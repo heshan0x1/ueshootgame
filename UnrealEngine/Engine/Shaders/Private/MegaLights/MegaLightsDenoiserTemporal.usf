@@ -1,0 +1,503 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// When loading SSS checkerboard pixel, do not adjust DiffuseColor/SpecularColor to preserve specular and diffuse lighting values for each pixel
+#define ALLOW_SSS_MATERIAL_OVERRIDE 0
+
+// When loading Substrate material, needs to support all types of pixels (Simple/Single/Complex/Special) 
+// as the temporal pass does not have tile types
+#define SUBSTRATE_FASTPATH 0
+#define SUBSTRATE_SINGLEPATH 0
+#define SUBSTRATE_COMPLEXSPECIALPATH 1
+
+#include "../Common.ush"
+#include "../Quantization.ush"
+#include "MegaLights.ush"
+#include "MegaLightsMaterial.ush"
+#include "../Lumen/LumenReflectionDenoiserCommon.ush"
+#include "../StochasticLighting/StochasticLightingCommon.ush"
+
+#include "/Engine/Public/DualPixelVectorization.ush"
+
+// Improves performance on certain platforms
+#if !DEBUG_MODE && VALID_HISTORY
+	MAX_OCCUPANCY
+#endif
+
+#if PLATFORM_SUPPORTS_REAL_TYPES
+#define PACKED_LIGHTING_TYPE half3x2
+#else
+#define PACKED_LIGHTING_TYPE uint3
+#endif
+#define LIGHTING_TYPE half3x2
+#define LIGHTING_EXTRA_EXPOSURE half(16.0)
+
+Texture2D<half3> ResolvedDiffuseLighting;
+Texture2D<half3> ResolvedSpecularLighting;
+Texture2D<half> ShadingConfidenceTexture;
+Texture2D MegaLightsDepthHistory;
+Texture2D<float4> MegaLightsNormalAndShading;
+Texture2D<half3> DiffuseLightingHistoryTexture;
+Texture2D<half3> SpecularLightingHistoryTexture;
+Texture2D<half4> LightingMomentsHistoryTexture;
+Texture2D<half> NumFramesAccumulatedHistoryTexture;
+Texture2D<uint> EncodedHistoryScreenCoordTexture;
+Texture2D<uint> PackedPixelDataTexture;
+
+// 2^(-NumMantissaBits)
+float3 TargetFormatQuantizationError;
+
+float4 HistoryBufferSizeAndInvSize;
+float4 HistorySubPixelGridSizeAndInvSize;
+float PrevSceneColorPreExposureCorrection;
+float MinFramesAccumulatedForHistoryMiss;
+float MinFramesAccumulatedForHighConfidence;
+float TemporalMaxFramesAccumulated;
+float TemporalNeighborhoodClampScale;
+uint2 HistoryScreenCoordDecodeShift;
+
+RWTexture2D<float3> RWDiffuseLighting;
+RWTexture2D<float3> RWSpecularLighting;
+RWTexture2D<float4> RWLightingMoments;
+RWTexture2D<UNORM float> RWNumFramesAccumulated;
+
+struct FNeighborhood
+{
+	LIGHTING_TYPE Center;
+	LIGHTING_TYPE Extent;
+};
+
+// Downsampled lighting neighborhood
+#define SHARED_TILE_BORDER 2
+#define SHARED_TILE_SIZE_X (THREADGROUP_SIZE / DOWNSAMPLE_FACTOR_X + 2 * SHARED_TILE_BORDER)
+#define SHARED_TILE_SIZE_Y (THREADGROUP_SIZE / DOWNSAMPLE_FACTOR_Y + 2 * SHARED_TILE_BORDER)
+groupshared PACKED_LIGHTING_TYPE SharedResolvedLightingYCoCg[SHARED_TILE_SIZE_X][SHARED_TILE_SIZE_Y];
+
+PACKED_LIGHTING_TYPE PackDiffuseAndSpecular(LIGHTING_TYPE Lighting)
+{
+	PACKED_LIGHTING_TYPE Packed;
+
+#if PLATFORM_SUPPORTS_REAL_TYPES
+	Packed = Lighting;
+#else
+	Packed.x = (f32tof16(dpv_hi(Lighting).x) << 16) | f32tof16(dpv_lo(Lighting).x);
+	Packed.y = (f32tof16(dpv_hi(Lighting).y) << 16) | f32tof16(dpv_lo(Lighting).y);
+	Packed.z = (f32tof16(dpv_hi(Lighting).z) << 16) | f32tof16(dpv_lo(Lighting).z);
+#endif
+	return Packed;
+}
+
+LIGHTING_TYPE UnpackDiffuseAndSpecular(PACKED_LIGHTING_TYPE Packed)
+{
+	LIGHTING_TYPE Lighting;
+
+#if PLATFORM_SUPPORTS_REAL_TYPES
+	Lighting = Packed;
+#else
+	Lighting[0] = float2(f16tof32(Packed.x & 0xFFFF), f16tof32(Packed.x >> 16));
+	Lighting[1] = float2(f16tof32(Packed.y & 0xFFFF), f16tof32(Packed.y >> 16));
+	Lighting[2] = float2(f16tof32(Packed.z & 0xFFFF), f16tof32(Packed.z >> 16));
+#endif
+	return Lighting;
+}
+
+bool2 IsDiffuseAndSpecularValid(LIGHTING_TYPE Lighting)
+{
+	half2 LightingRed = half2(dpv_lo(Lighting).x, dpv_hi(Lighting).x);
+
+#if PLATFORM_SUPPORTS_REAL_TYPES
+	uint16_t2 LightingRedU = asuint16(LightingRed);
+	uint16_t2 SignBitMask = 0x8000;
+#else
+	uint2 LightingRedU = asuint(LightingRed);
+	uint2 SignBitMask = 0x80000000;
+#endif
+	return (LightingRedU & SignBitMask) == 0;
+}
+
+// Compute local neighborhood statistics
+void GetNeighborhood(
+	uint2 LocalCoord,
+	LIGHTING_TYPE CenterSample,
+	inout FNeighborhood Neighborhood,
+	inout FShaderPrintContext DebugContext)
+{
+	bool2 bValidCenter = IsDiffuseAndSpecularValid(CenterSample);
+
+	half2 WeightSum = select(bValidCenter, half2(1.0, 1.0), half2(0.0, 0.0));
+	LIGHTING_TYPE SampleSum = CenterSample;
+	LIGHTING_TYPE SampleSqSum = CenterSample * CenterSample;
+
+	// Compute based on the downsampled coords in order to skip interpolated/upsampled values, as they don't really add any extra information
+	LocalCoord = LocalCoord / uint2(DOWNSAMPLE_FACTOR_X, DOWNSAMPLE_FACTOR_Y);
+
+	const int KernelSize = 2;
+	for (int NeighborOffsetY = -KernelSize; NeighborOffsetY <= KernelSize; ++NeighborOffsetY)
+	{
+		for (int NeighborOffsetX = -KernelSize; NeighborOffsetX <= KernelSize; ++NeighborOffsetX)
+		{
+			const bool bCenter = NeighborOffsetX == 0 && NeighborOffsetY == 0;
+			const bool bCorner = abs(NeighborOffsetX) == KernelSize && abs(NeighborOffsetY) == KernelSize;
+
+			// Skip center as it's already accounted for
+			// Also optimize it a bit by skipping corners as it doesn't affect visuals much
+			if (!bCenter && !bCorner)
+			{
+				uint2 SharedCoord = LocalCoord + SHARED_TILE_BORDER + int2(NeighborOffsetX, NeighborOffsetY);
+				PACKED_LIGHTING_TYPE PackedLighting = SharedResolvedLightingYCoCg[SharedCoord.x][SharedCoord.y];
+				LIGHTING_TYPE NeighborSample = UnpackDiffuseAndSpecular(PackedLighting);
+				bool2 bValidNeighbor = IsDiffuseAndSpecularValid(NeighborSample);
+
+				SampleSum += NeighborSample;
+				SampleSqSum += NeighborSample * NeighborSample;
+				WeightSum += select(bValidNeighbor, half2(1.0, 1.0), half2(0.0, 0.0));
+			}
+		}
+	}
+
+	WeightSum = max(WeightSum, half(1.0));
+	LIGHTING_TYPE M1 = dpv_scale(SampleSum, rcp(WeightSum));
+	LIGHTING_TYPE M2 = dpv_scale(SampleSqSum, rcp(WeightSum));
+	LIGHTING_TYPE Variance = M2 - M1 * M1;
+	Variance = dpv_interleave_registers(max(dpv_lo(Variance), half(0.0)), max(dpv_hi(Variance), half(0.0)));
+	LIGHTING_TYPE StdDev = sqrt(Variance);
+	
+	Neighborhood = (FNeighborhood)0;
+	Neighborhood.Center = M1;
+	Neighborhood.Extent = half(TemporalNeighborhoodClampScale) * StdDev;
+}
+
+half ShadingConfidenceWeight(half ShadingConfidence)
+{
+	// #ml_todo: expose as CVars
+	half Edge0 = 0.75;
+	half Edge1 = 0.25;
+	return saturate((ShadingConfidence - Edge0) / (Edge1 - Edge0));
+}
+
+#ifdef DenoiserTemporalCS
+
+/**
+ * Temporal accumulation of shaded light samples
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void DenoiserTemporalCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 ScreenCoord = DispatchThreadId.xy + View.ViewRectMinAndSize.xy;
+
+	FShaderPrintContext DebugContext = InitDebugContext(ScreenCoord, /*bDownsampled*/ false, float2(0.65, 0.55));
+
+	// Load resolved diffuse and specular neighborhood into shared memory
+	for (uint SharedCoordY = GroupThreadId.y; SharedCoordY < SHARED_TILE_SIZE_Y; SharedCoordY += THREADGROUP_SIZE)
+	{
+		for (uint SharedCoordX = GroupThreadId.x; SharedCoordX < SHARED_TILE_SIZE_X; SharedCoordX += THREADGROUP_SIZE)
+		{
+			uint2 DownsampledResolveCoord = (GroupId.xy * THREADGROUP_SIZE + View.ViewRectMinAndSize.xy) / uint2(DOWNSAMPLE_FACTOR_X, DOWNSAMPLE_FACTOR_Y) + int2(SharedCoordX, SharedCoordY) - SHARED_TILE_BORDER;
+			uint2 ResolvedCoord = DownsampledScreenCoordToScreenCoord(DownsampledResolveCoord);
+			
+			LIGHTING_TYPE ResolvedYCoCg = -0.0;
+
+			// Skip corners as they will be also skiped in GetNeighborhood()
+			const bool bCorner = (SharedCoordX == 0 || SharedCoordX + 1 == SHARED_TILE_SIZE_X) && (SharedCoordY == 0 || SharedCoordY + 1 == SHARED_TILE_SIZE_Y);
+			if (!bCorner && all(ResolvedCoord.xy - View.ViewRectMinAndSize.xy < View.ViewRectMinAndSize.zw))
+			{
+				half3 DiffuseSample = ResolvedDiffuseLighting[ResolvedCoord];
+				half3 SpecularSample = ResolvedSpecularLighting[ResolvedCoord];
+
+				DiffuseSample = select(IsLightingValid(DiffuseSample), LumenRGBToYCoCg(DiffuseSample / LIGHTING_EXTRA_EXPOSURE), -0.0);
+				SpecularSample = select(IsLightingValid(SpecularSample), LumenRGBToYCoCg(SpecularSample / LIGHTING_EXTRA_EXPOSURE), -0.0);
+
+				ResolvedYCoCg = dpv_interleave_registers(DiffuseSample, SpecularSample);
+			}
+
+			SharedResolvedLightingYCoCg[SharedCoordX][SharedCoordY] = PackDiffuseAndSpecular(ResolvedYCoCg);
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (all(ScreenCoord < View.ViewRectMinAndSize.xy + View.ViewRectMinAndSize.zw))
+	{
+  		LIGHTING_TYPE ResolvedLighting;
+		FNeighborhood Neighborhood;
+
+	#if DOWNSAMPLE_FACTOR_X == 1 && DOWNSAMPLE_FACTOR_Y == 1
+		// We can load directly from LDS when downsampling is disabled
+		PACKED_LIGHTING_TYPE PackedLighting = SharedResolvedLightingYCoCg[GroupThreadId.x + SHARED_TILE_BORDER][GroupThreadId.y + SHARED_TILE_BORDER];
+		ResolvedLighting = UnpackDiffuseAndSpecular(PackedLighting);
+	#else
+		half3 CenterDiffuse = ResolvedDiffuseLighting[ScreenCoord];
+		half3 CenterSpecular = ResolvedSpecularLighting[ScreenCoord];
+			
+		CenterDiffuse = select(IsLightingValid(CenterDiffuse), LumenRGBToYCoCg(CenterDiffuse / LIGHTING_EXTRA_EXPOSURE), -0.0);
+		CenterSpecular = select(IsLightingValid(CenterSpecular), LumenRGBToYCoCg(CenterSpecular / LIGHTING_EXTRA_EXPOSURE), -0.0);
+
+		ResolvedLighting = dpv_interleave_registers(CenterDiffuse, CenterSpecular);
+	#endif
+
+		GetNeighborhood(GroupThreadId.xy, ResolvedLighting, Neighborhood, DebugContext);
+
+		if (DebugContext.bIsActive)
+		{
+			Print(DebugContext, TEXT("TemporalAccumulation"), FontTitle);
+			Newline(DebugContext);
+			Print(DebugContext, TEXT("ScreenCoord         : "));
+			Print(DebugContext, ScreenCoord.x, FontValue);
+			Print(DebugContext, ScreenCoord.y, FontValue);
+			Newline(DebugContext);
+			Print(DebugContext, TEXT("CenterDiffuse       : "));
+			Print(DebugContext, dpv_lo(ResolvedLighting), FontValue);
+			Newline(DebugContext);
+			Print(DebugContext, TEXT("CenterSpecular      : "));
+			Print(DebugContext, dpv_hi(ResolvedLighting), FontValue);
+		}
+
+		FMegaLightsPackedPixelData PackedPixelData = (FMegaLightsPackedPixelData)PackedPixelDataTexture[ScreenCoord];
+		uint EncodedHistoryScreenCoord = EncodedHistoryScreenCoordTexture[ScreenCoord];
+		
+		half3 DiffuseLighting = INVALID_LIGHTING;
+		half3 SpecularLighting = INVALID_LIGHTING;
+		half2 DiffuseMoments = 0.0;
+		half2 SpecularMoments = 0.0;
+
+		bool bLightingValid = IsDiffuseAndSpecularValid(ResolvedLighting).x;
+		half NumFramesAccumulated = bLightingValid ? 1.0 : 0.0;
+
+		bool bThisPixelValid = PackedPixelData.IsValid();
+		if (bThisPixelValid)
+		{
+		#if VALID_HISTORY
+			bool bAnyHistoryValid = PackedPixelData.AnyHistoryValid();
+			if (bAnyHistoryValid)
+			{
+				// HistoryScreenUV must be inside history view or this pixel will have INVALID_PACKED_PIXEL_DATA
+				bool bHistoryWasOnScreen = true;
+				if (bHistoryWasOnScreen)
+				{
+					float2 HistoryScreenCoord;
+					half2 HistoryBilinearWeights;
+					{
+						float4 Decoded = DecodeHistoryScreenCoord(EncodedHistoryScreenCoord, HistoryScreenCoordDecodeShift, HistorySubPixelGridSizeAndInvSize.zw);
+						HistoryScreenCoord = Decoded.xy;
+						HistoryBilinearWeights = half2(Decoded.zw);
+					}
+
+					float2 HistoryGatherUV = (HistoryScreenCoord + 1.0f) * HistoryBufferSizeAndInvSize.zw;
+
+					half4 HistoryWeights = half4(
+						(1 - HistoryBilinearWeights.y) * (1 - HistoryBilinearWeights.x),
+						(1 - HistoryBilinearWeights.y) * HistoryBilinearWeights.x,
+						HistoryBilinearWeights.y * (1 - HistoryBilinearWeights.x),
+						HistoryBilinearWeights.y * HistoryBilinearWeights.x);
+
+					HistoryWeights *= select(PackedPixelData.GetHistorySampleValidity(), half(1.0), half(0.0));
+
+					if (DebugContext.bIsActive)
+					{
+						Newline(DebugContext);
+						Print(DebugContext, TEXT("HistoryWeights      : "));
+						Print(DebugContext, HistoryWeights, FontValue);
+					}
+
+					// At least one history neighbor must be valid or this pixel will have INVALID_PACKED_PIXEL_DATA
+					bool bAnyHistoryNeighborValid = true;
+					if (bAnyHistoryNeighborValid)
+					{
+						half3 DiffuseLightingHistory = 0.0;
+						DiffuseLightingHistory.x = dot(DiffuseLightingHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingHistory.y = dot(DiffuseLightingHistoryTexture.GatherGreen(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingHistory.z = dot(DiffuseLightingHistoryTexture.GatherBlue(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						DiffuseLightingHistory = DiffuseLightingHistory / dot(HistoryWeights, half(1.0));
+
+						half3 SpecularLightingHistory = 0.0;
+						SpecularLightingHistory.x = dot(SpecularLightingHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingHistory.y = dot(SpecularLightingHistoryTexture.GatherGreen(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingHistory.z = dot(SpecularLightingHistoryTexture.GatherBlue(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						SpecularLightingHistory = SpecularLightingHistory / dot(HistoryWeights, half(1.0));
+
+						half4 LightingMomentsHistory = 0.0;
+						LightingMomentsHistory.x = dot(LightingMomentsHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						LightingMomentsHistory.y = dot(LightingMomentsHistoryTexture.GatherGreen(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						LightingMomentsHistory.z = dot(LightingMomentsHistoryTexture.GatherBlue(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						LightingMomentsHistory.w = dot(LightingMomentsHistoryTexture.GatherAlpha(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights);
+						LightingMomentsHistory = LightingMomentsHistory / dot(HistoryWeights, half(1.0));
+
+						// Correct history for current frame exposure
+						half3 HistoryDiffuseLighting = DiffuseLightingHistory * half(PrevSceneColorPreExposureCorrection);
+						half3 HistorySpecularLighting = SpecularLightingHistory * half(PrevSceneColorPreExposureCorrection);
+
+						half PrevSceneColorPreExposureCorrectionSq = half(PrevSceneColorPreExposureCorrection) * half(PrevSceneColorPreExposureCorrection);
+						half2 HistoryDiffuseMoments = LightingMomentsHistory.xy * half2(PrevSceneColorPreExposureCorrection, PrevSceneColorPreExposureCorrectionSq);
+						half2 HistorySpecularMoments = LightingMomentsHistory.zw * half2(PrevSceneColorPreExposureCorrection, PrevSceneColorPreExposureCorrectionSq);
+
+						HistoryDiffuseMoments.y = min(HistoryDiffuseMoments.y, half(MaxHalfFloat));
+						HistorySpecularMoments.y = min(HistorySpecularMoments.y, half(MaxHalfFloat));
+
+						// Disable neighborhood clamp
+						// Setting bounds to MaxHalfFloat instead of a branch generates code with much higher occupancy on console
+						if (!bLightingValid)
+						{
+							Neighborhood.Extent = half(MaxHalfFloat);
+						}
+
+						// Clamp diffuse history
+						half DiffuseConfidence = 1.0;
+						half3 ClampedHistoryDiffuseLighting = HistoryDiffuseLighting;
+						{
+							HistoryDiffuseLighting = LumenRGBToYCoCg(HistoryDiffuseLighting / LIGHTING_EXTRA_EXPOSURE);
+							ClampedHistoryDiffuseLighting = clamp(HistoryDiffuseLighting, dpv_lo(Neighborhood.Center - Neighborhood.Extent), dpv_lo(Neighborhood.Center + Neighborhood.Extent));
+
+							// Speedup accumulation if history is far away from the current neighborhood
+							half NormalizedDistanceToNeighborhood = length(abs(ClampedHistoryDiffuseLighting - HistoryDiffuseLighting) / max(dpv_lo(Neighborhood.Extent), half(0.1) / LIGHTING_EXTRA_EXPOSURE));
+							DiffuseConfidence = saturate(1.0 - NormalizedDistanceToNeighborhood);
+
+							ClampedHistoryDiffuseLighting = LumenYCoCgToRGB(ClampedHistoryDiffuseLighting * LIGHTING_EXTRA_EXPOSURE);
+						}
+
+						half SpecularConfidence = 1.0;
+						half3 ClampedHistorySpecularLighting = HistorySpecularLighting;
+						{
+							HistorySpecularLighting = LumenRGBToYCoCg(HistorySpecularLighting / LIGHTING_EXTRA_EXPOSURE);						
+							ClampedHistorySpecularLighting = clamp(HistorySpecularLighting, dpv_hi(Neighborhood.Center - Neighborhood.Extent), dpv_hi(Neighborhood.Center + Neighborhood.Extent));
+
+							// Speedup accumulation if history is far away from the current neighborhood
+							half NormalizedDistanceToNeighborhood = length(abs(ClampedHistorySpecularLighting - HistorySpecularLighting) / max(dpv_hi(Neighborhood.Extent), half(0.1) / LIGHTING_EXTRA_EXPOSURE));
+							SpecularConfidence = saturate(1.0 - NormalizedDistanceToNeighborhood);
+
+							ClampedHistorySpecularLighting = LumenYCoCgToRGB(ClampedHistorySpecularLighting * LIGHTING_EXTRA_EXPOSURE);
+						}
+
+						// Reproject and rescale normalized NumFramesAccumulated
+						half NumFramesAccumulatedHistory = 0.0;
+						NumFramesAccumulatedHistory = UnpackNumFramesAccumulated(dot(NumFramesAccumulatedHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy, HistoryWeights) / dot(HistoryWeights, half(1.0)));
+
+						half ShadingConfidence = ShadingConfidenceTexture[ScreenCoord];
+						half MaxConfidenceFrames = lerp(half(MinFramesAccumulatedForHighConfidence), half(TemporalMaxFramesAccumulated), ShadingConfidenceWeight(ShadingConfidence));
+						half MaxDiffuseFrames = min(lerp(half(MinFramesAccumulatedForHistoryMiss), half(TemporalMaxFramesAccumulated), DiffuseConfidence), MaxConfidenceFrames);
+						half MaxSpecularFrames = min(lerp(half(MinFramesAccumulatedForHistoryMiss), half(TemporalMaxFramesAccumulated), SpecularConfidence), MaxConfidenceFrames);
+
+						// Advance the frame counter
+						half DiffuseNumFramesAccumulated = min(NumFramesAccumulatedHistory + 1.0, MaxDiffuseFrames);
+						half SpecularNumFramesAccumulated = min(NumFramesAccumulatedHistory + 1.0, MaxSpecularFrames);
+						NumFramesAccumulated = lerp(DiffuseNumFramesAccumulated, SpecularNumFramesAccumulated, 0.5);
+
+						if (bLightingValid)
+						{
+							DiffuseLighting = LumenYCoCgToRGB(dpv_lo(ResolvedLighting) * LIGHTING_EXTRA_EXPOSURE);
+							SpecularLighting = LumenYCoCgToRGB(dpv_hi(ResolvedLighting) * LIGHTING_EXTRA_EXPOSURE);
+
+							half DiffuseLuminance = dot(DiffuseLighting, half3(LuminanceFactors()));
+							half SpecularLuminance = dot(SpecularLighting, half3(LuminanceFactors()));
+
+							DiffuseMoments = half2(DiffuseLuminance, min(DiffuseLuminance * DiffuseLuminance, half(MaxHalfFloat)));
+							SpecularMoments = half2(SpecularLuminance, min(SpecularLuminance * SpecularLuminance, half(MaxHalfFloat)));
+
+							// Blend history with new samples
+							half DiffuseAlpha = 1.0 / DiffuseNumFramesAccumulated;
+							DiffuseLighting = lerp(ClampedHistoryDiffuseLighting, DiffuseLighting, DiffuseAlpha);
+							DiffuseMoments = lerp(HistoryDiffuseMoments, DiffuseMoments, DiffuseAlpha);
+
+							half SpecularAlpha = 1.0 / SpecularNumFramesAccumulated;
+							SpecularLighting = lerp(ClampedHistorySpecularLighting, SpecularLighting, SpecularAlpha);
+							SpecularMoments = lerp(HistorySpecularMoments, SpecularMoments, SpecularAlpha);
+						}
+						else
+						{
+							// No valid samples this frame - reuse history
+							DiffuseLighting = ClampedHistoryDiffuseLighting;
+							DiffuseMoments = HistoryDiffuseMoments;
+
+							SpecularLighting = ClampedHistorySpecularLighting;
+							SpecularMoments = HistorySpecularMoments;
+						}
+
+					#if PLATFORM_SUPPORTS_REAL_TYPES
+						DiffuseLighting = select((asuint16(DiffuseLighting) & 0x7C00) != 0x7C00, DiffuseLighting, 0.0);
+						SpecularLighting = select((asuint16(SpecularLighting) & 0x7C00) != 0x7C00, SpecularLighting, 0.0);
+						DiffuseMoments = select((asuint16(DiffuseMoments) & 0x7C00) != 0x7C00, DiffuseMoments, 0.0);
+						SpecularMoments = select((asuint16(SpecularMoments) & 0x7C00) != 0x7C00, SpecularMoments, 0.0);
+					#else
+						DiffuseLighting = MakeFinite(DiffuseLighting);
+						SpecularLighting = MakeFinite(SpecularLighting);
+						DiffuseMoments = MakeFinite(DiffuseMoments);
+						SpecularMoments = MakeFinite(SpecularMoments);
+					#endif
+
+						if (DebugContext.bIsActive)
+						{
+							half DiffuseVariance = max(DiffuseMoments.y - DiffuseMoments.x * DiffuseMoments.x, 0.0);
+							half SpecularVariance = max(SpecularMoments.y - SpecularMoments.x * SpecularMoments.x, 0.0);
+
+							Newline(DebugContext);
+							Print(DebugContext, TEXT("NumFramesAccumulated: "));
+							Print(DebugContext, NumFramesAccumulated, FontValue);
+							Newline(DebugContext);
+							Print(DebugContext, TEXT("DiffuseVariance     : "));
+							Print(DebugContext, DiffuseVariance, FontValue);
+							Newline(DebugContext);
+							Print(DebugContext, TEXT("SpecularVariance    : "));
+							Print(DebugContext, SpecularVariance, FontValue);
+							Newline(DebugContext);
+							Print(DebugContext, TEXT("Diffuse             : "));
+							Print(DebugContext, DiffuseLighting, FontValue);
+							Print(DebugContext, Luminance(DiffuseLighting), FontValue);
+							Newline(DebugContext);
+							Print(DebugContext, TEXT("Specular            : "));
+							Print(DebugContext, SpecularLighting, FontValue);
+							Print(DebugContext, Luminance(SpecularLighting), FontValue);
+							Newline(DebugContext);
+							Print(DebugContext, TEXT("Confidence          : "));
+							Print(DebugContext, DiffuseConfidence, FontValue);
+							Print(DebugContext, SpecularConfidence, FontValue);
+						}
+					}
+				}
+			}
+			else
+		#endif
+			{
+				bool2 bValidCenter = IsDiffuseAndSpecularValid(ResolvedLighting);
+
+				if (bValidCenter.x)
+				{
+					DiffuseLighting = LumenYCoCgToRGB(dpv_lo(ResolvedLighting) * LIGHTING_EXTRA_EXPOSURE);
+					half DiffuseLuminance = dot(DiffuseLighting, half3(LuminanceFactors()));
+					DiffuseMoments = half2(DiffuseLuminance, min(DiffuseLuminance * DiffuseLuminance, half(MaxHalfFloat)));
+				}
+				else
+				{
+					DiffuseLighting = 0.0;
+					DiffuseMoments = 0.0;
+				}
+
+				if (bValidCenter.y)
+				{
+					SpecularLighting = LumenYCoCgToRGB(dpv_hi(ResolvedLighting) * LIGHTING_EXTRA_EXPOSURE);
+					half SpecularLuminance = dot(SpecularLighting, half3(LuminanceFactors()));
+					SpecularMoments = half2(SpecularLuminance, min(SpecularLuminance * SpecularLuminance, half(MaxHalfFloat)));
+				}
+				else
+				{
+					SpecularLighting = 0.0;
+					SpecularMoments = 0.0;
+				}
+			}
+
+			const uint Random = Rand3DPCG16(int3(ScreenCoord, MegaLightsStateFrameIndex)).x;
+			const float QuantizationRand = Rand16ToFloat(Random);
+			DiffuseLighting = QuantizeFloatColor(DiffuseLighting, TargetFormatQuantizationError, QuantizationRand);
+			SpecularLighting = QuantizeFloatColor(SpecularLighting, TargetFormatQuantizationError, QuantizationRand);
+		}
+
+		AddTextBackground(DebugContext, FontBackground);
+
+		RWDiffuseLighting[ScreenCoord] = DiffuseLighting;
+		RWSpecularLighting[ScreenCoord] = SpecularLighting;
+		RWLightingMoments[ScreenCoord] = float4(DiffuseMoments, SpecularMoments);
+		RWNumFramesAccumulated[ScreenCoord] = PackNumFramesAccumulated(NumFramesAccumulated);
+	}
+}
+
+#endif // DenoiserTemporalCS

@@ -1,0 +1,200 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+
+<root>
+    <xsd:schema id="root" xmlns="" xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:msdata="urn:schemas-microsoft-com:xml-msdata">
+        <xsd:element name="root" msdata:IsDataSet="true">
+            
+        </xsd:element>
+    </xsd:schema>
+    <resheader name="resmimetype">
+        <value>text/microsoft-resx</value>
+    </resheader>
+    <resheader name="version">
+        <value>1.3</value>
+    </resheader>
+    <resheader name="reader">
+        <value>System.Resources.ResXResourceReader, System.Windows.Forms, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+    </resheader>
+    <resheader name="writer">
+        <value>System.Resources.ResXResourceWriter, System.Windows.Forms, Version=2.0.0.0, Culture=neutral, PublicKeyToken=b77a5c561934e089</value>
+    </resheader>
+    <data name="Workspace_Refresh_Tooltip" xml:space="preserve">
+        <value>Refresh the workspace</value>
+    </data>
+    <data name="Tree_Expand_Tooltip" xml:space="preserve">
+        <value>Expand all items</value>
+    </data>
+    <data name="Tree_Collapse_Tooltip" xml:space="preserve">
+        <value>Collapse all items</value>
+    </data>
+    <data name="Workspace_Connect" xml:space="preserve">
+        <value>Create a new workspace connection</value>
+    </data>
+    <data name="Shader_NotFound" xml:space="preserve">
+        <value>Shader not found in target application.</value>
+    </data>
+    <data name="Shader_NoDebugSymbols" xml:space="preserve">
+        <value>Shader not compiled with debugging symbols, please ensure the shader is compiled with embedded debugging data.</value>
+    </data>
+    <data name="BusMode_Toggle_Tooltip" xml:space="preserve">
+        <value>Pause/resume all instrumentation</value>
+    </data>
+    <data name="Discovery_DropDown_Tooltip" xml:space="preserve">
+        <value>Configure discoverability</value>
+    </data>
+    <data name="EditLabel_Close_Tooltip" xml:space="preserve">
+        <value>Remove this entry</value>
+    </data>
+    <data name="ApplicationList_Add_Tooltip" xml:space="preserve">
+        <value>Add a new application</value>
+    </data>
+    <data name="PDBSetting_Add_Tooltip" xml:space="preserve">
+        <value>Add a new PDB search path</value>
+    </data>
+    <data name="NetworkStatus_Download_Tooltip" xml:space="preserve">
+        <value>Network data read by this session</value>
+    </data>
+    <data name="NetworkStatus_Upload_Tooltip" xml:space="preserve">
+        <value>Network data written by this session</value>
+    </data>
+    <data name="Log_Filter_Tooltip" xml:space="preserve">
+        <value>Logging filter</value>
+    </data>
+    <data name="Log_Close_Tooltip" xml:space="preserve">
+        <value>Clear all logging entries</value>
+    </data>
+    <data name="Log_ScrollToBottom_Tooltip" xml:space="preserve">
+        <value>Scroll to the bottom with new logging entries</value>
+    </data>
+    <data name="PipelineTree_Refresh_Tooltip" xml:space="preserve">
+        <value>Refresh all pipeline entries</value>
+    </data>
+    <data name="ShaderTree_Refresh_Tooltip" xml:space="preserve">
+        <value>Refresh all shader entries</value>
+    </data>
+    <data name="Tree_DestroyAll_Tooltip" xml:space="preserve">
+        <value>Close all live workspaces</value>
+    </data>
+    <data name="MessageCollection_Filter_Tooltip" xml:space="preserve">
+        <value>Filter validation messages</value>
+    </data>
+    <data name="MessageCollection_Clear_Tooltip" xml:space="preserve">
+        <value>Clear all validation messages</value>
+    </data>
+    <data name="Help_Tooltip" xml:space="preserve">
+        <value>Display help</value>
+    </data>
+    <data name="Launch_SelectFolder_Tooltip" xml:space="preserve">
+        <value>Open a folder</value>
+    </data>
+    <data name="Shader_Code_ShowInIL" xml:space="preserve">
+        <value>Show this validation error in IL</value>
+    </data>
+    <data name="Shader_Code_ShowInSource" xml:space="preserve">
+        <value>Show this validation error in source</value>
+    </data>
+    <data name="Detail_Resource_Pause" xml:space="preserve">
+        <value>Pause validation reporting</value>
+    </data>
+    <data name="Workspace_Configuration_Custom_Name" xml:space="preserve">
+        <value>Custom</value>
+    </data>
+    <data name="Workspace_Configuration_Custom_Description" xml:space="preserve">
+        <value>Setup a custom workspace</value>
+    </data>
+    <data name="Workspace_Configuration_Basic_Header" xml:space="preserve">
+        <value>Basic configuration, includes</value>
+    </data>
+    <data name="Workspace_Configuration_All_Name" xml:space="preserve">
+        <value>All Standard</value>
+    </data>
+    <data name="Workspace_Configuration_All_Header" xml:space="preserve">
+        <value>All configurations, includes</value>
+    </data>
+    <data name="Workspace_Configuration_Basic_Name" xml:space="preserve">
+        <value>Basic</value>
+    </data>
+    <data name="Workspace_Configuration_All_Description" xml:space="preserve">
+        <value>All configurations</value>
+    </data>
+    <data name="Launch_SafeGuard" xml:space="preserve">
+        <value>Safe guarding prevents undefined behaviour from taking place due to erroneous operations. Affects performance.</value>
+    </data>
+    <data name="Launch_SynchronousRecording" xml:space="preserve">
+        <value>Enables use of synchronous recording, pipeline usage waits on compilation to finish. Required for certain features.</value>
+    </data>
+    <data name="Launch_Detail" xml:space="preserve">
+        <value>Enables detailed validation reporting, affects performance.</value>
+    </data>
+    <data name="Discovery_Warning_Title" xml:space="preserve">
+        <value>Service Installation</value>
+    </data>
+    <data name="Discovery_Warning_Content" xml:space="preserve">
+        <value>Global discovery requires the installation of GPU Reshape services, which are added to the (OS) startup programs. Disabling global discovery will uninstall the services.
+
+Do you consent to this?</value>
+    </data>
+    <data name="Instrumentation_Stage_Shaders" xml:space="preserve">
+        <value>Compiling {0} shaders...</value>
+    </data>
+    <data name="Instrumentation_Stage_PipelineLibraries" xml:space="preserve">
+        <value>Compiling {0} pipeline libraries...</value>
+    </data>
+    <data name="Instrumentation_Stage_Pipelines" xml:space="preserve">
+        <value>Compiling {0} pipelines...</value>
+    </data>
+    <data name="Log_Report_Tooltip" xml:space="preserve">
+        <value>Open attached report</value>
+    </data>
+    <data name="Launch_TexelAddressing" xml:space="preserve">
+        <value>Enables texel addressing, imposes large memory overhead</value>
+    </data>
+    <data name="Features_TexelAddressing_Info" xml:space="preserve">
+        <value>Texel Addressing enables tracking initialization / concurrency events on a per-texel level, greatly improving accuracy. This incurs a heavy memory and performance overhead, disable to track on a per-resource level.</value>
+    </data>
+    <data name="Launch_CaptureChildProcesses" xml:space="preserve">
+        <value>Hook into the entire process tree of an application, automatically creates process hierarchy</value>
+    </data>
+    <data name="Launch_SuspendDeferredInitialization" xml:space="preserve">
+        <value>Suspends the deferred initialization thread created on injection, this avoids some app-side TLS initialization order issues</value>
+    </data>
+    <data name="Launch_AttachAllDevices" xml:space="preserve">
+        <value>Attach to all graphical devices the application creates, a workspace is automatically created per device</value>
+    </data>
+    <data name="Tool_Shaders" xml:space="preserve">
+        <value>All workspace shaders</value>
+    </data>
+    <data name="Tool_Pipelines" xml:space="preserve">
+        <value>All workspace pipelines</value>
+    </data>
+    <data name="Tool_Properties" xml:space="preserve">
+        <value>Instrumentation properties</value>
+    </data>
+    <data name="Tool_Workspaces" xml:space="preserve">
+        <value>All application workspaces</value>
+    </data>
+    <data name="Tool_Files" xml:space="preserve">
+        <value>Selected shader files</value>
+    </data>
+    <data name="Tool_Log" xml:space="preserve">
+        <value>Workspace logs</value>
+    </data>
+    <data name="ShaderView_Code" xml:space="preserve">
+        <value>Source code</value>
+    </data>
+    <data name="ShaderView_IL" xml:space="preserve">
+        <value>Instructions (GRIL)</value>
+    </data>
+    <data name="ShaderView_BlockGraph" xml:space="preserve">
+        <value>Basic block graph (GRIL)</value>
+    </data>
+    <data name="Launch_Coverage" xml:space="preserve">
+        <value>Enables coverage reporting, affects performance, catches more issues but limits streaming per shader location</value>
+    </data>
+    <data name="Status_Active" xml:space="preserve">
+        <value>Recently in-use</value>
+    </data>
+    <data name="Status_Instrumented" xml:space="preserve">
+        <value>Currently instrumented</value>
+    </data>
+</root>

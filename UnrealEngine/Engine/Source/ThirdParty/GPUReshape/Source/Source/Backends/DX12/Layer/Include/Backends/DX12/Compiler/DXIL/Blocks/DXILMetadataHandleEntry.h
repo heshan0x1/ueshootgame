@@ -1,0 +1,82 @@
+﻿// 
+// The MIT License (MIT)
+// 
+// Copyright (c) 2024 Advanced Micro Devices, Inc.,
+// Fatalist Development AB (Avalanche Studio Group),
+// and Miguel Petersen.
+// 
+// All Rights Reserved.
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy 
+// of this software and associated documentation files (the "Software"), to deal 
+// in the Software without restriction, including without limitation the rights 
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+// of the Software, and to permit persons to whom the Software is furnished to do so, 
+// subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in all 
+// copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+// INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+// PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+// FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// 
+
+#pragma once
+
+// Layer
+#include <Backends/DX12/Compiler/DXIL/DXILHeader.h>
+#include <Backends/DX12/Compiler/DXIL/LLVM/LLVMBlock.h>
+
+// Backend
+#include <Backend/IL/Type.h>
+
+/// Represents a handle
+struct DXILMetadataHandleEntry {
+    /// Source record
+    const LLVMRecord* record{nullptr};
+
+    /// Resource type
+    const Backend::IL::Type* type{nullptr};
+
+    /// Optional, library specific variable
+    const Backend::IL::Variable* libVariable{nullptr};
+
+    /// Binding class
+    DXILShaderResourceClass _class{};
+
+    /// Binding register base
+    uint32_t registerBase{~0u};
+
+    /// Binding register range
+    uint32_t registerRange{~0u};
+
+    /// Binding space
+    uint32_t bindSpace{~0u};
+
+    /// Metadata name
+    const char* name{""};
+
+    /// Class specific data
+    union {
+        /// Unordered metadata
+        struct {
+            /// Underlying component type
+            ComponentType componentType;
+
+            /// Underlying shape
+            DXILShaderResourceShape shape;
+        } uav;
+
+        /// Resource metadata
+        struct {
+            /// Underlying component type
+            ComponentType componentType;
+            
+            /// Underlying shape
+            DXILShaderResourceShape shape;
+        } srv;
+    };
+};

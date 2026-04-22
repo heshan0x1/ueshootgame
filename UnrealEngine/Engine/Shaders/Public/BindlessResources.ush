@@ -1,0 +1,93 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "Platform.ush"
+
+#if UE_BINDLESS_ENABLED
+	#if !defined(UE_BINDLESS_SRV_HEAP_DECL)
+		#define UE_BINDLESS_SRV_HEAP_DECL(Type)
+	#endif
+
+	#if !defined(UE_BINDLESS_UAV_HEAP_DECL)
+		#define UE_BINDLESS_UAV_HEAP_DECL(Type)
+	#endif
+
+	#if !defined(UE_BINDLESS_SAMPLER_HEAP_DECL)
+		#define UE_BINDLESS_SAMPLER_HEAP_DECL(Type)
+	#endif
+
+	// Using platform defined bindless macros
+	#define UB_RESOURCE_MEMBER_SRV(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		UE_BINDLESS_SRV_HEAP_DECL(SafeType##UBName##_##Name); \
+		SafeType##UBName##_##Name GetBindlessResource##UBName##_##Name() { return GetSRVFromHeap(SafeType##UBName##_##Name, UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessSRV_, Name)); } \
+		static const SafeType##UBName##_##Name UBName##_##Name = GetBindlessResource##UBName##_##Name();
+
+	#define UB_RESOURCE_MEMBER_UAV(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		UE_BINDLESS_UAV_HEAP_DECL(SafeType##UBName##_##Name); \
+		SafeType##UBName##_##Name GetBindlessResource##UBName##_##Name() { return GetUAVFromHeap(SafeType##UBName##_##Name, UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessUAV_, Name)); } \
+		static const SafeType##UBName##_##Name UBName##_##Name = GetBindlessResource##UBName##_##Name();
+
+	#define UB_RESOURCE_MEMBER_SAMPLER(Type, UBName, Name) \
+		typedef Type SafeType##UBName##_##Name; \
+		UE_BINDLESS_SAMPLER_HEAP_DECL(SafeType##UBName##_##Name); \
+		SafeType##UBName##_##Name GetBindlessSampler##UBName##_##Name() { return GetSamplerFromHeap(SafeType##UBName##_##Name, UB_CB_PREFIXED_MEMBER_ACCESS(UBName, BindlessSampler_, Name)); } \
+		static const SafeType##UBName##_##Name UBName##_##Name = GetBindlessSampler##UBName##_##Name();
+#else
+	#define UB_RESOURCE_MEMBER_SRV(Type, UBName, Name) Type UBName##_##Name
+	#define UB_RESOURCE_MEMBER_UAV(Type, UBName, Name) Type UBName##_##Name
+	#define UB_RESOURCE_MEMBER_SAMPLER(Type, UBName, Name) Type UBName##_##Name
+#endif
+
+#if UE_BINDLESS_ENABLED
+
+typedef ByteAddressBuffer FResourceCollection;
+
+uint GetCountFromResourceCollection(FResourceCollection ResourceCollection)
+{
+	return ResourceCollection.Load(0);
+}
+
+uint GetResourceIndexFromResourceCollection(FResourceCollection ResourceCollection, uint CollectionIndex)
+{
+	int Offset = (CollectionIndex + 1) * 4;
+	return ResourceCollection.Load(Offset);
+}
+
+#if defined(BINDLESS_SRV_ARRAY_PREFIX)
+	#define RESOURCE_COLLECTION_HEAP_NAME_INNER1(Prefix, Name) Prefix##Name
+	#define RESOURCE_COLLECTION_HEAP_NAME_INNER(Prefix, Name) RESOURCE_COLLECTION_HEAP_NAME_INNER1(Prefix,Name)
+	#define RESOURCE_COLLECTION_HEAP_NAME(Name) RESOURCE_COLLECTION_HEAP_NAME_INNER(BINDLESS_SRV_ARRAY_PREFIX, Name)
+
+	#define TEXTURE_FROM_COLLECTION_T(TType) \
+		typedef TType SafeType##TType; \
+		SafeType##TType RESOURCE_COLLECTION_HEAP_NAME(TType)[]; \
+		SafeType##TType TextureFromCollection_##TType(FResourceCollection ResourceCollection, uint CollectionIndex) \
+		{ \
+			uint ResourceIndex = GetResourceIndexFromResourceCollection(ResourceCollection, CollectionIndex); \
+			return RESOURCE_COLLECTION_HEAP_NAME(TType)[ResourceIndex]; \
+		}
+#else
+	#define TEXTURE_FROM_COLLECTION_T(TType) \
+		TType TextureFromCollection_##TType(FResourceCollection ResourceCollection, uint CollectionIndex) \
+		{ \
+			uint ResourceIndex = GetResourceIndexFromResourceCollection(ResourceCollection, CollectionIndex); \
+			return GetSRVFromHeap(TType, ResourceIndex); \
+		}
+#endif
+
+TEXTURE_FROM_COLLECTION_T(Texture2D)
+TEXTURE_FROM_COLLECTION_T(TextureCube)
+TEXTURE_FROM_COLLECTION_T(Texture2DArray)
+TEXTURE_FROM_COLLECTION_T(TextureCubeArray)
+TEXTURE_FROM_COLLECTION_T(Texture3D)
+
+#endif
+
+#if defined(INCLUDE_PLATFORM_BINDLESS_RESOURCES_USH)
+	#include "/Platform/Public/PlatformBindlessResources.ush"
+#elif SM6_PROFILE
+	#include "Platform/D3D/PlatformBindlessResources.ush"
+#endif

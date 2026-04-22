@@ -1,0 +1,108 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Public/Platform.ush"
+#include "/Engine/Private/Landscape/LandscapeCommon.ush"
+
+// Input:
+// First 2 channels of first texture always reserved for heightmap (see constructor of FLandscapeGrassWeightExporter_RenderThread::FComponentInfo).
+// So first two grass maps will be in z & w channels of first set of pass, otherwise packed in remaining channels.
+// Generated grass maps all end up in one big row (see FLandscapeGrassWeightExporter::FLandscapeGrassWeightExporter()).
+//
+//  -----------------------------------------
+// | LC0  | LC0  | LC1  | LC1  | LC2  | LC2  |
+// | x=h0 | x=g2 | x=h0 | x=g2 | x=h0 | x=g2 |  NumComponents=3, NumGrassMaps=3, InNumGrassMapPasses=2
+// | y=h1 | y=   | y=h1 | y=   | y=h1 | y=   |
+// | z=g0 | z=   | z=g0 | z=   | z=g0 | z=   |
+// | w=g1 | w=   | w=g1 | w=   | w=g1 | w=   |
+//  -----------------------------------------
+Texture2D<float4> InPackedGrassMaps;
+
+// Grass maps output. Each slice is a single grass combined grass map.
+// Each component is an inner grid cell. Res is vert count and includes outer edges, so a row/col is removed from each internal boundary.
+//
+//                         -------------------------------
+//                       -------------------------------  |
+//                      |  Res-1  |  Res-1  |    Res    | |
+//                      |         |         |           | |
+//  (Res-1) * NumTilesY |Res-1    |         |           | |
+//         + 1          |         |         |           | |
+//                      |---------+---------+-----------| |
+//                      |         |         |           | |
+//                      |Res-1    |         |           | |
+//                      |         |         |           | |
+//                      |         |         |           | |
+//                      |---------+---------+-----------| |
+//                      |         |         |           | |
+//                      |         |         |           | |
+//                      |Res      |         |           | |
+//                      |         |         |           | |
+//                      |         |         |           |-  NumGrassMaps slices
+//                       -------------------------------
+//                            (Res-1) * NumTilesX + 1
+//
+RWTexture2DArray<float> OutUnpackedGrassMaps;
+
+// Height output. Dimension is (NumComponentsX * InLandscapeComponentResolution, NumComponentsY * InLandscapeComponentResolution, NumGrassMaps).
+RWTexture2D<float> OutUnpackedHeight;
+
+int4 InLinearTileIndexToComponentIndex[PCG_MAX_NUM_LANDSCAPE_COMPONENTS]; // Only x component used, 16 byte alignment on arrays
+uint2 InNumTiles;
+uint InLandscapeComponentResolution; // One texel per vert, so number of quads + 1
+uint InNumGrassMapPasses;
+float3 InLandscapeGridScale; // x == LS Actor DrawScale.X, y == LS Actor DrawScale.y, z == LS Actor DrawScale.z / 128.0f (ZSCALE)
+float InLandscapeLocationZ;
+uint2 InOutputResolution;
+uint InOutputHeight;
+
+// Dispatch group count is (InOutputResolution.xy / 8, NumGrassMaps).
+[numthreads(THREADGROUPSIZE_X, THREADGROUPSIZE_Y, THREADGROUPSIZE_Z)]
+void PCGGrassMapUnpacker_CS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	if (any(DispatchThreadId.xy >= InOutputResolution))
+	{
+		return;
+	}
+
+	// The rendered landscape components in the input are not in any particular order, so lookup which component index for this output tile.
+	// Clamp because we are dividing by resolution-1 and last col/row of texture will overflow.
+	const uint2 TileCoords = min(DispatchThreadId.xy / (InLandscapeComponentResolution - 1u), InNumTiles - 1u);
+
+	const uint TileLinearIndex = TileCoords.y * InNumTiles.x + TileCoords.x;
+	const int ComponentIndex = InLinearTileIndexToComponentIndex[TileLinearIndex][0];
+
+	// Invalid component index means there was no component present for this output tile.
+	if (ComponentIndex == -1)
+	{
+		// First layer of threads also deals with height.
+		if (InOutputHeight == 1 && DispatchThreadId.z == 0)
+		{
+			OutUnpackedHeight[DispatchThreadId.xy] = 0.0f;
+		}
+
+		OutUnpackedGrassMaps[DispatchThreadId] = 0.0f;
+		return;
+	}
+
+	// Coordinates into input grass maps (see packing above).
+	const uint GrassMapIndex = DispatchThreadId.z;
+	const uint PassIndex = (GrassMapIndex + 2) / 4;
+	const uint ComponentXOffset = (ComponentIndex * InNumGrassMapPasses + PassIndex) * InLandscapeComponentResolution;
+
+	// Coordinates into packed data which are laid out horizontally (see above).
+	const uint2 LocalTileCoords = uint2(DispatchThreadId.x - TileCoords.x * (InLandscapeComponentResolution - 1), DispatchThreadId.y - TileCoords.y * (InLandscapeComponentResolution - 1));
+	const uint2 InputCoords = uint2(LocalTileCoords.x + ComponentXOffset, LocalTileCoords.y);
+
+	// Heights. The first layer threads also deal with height.
+	if (InOutputHeight == 1 && DispatchThreadId.z == 0)
+	{
+		const float RelativeHeight = (UnpackHeight(InPackedGrassMaps[InputCoords].xy) - LANDSCAPE_MID_VALUE) * InLandscapeGridScale.z * TERRAIN_ZSCALE;
+		OutUnpackedHeight[DispatchThreadId.xy] = RelativeHeight + InLandscapeLocationZ;
+	}
+
+	// Grass map source channel (see packing above).
+	const uint InputChannelIndex = (GrassMapIndex + 2) % 4;
+
+	// Grass maps
+	OutUnpackedGrassMaps[DispatchThreadId] = InPackedGrassMaps[InputCoords][InputChannelIndex];
+}

@@ -1,0 +1,2 @@
+https://filehost.perforce.com/perforce/r25.1/bin.ntarm64/p4api_vs2022_static_openssl1.1.1.zip
+https://filehost.perforce.com/perforce/r25.1/bin.ntx64/p4api_vs2022_static_openssl1.1.1.zip

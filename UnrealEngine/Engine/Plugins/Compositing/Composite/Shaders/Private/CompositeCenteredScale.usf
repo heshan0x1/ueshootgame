@@ -1,0 +1,19 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+float2 ScaleUV;
+static const float2 CenterUV = 0.5f;
+
+void MainPS(
+    noperspective float4 InUVAndScreenPos : TEXCOORD0,
+    out float4 OutColor : SV_Target0
+    )
+{
+    float2 UV = InUVAndScreenPos.xy;
+    UV = ((UV - CenterUV) * ScaleUV) + CenterUV;
+
+    OutColor = InputTexture.Sample(InputSampler, UV);
+}

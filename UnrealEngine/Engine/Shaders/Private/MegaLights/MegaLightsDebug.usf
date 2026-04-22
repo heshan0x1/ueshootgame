@@ -1,0 +1,137 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define DEBUG_MODE 1
+
+#include "../Common.ush"
+#include "/Engine/Shared/MegaLightsDefinitions.h"
+#include "MegaLights.ush"
+
+StructuredBuffer<uint> DownsampledTileAllocator;
+StructuredBuffer<uint> DownsampledTileData;
+uint DownsampledTileDataStride;
+
+StructuredBuffer<uint> TileAllocator;
+StructuredBuffer<uint> TileData;
+uint TileDataStride;
+
+uint DebugTileClassificationMode;
+
+uint GetNumTiles(uint TileType)
+{
+	return (DebugTileClassificationMode % 2 == 1) ? TileAllocator[TileType] : DownsampledTileAllocator[TileType];
+}
+
+uint2 GetUnpackedTileData(uint TileType, uint TileIndex)
+{
+	if (DebugTileClassificationMode % 2 == 1)
+	{
+		return UnpackTile(TileData[TileIndex + TileType * TileDataStride]);
+	}
+	else
+	{
+		return UnpackTile(DownsampledTileData[TileIndex + TileType * DownsampledTileDataStride]);
+	}
+}
+
+float4 GetTileTypeColor(uint TileType)
+{
+	float4 Color = ColorMagenta;
+
+	switch (TileType)
+	{
+		case TILE_MODE_SIMPLE_SHADING:
+		case TILE_MODE_SIMPLE_SHADING_RECT:
+		case TILE_MODE_SIMPLE_SHADING_RECT_TEXTURED:
+			Color = ColorLightGreen;
+			break;
+
+		case TILE_MODE_SINGLE_SHADING:
+		case TILE_MODE_SINGLE_SHADING_RECT:
+		case TILE_MODE_SINGLE_SHADING_RECT_TEXTURED:
+			Color = ColorYellow;
+			break;
+
+		case TILE_MODE_COMPLEX_SHADING:
+		case TILE_MODE_COMPLEX_SHADING_RECT:
+		case TILE_MODE_COMPLEX_SHADING_RECT_TEXTURED:
+			Color = ColorLightRed;
+			break;
+
+		case TILE_MODE_COMPLEX_SPECIAL_SHADING:
+		case TILE_MODE_COMPLEX_SPECIAL_SHADING_RECT:
+		case TILE_MODE_COMPLEX_SPECIAL_SHADING_RECT_TEXTURED:
+			Color = ColorPurple;
+			break;
+
+		case TILE_MODE_EMPTY:
+			Color = ColorSilver;
+			break;
+	};
+
+	if (IsRectLightTileType(TileType))
+	{
+		Color = lerp(Color, ColorRed, 0.2f);
+	}
+
+	if (IsTexturedLightTileType(TileType))
+	{
+		Color = lerp(Color, ColorRed, 0.2f);
+	}
+
+	return float4(Color.xyz, 0.75f);
+}
+
+/**
+ * Run one thread per tile and output debug tile classification visualization
+ */
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void MegaLightsDebugCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	FShaderPrintContext DebugContext = InitShaderPrintContext(true, float2(0.05, 0.05));
+
+	if (all(DispatchThreadId == 0))
+	{
+		Print(DebugContext, TEXT("TileType             | Num      "), FontSilver);
+		for (uint TileType = 0; TileType < MAX_USED_TILE_MODE; ++TileType)
+		{
+			FFontColor Color = InitFontColor(GetTileTypeColor(TileType).xyz);
+
+			Newline(DebugContext);
+			PrintTileTypeString(DebugContext, TileType, Color);
+			Print(DebugContext, TEXT(": "));
+			Print(DebugContext, GetNumTiles(TileType), FontValue);
+		}
+	}
+
+	uint TileIndex = DispatchThreadId.x;
+
+	for (uint TileType = 0; TileType < MAX_USED_TILE_MODE; ++TileType)
+	{
+		if (TileIndex < GetNumTiles(TileType) && TileType != TILE_MODE_EMPTY)
+		{
+			uint2 TileCoord = GetUnpackedTileData(TileType, TileIndex);
+			float4 Color = GetTileTypeColor(TileType);
+			float2 TileSizeOnScreen = TILE_SIZE;
+
+			if (DebugTileClassificationMode % 2 == 0)
+			{
+				TileSizeOnScreen *= GetDownsampleFactor();
+			}
+
+			AddFilledQuadSS(
+				DebugContext, 
+				((TileCoord + 0) * TileSizeOnScreen) / View.ViewResolutionFraction,
+				((TileCoord + 1) * TileSizeOnScreen) / View.ViewResolutionFraction,
+				Color);
+
+			AddQuadSS(
+				DebugContext,
+				((TileCoord + 0) * TileSizeOnScreen) / View.ViewResolutionFraction,
+				((TileCoord + 1) * TileSizeOnScreen) / View.ViewResolutionFraction,
+				float4(1, 1, 1, 1));
+		}
+	}
+}

@@ -1,0 +1,559 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../../Common.ush"
+#include "../../BRDF.ush"
+#include "../../BlockCompressionCommon.ush"
+#include "../../BCCompressionCommon.ush"
+#include "LumenSurfaceCache.ush"
+#include "LumenSurfaceCacheSampling.ush"
+#include "../LumenVirtualTextureCommon.ush"
+
+#ifndef THREADGROUP_SIZE
+	#define THREADGROUP_SIZE 0
+#endif
+
+Buffer<float4> CardUVRects;
+Buffer<uint> CardIndices;
+
+RWTexture2D<uint4> RWAtlasBlock4;
+RWTexture2D<uint2> RWAtlasBlock2;
+
+Texture2D SourceAlbedoAtlas;
+Texture2D SourceNormalAtlas;
+Texture2D SourceEmissiveAtlas;
+Texture2D SourceDepthAtlas;
+
+float2 OneOverSourceAtlasSize;
+float TexelCullingHeightBias;
+
+#define SURFACE_LAYER_DEPTH 0
+#define SURFACE_LAYER_ALBEDO 1
+#define SURFACE_LAYER_OPACITY 2
+#define SURFACE_LAYER_NORMAL 3
+#define SURFACE_LAYER_EMISSIVE 4
+
+void LumenCardCopyPS(
+	float4 Position : SV_POSITION,
+	float2 AtlasUV : TEXCOORD0,
+	float2 RectUV : TEXCOORD1,
+	float RectIndex : RECT_INDEX
+#if !COMPRESS
+	, out float4 OutColor0 : SV_Target0
+#endif
+)
+{
+	uint2 WriteCoord = (uint2) Position.xy;
+
+	#if SURFACE_LAYER == SURFACE_LAYER_DEPTH
+	{
+		#if COMPRESS
+		{
+			float BlockTexels[16];
+			float BlockTexelsY[16];
+			ReadBlockX(SourceDepthAtlas, GlobalPointClampedSampler, AtlasUV - OneOverSourceAtlasSize, OneOverSourceAtlasSize, BlockTexels);
+
+			for (uint TexelIndex = 0; TexelIndex < 16; ++TexelIndex)
+			{
+				// Reverse inverted Z from the HW depth buffer
+				BlockTexels[TexelIndex] = 1.0f - BlockTexels[TexelIndex];
+			}
+
+			RWAtlasBlock2[WriteCoord] = CompressBC4Block(BlockTexels);
+		}
+		#else
+		{
+			bool bValidPixel = Texture2DSampleLevel(SourceNormalAtlas, GlobalPointClampedSampler, AtlasUV, 0).w > 0.5f;
+
+			// Reverse inverted Z from the HW depth buffer
+			float Depth = 1.0f - Texture2DSampleLevel(SourceDepthAtlas, GlobalPointClampedSampler, AtlasUV, 0).x;
+
+		#if CULL_UNDERGROUND_TEXELS
+			if (bValidPixel)
+			{
+				uint CardIndex = CardIndices[uint(RectIndex)];
+
+				// Skip landscape cards because the texels are always on the ground
+				if (CardIndex != 0xffffffff)
+				{
+					float4 CardUVRect = CardUVRects[uint(RectIndex)];
+					float2 CardUV = lerp(CardUVRect.xy, CardUVRect.zw, RectUV);
+
+					FLumenCardData Card = GetLumenCardData(CardIndex);
+
+					float3 TexelWorldPosition = GetCardWorldPosition(Card, CardUV, Depth);
+
+					bool bInsideVolume;
+					uint SampledMipLevel;
+					float WorldHeight;
+					SampleHeightVirtualTexture(TexelWorldPosition, bInsideVolume, SampledMipLevel, WorldHeight);
+
+					if (bInsideVolume && SampledMipLevel != 0xffffffff)
+					{
+						float HeightBias = TexelCullingHeightBias * float(1u << SampledMipLevel);
+						bValidPixel = TexelWorldPosition.z + HeightBias > WorldHeight;
+					}
+				}
+			}
+		#endif
+
+			OutColor0 = float4(EncodeSurfaceCacheDepth(Depth, bValidPixel), 0.0f, 0.0f, 0.0f);
+		}
+		#endif
+	}
+	#elif SURFACE_LAYER == SURFACE_LAYER_ALBEDO
+	{
+		#if COMPRESS
+		{
+			float3 BlockTexels[16];
+			ReadBlockRGB(SourceAlbedoAtlas, GlobalPointClampedSampler, AtlasUV - OneOverSourceAtlasSize, OneOverSourceAtlasSize, BlockTexels);
+			RWAtlasBlock4[WriteCoord] = CompressBC7Block(BlockTexels);
+		}
+		#else
+		{
+			float3 Albedo = Texture2DSampleLevel(SourceAlbedoAtlas, GlobalPointClampedSampler, AtlasUV, 0).xyz;
+			OutColor0 = float4(Albedo, 0.0f);
+		}
+		#endif
+	}
+	#elif SURFACE_LAYER == SURFACE_LAYER_OPACITY
+	{
+		#if COMPRESS
+		{
+			float BlockTexels[16];
+			ReadBlockAlpha(SourceAlbedoAtlas, GlobalPointClampedSampler, AtlasUV - OneOverSourceAtlasSize, OneOverSourceAtlasSize, BlockTexels);
+			RWAtlasBlock2[WriteCoord] = CompressBC4Block(BlockTexels);
+		}
+		#else
+		{
+			float Opacity = Texture2DSampleLevel(SourceAlbedoAtlas, GlobalPointClampedSampler, AtlasUV, 0).w;
+			OutColor0 = float4(Opacity, 0.0f, 0.0f, 0.0f);
+		}
+		#endif
+	}
+	#elif SURFACE_LAYER == SURFACE_LAYER_NORMAL
+	{
+		#if COMPRESS
+		{
+			float BlockTexelsX[16];
+			float BlockTexelsY[16];
+			ReadBlockXY(SourceNormalAtlas, GlobalPointClampedSampler, AtlasUV - OneOverSourceAtlasSize, OneOverSourceAtlasSize, BlockTexelsX, BlockTexelsY);
+			RWAtlasBlock4[WriteCoord] = CompressBC5Block(BlockTexelsX, BlockTexelsY);
+		}
+		#else
+		{
+			float3 Normal = Texture2DSampleLevel(SourceNormalAtlas, GlobalPointClampedSampler, AtlasUV, 0).xyz;
+			OutColor0 = float4(Normal.xy, 0.0f, 0.0f);
+		}
+		#endif
+	}
+	#elif SURFACE_LAYER == SURFACE_LAYER_EMISSIVE
+	{
+		#if COMPRESS
+		{
+			float3 BlockTexels[16];
+			ReadBlockRGB(SourceEmissiveAtlas, GlobalPointClampedSampler, AtlasUV - OneOverSourceAtlasSize, OneOverSourceAtlasSize, BlockTexels);
+			RWAtlasBlock4[WriteCoord] = CompressBC6HBlock(BlockTexels);
+		}
+		#else
+		{
+			float3 Emissive = Texture2DSampleLevel(SourceEmissiveAtlas, GlobalPointClampedSampler, AtlasUV, 0).xyz;
+			OutColor0 = float4(Emissive.xyz, 0.0f);
+		}
+		#endif
+	}
+	#endif
+}
+
+Texture2D SourceOpacityAtlas;
+Buffer<uint4> SourceCardData;
+
+void LumenCardResamplePS(
+	float4 SvPosition : SV_POSITION,
+	float2 AtlasUV : TEXCOORD0,
+	float2 RectUV : TEXCOORD1,
+	float RectIndexF : RECT_INDEX,
+	out float4 OutAlbedoOpacity : SV_Target0,
+	out float4 OutNormal : SV_Target1,
+	out float4 OutEmissive : SV_Target2,
+	out float OutDepth : SV_DEPTH)
+{
+	uint RectIndex = uint(RectIndexF);
+	uint PackedData = SourceCardData[RectIndex * 2 + 0].y;
+	uint SourceCardIndex = (PackedData & 0x7fffffff) - 1u;
+	bool bResample = SourceCardIndex != uint(-1);
+
+	if (bResample)
+	{
+		bResample = false;
+
+		bool bAxisXFlipped = (PackedData & 0x80000000) != 0;
+		float4 CardUVRect = asfloat(SourceCardData[RectIndex * 2 + 1]);
+		float2 CardUV = CardUVRect.xy + (CardUVRect.zw - CardUVRect.xy) * RectUV;
+
+		if (bAxisXFlipped)
+		{
+			CardUV.x = 1.0f - CardUV.x;
+		}
+
+		// LumenCardScene contains the old card structure during the resample
+		FLumenCardData OldCard = GetLumenCardData(SourceCardIndex);
+
+		// Assuming card extent hasn't changed
+		float2 LocalSamplePosition = GetCardLocalPosition(OldCard.LocalExtent, CardUV, 0.0f).xy;
+
+		FLumenCardSample CardSample = ComputeSurfaceCacheSample(OldCard, SourceCardIndex, LocalSamplePosition, 0.0f, false);
+		if (CardSample.bValid)
+		{
+			float4 TexelDepths = SourceDepthAtlas.Gather(GlobalPointClampedSampler, CardSample.PhysicalAtlasUV, 0.0f);
+			float4 TexelValid;
+
+			for (uint TexelIndex = 0; TexelIndex < 4; ++TexelIndex)
+			{
+				if (OldCard.bHeightfield)
+				{
+					// No need to depth test heightfields
+					TexelValid[TexelIndex] = 1.0f;
+				}
+				else
+				{
+					// Skip invalid texels
+					TexelValid[TexelIndex] = IsSurfaceCacheDepthValid(TexelDepths[TexelIndex]) ? 1.0f : 0.0f;
+				}
+			}
+
+			float4 TexelWeights = CardSample.TexelBilinearWeights * TexelValid;
+			float TexelWeightSum = dot(TexelWeights, 1.0f);
+
+			if (TexelWeightSum > 0.0f)
+			{
+				bResample = true;
+				TexelWeights /= TexelWeightSum;
+
+				float Depth = dot(TexelDepths, TexelWeights);
+				float3 Albedo = SampleSurfaceCacheAtlas(SourceAlbedoAtlas, CardSample.PhysicalAtlasUV, TexelWeights);
+				float Opacity = SampleSurfaceCacheAtlas(SourceOpacityAtlas, CardSample.PhysicalAtlasUV, TexelWeights).x;
+				float2 Normal = SampleSurfaceCacheAtlas(SourceNormalAtlas, CardSample.PhysicalAtlasUV, TexelWeights).xy;
+				float3 Emissive = SampleSurfaceCacheAtlas(SourceEmissiveAtlas, CardSample.PhysicalAtlasUV, TexelWeights);
+
+				OutAlbedoOpacity = float4(Albedo, Opacity);
+				OutNormal = float4(Normal, 0.0f, 1.0f);
+				OutEmissive = float4(Emissive, 0.0f);
+				OutDepth = 1.0f - Depth;
+			}
+		}
+	}
+
+	if (!bResample)
+	{
+		OutAlbedoOpacity = 0.0f;
+		OutNormal = float4(0.5f, 0.5f, 0.0f, 0.0f);
+		OutEmissive = 0.0f;
+		OutDepth = 0.0f;
+	}
+}
+
+#ifdef ClearCompressedAtlasCS
+float3 ClearValue;
+uint2 OutputAtlasSize;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ClearCompressedAtlasCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint2 WriteCoord = DispatchThreadId.xy;
+	if (all(WriteCoord < OutputAtlasSize))
+	{
+		#if SURFACE_LAYER == SURFACE_LAYER_DEPTH
+		{
+			float BlockTexels[16];
+			for (uint TexelIndex = 0; TexelIndex < 16; ++TexelIndex)
+			{
+				BlockTexels[TexelIndex] = ClearValue.x;
+			}
+			RWAtlasBlock2[WriteCoord] = CompressBC4Block(BlockTexels);
+		}
+		#elif SURFACE_LAYER == SURFACE_LAYER_ALBEDO
+		{
+			float3 BlockTexels[16];
+			for (uint TexelIndex = 0; TexelIndex < 16; ++TexelIndex)
+			{
+				BlockTexels[TexelIndex] = ClearValue;
+			}
+			RWAtlasBlock4[WriteCoord] = CompressBC7Block(BlockTexels);
+		}
+		#elif SURFACE_LAYER == SURFACE_LAYER_OPACITY
+		{
+			float BlockTexels[16];
+			for (uint TexelIndex = 0; TexelIndex < 16; ++TexelIndex)
+			{
+				BlockTexels[TexelIndex] = ClearValue.x;
+			}
+			RWAtlasBlock2[WriteCoord] = CompressBC4Block(BlockTexels);
+		}
+		#elif SURFACE_LAYER == SURFACE_LAYER_NORMAL
+		{
+			float BlockTexelsX[16];
+			float BlockTexelsY[16];
+			for (uint TexelIndex = 0; TexelIndex < 16; ++TexelIndex)
+			{
+				BlockTexelsX[TexelIndex] = ClearValue.x;
+				BlockTexelsY[TexelIndex] = ClearValue.y;
+			}
+			RWAtlasBlock4[WriteCoord] = CompressBC5Block(BlockTexelsX, BlockTexelsY);
+		}
+		#elif SURFACE_LAYER == SURFACE_LAYER_EMISSIVE
+		{
+			float3 BlockTexels[16];
+			for (uint TexelIndex = 0; TexelIndex < 16; ++TexelIndex)
+			{
+				BlockTexels[TexelIndex] = ClearValue;
+			}
+			RWAtlasBlock4[WriteCoord] = CompressBC6HBlock(BlockTexels);
+		}
+		#endif
+	}
+}
+#endif
+
+uint DilationTileDataOffset;
+
+Buffer<uint4> CardPageRectBuffer;
+Buffer<uint> PackedCardTileDataBuffer;
+
+RWTexture2D<UNORM float4> RWAlbedoAtlas;
+RWTexture2D<UNORM float4> RWNormalAtlas;
+RWTexture2D<float> RWDepthAtlas;
+
+uint PackTileData(uint2 TileCoord, uint PageIndex)
+{
+	return TileCoord.x | (TileCoord.y << 4u) | (PageIndex << 8u);
+}
+
+void UnpackTileData(uint Packed, out uint2 TileCoord, out uint PageIndex)
+{
+	TileCoord.x = BitFieldExtractU32(Packed, 4, 0);
+	TileCoord.y = BitFieldExtractU32(Packed, 4, 4);
+	PageIndex = BitFieldExtractU32(Packed, 24, 8);
+}
+
+#ifdef CopyCapturedCardPageCS
+
+#define TILE_SIZE 8
+#define BORDER_SIZE 1
+#define TILE_SIZE_WITH_BORDER (TILE_SIZE + BORDER_SIZE * 2)
+
+groupshared uint GroupAlbedoStorage[TILE_SIZE_WITH_BORDER][TILE_SIZE_WITH_BORDER];
+groupshared uint GroupNormalStorage[TILE_SIZE_WITH_BORDER][TILE_SIZE_WITH_BORDER];
+groupshared float GroupDepthStorage[TILE_SIZE_WITH_BORDER][TILE_SIZE_WITH_BORDER];
+
+float4 LoadGroupAlbedo(uint2 Coord)
+{
+	uint PackedAlbedo = GroupAlbedoStorage[Coord.y][Coord.x];
+	float4 Result;
+	Result.r = float(BitFieldExtractU32(PackedAlbedo, 8, 0)) / 255.0;
+	Result.g = float(BitFieldExtractU32(PackedAlbedo, 8, 8)) / 255.0;
+	Result.b = float(BitFieldExtractU32(PackedAlbedo, 8, 16)) / 255.0;
+	Result.a = float(BitFieldExtractU32(PackedAlbedo, 8, 24)) / 255.0;
+	return Result;
+}
+
+void StoreGroupAlbedo(uint2 Coord, float4 Albedo)
+{
+	uint4 Temp = uint4((Albedo + 1.0 / 512.0) * 255.0);
+	uint PackedAlbedo = Temp.x | (Temp.y << 8u) | (Temp.z << 16u) | (Temp.w << 24u);
+	GroupAlbedoStorage[Coord.y][Coord.x] = PackedAlbedo;
+}
+
+float4 LoadGroupNormal(uint2 Coord)
+{
+	uint PackedNormal = GroupNormalStorage[Coord.y][Coord.x];
+	float4 Result;
+	Result.x = float(BitFieldExtractU32(PackedNormal, 10, 0)) / 1023.0;
+	Result.y = float(BitFieldExtractU32(PackedNormal, 10, 10)) / 1023.0;
+	Result.z = float(BitFieldExtractU32(PackedNormal, 10, 20)) / 1023.0;
+	Result.w = float(BitFieldExtractU32(PackedNormal, 1, 31));
+	Result.xyz = Result.xyz * 2.0 - 1.0;
+	return Result;
+}
+
+void StoreGroupNormal(uint2 Coord, float4 Normal)
+{
+	Normal.xyz = saturate(Normal.xyz * 0.5 + 0.5);
+	uint4 Temp = uint4((Normal.xyz + 1.0 / 2048.0) * 1023.0, Normal.w > 0.5 ? 1 : 0);
+	uint PackedNormal = Temp.x | (Temp.y << 10u) | (Temp.z << 20u) | (Temp.w << 31u);
+	GroupNormalStorage[Coord.y][Coord.x] = PackedNormal;
+}
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void CopyCapturedCardPageCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint TileDataOffset = 0;
+#if DILATE_ONE_TEXEL
+	TileDataOffset = DilationTileDataOffset;
+#endif
+
+	uint PageIndex;
+	uint2 TileCoord;
+	UnpackTileData(PackedCardTileDataBuffer[TileDataOffset + GroupId.x], TileCoord, PageIndex);
+
+	int4 PageRect = CardPageRectBuffer[PageIndex];
+	int2 TileBase = PageRect.xy + TileCoord * TILE_SIZE;
+
+#if DILATE_ONE_TEXEL
+	for (int OffsetY = 0; OffsetY < TILE_SIZE_WITH_BORDER; OffsetY += THREADGROUP_SIZE)
+	{
+		for (int OffsetX = 0; OffsetX < TILE_SIZE_WITH_BORDER; OffsetX += THREADGROUP_SIZE)
+		{
+			int2 SharedCoord = int2(OffsetX, OffsetY) + GroupThreadId.xy;
+
+			if (all(SharedCoord < TILE_SIZE_WITH_BORDER))
+			{
+				int2 SourceCoord = TileBase - BORDER_SIZE + SharedCoord;
+				float2 SourceUV = (SourceCoord + 0.5f) * OneOverSourceAtlasSize;
+			
+				float4 Albedo = 0.0f;
+				float4 Normal = float4(0.0f, 0.0f, 1.0f, 0.0f);
+				float Depth = 0.0f;
+
+				if (all(and(SourceCoord >= PageRect.xy, SourceCoord < PageRect.zw)))
+				{
+					Albedo = Texture2DSampleLevel(SourceAlbedoAtlas, GlobalPointClampedSampler, SourceUV, 0);
+					Normal = Texture2DSampleLevel(SourceNormalAtlas, GlobalPointClampedSampler, SourceUV, 0);
+					Depth = Texture2DSampleLevel(SourceDepthAtlas, GlobalPointClampedSampler, SourceUV, 0).x;
+
+					Albedo.xyz *= Albedo.xyz;
+					Normal.xyz = DecodeSurfaceCacheCardSpaceNormal(Normal.xy);
+				}
+
+				StoreGroupAlbedo(SharedCoord, Albedo);
+				StoreGroupNormal(SharedCoord, Normal);
+				GroupDepthStorage[SharedCoord.y][SharedCoord.x] = Depth;
+			}
+		}
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	float4 Albedo = LoadGroupAlbedo(GroupThreadId.xy + BORDER_SIZE);
+	float4 Normal = LoadGroupNormal(GroupThreadId.xy + BORDER_SIZE);
+	float Depth = GroupDepthStorage[GroupThreadId.y + BORDER_SIZE][GroupThreadId.x + BORDER_SIZE];
+	bool bValid = Normal.w > 0.5f;
+
+	if (!bValid)
+	{
+		Albedo = 0.0f;
+		Normal = 0.0f;
+		Depth = 0.0f;
+
+		for (uint OffsetY = 0; OffsetY < 3; ++OffsetY)
+		{
+			for (uint OffsetX = 0; OffsetX < 3; ++OffsetX)
+			{
+				if (OffsetX != 1u || OffsetY != 1u)
+				{
+					uint2 NeighborCoord = GroupThreadId.xy + uint2(OffsetX, OffsetY);
+					float4 NeighborNormal = LoadGroupNormal(NeighborCoord);
+
+					if (NeighborNormal.w > 0.5f)
+					{
+						Normal += float4(NeighborNormal.xyz, 1.0f);
+						Albedo += LoadGroupAlbedo(NeighborCoord);
+						Depth += GroupDepthStorage[NeighborCoord.y][NeighborCoord.x];
+					}
+				}
+			}
+		}
+
+		float WeightSum = Normal.w;
+		if (WeightSum > 0.0f)
+		{
+			bValid = true;
+			Albedo /= WeightSum;
+			Depth /= WeightSum;
+
+			float NormalLen2 = dot(Normal.xyz, Normal.xyz);
+			Normal.xyz = NormalLen2 > 1.e-8f ? Normal.xyz * rsqrt(NormalLen2) : float3(0.0f, 0.0f, 1.0f);
+		}
+	}
+
+	float4 EncodedAlbedo = float4(sqrt(Albedo.xyz), Albedo.w);
+	float4 EncodedNormal = float4(saturate(Normal.xy * 0.5f + 0.5f), 0.0f, bValid ? 1.0f : 0.0f);
+#else
+	uint2 SourceCoord = TileBase + GroupThreadId.xy;
+	float2 SourceUV = (SourceCoord + 0.5f) * OneOverSourceAtlasSize;
+
+	float4 EncodedAlbedo = Texture2DSampleLevel(SourceAlbedoAtlas, GlobalPointClampedSampler, SourceUV, 0);
+	float4 EncodedNormal = Texture2DSampleLevel(SourceNormalAtlas, GlobalPointClampedSampler, SourceUV, 0);
+	float Depth = Texture2DSampleLevel(SourceDepthAtlas, GlobalPointClampedSampler, SourceUV, 0).x;
+#endif
+
+	RWAlbedoAtlas[TileBase + GroupThreadId.xy] = EncodedAlbedo;
+	RWNormalAtlas[TileBase + GroupThreadId.xy] = EncodedNormal;
+	RWDepthAtlas[TileBase + GroupThreadId.xy] = Depth;
+}
+
+#endif // CopyCapturedCardPageCS
+
+uint NumCardPages;
+
+Buffer<uint> DilationPageMaskBuffer;
+
+RWBuffer<uint> RWTileAllocator;
+RWBuffer<uint> RWDilationTileAllocator;
+RWBuffer<uint> RWPackedCardTileDataBuffer;
+
+#ifdef GenerateDilationTileDataCS
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void GenerateDilationTileDataCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	uint PageIndex = DispatchThreadId.x;
+
+	if (PageIndex >= NumCardPages)
+	{
+		return;
+	}
+
+	uint4 PageRect = CardPageRectBuffer[PageIndex];
+	uint2 PageSize = PageRect.zw - PageRect.xy;
+
+	uint DwordIndex = PageIndex / 32;
+	uint BitMask = 1u << (PageIndex % 32);
+	bool bNeedsDilation = (DilationPageMaskBuffer[DwordIndex] & BitMask) != 0;
+
+	uint2 TileSize = uint2(8, 8);
+	uint2 TileCount2D = PageSize / TileSize;
+	uint TileCount = TileCount2D.x * TileCount2D.y;
+
+	uint TileDataOffset;
+	if (bNeedsDilation)
+	{
+		InterlockedAdd(RWDilationTileAllocator[0], TileCount, TileDataOffset);
+		TileDataOffset += DilationTileDataOffset;
+	}
+	else
+	{
+		InterlockedAdd(RWTileAllocator[0], TileCount, TileDataOffset);
+	}
+
+	for (uint TileY = 0; TileY < TileCount2D.y; ++TileY)
+	{
+		for (uint TileX = 0; TileX < TileCount2D.x; ++TileX)
+		{
+			uint TileIndex = TileY * TileCount2D.x + TileX;
+			uint2 TileCoord = uint2(TileX, TileY);
+
+			RWPackedCardTileDataBuffer[TileDataOffset + TileIndex] = PackTileData(TileCoord, PageIndex);
+		}
+	}
+}
+
+#endif // GenerateDilationTileDataCS

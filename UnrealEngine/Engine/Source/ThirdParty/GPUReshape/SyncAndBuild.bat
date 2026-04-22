@@ -1,0 +1,1 @@
+Python.exe SyncAndBuild.py

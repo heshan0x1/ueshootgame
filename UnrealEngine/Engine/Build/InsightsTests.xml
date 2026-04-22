@@ -1,0 +1,106 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../Build/Graph/Schema.xsd" >
+	<!-- Horde Options -->	
+	<EnvVar Name="UE_HORDE_JOBID"/>
+	<EnvVar Name="UE_HORDE_STEPID"/>
+
+	<Include Script="Graph/Tasks/Inc/SharedProperties.xml" />
+
+	<Option Name="Clients" DefaultValue="" Description="Comma separated list of client specifiers in format [ClientTarget;Platform1+...;ProjectDir;ProjectName;Test]. Project path can be empty." />
+	<Option Name="ViewerMode" DefaultValue="false" Description="Whether to run insights tests in viewer mode"/>
+	<Option Name="HubMode" DefaultValue="false" Description="Whether to run insights tests in hub mode"/>
+	<Option Name="GenerateTraces" DefaultValue="false" Description="Set to true to generate insights traces against a list of clients"/>
+	<Option Name="HostTests" DefaultValue="System.Insights" Description="Tests to run with the Insights app"/>
+	<Option Name="Configuration" DefaultValue="Development" Description="Development, Debug or Shipping"/>
+	<Option Name="Devices" DefaultValue="" Description="A list of devices to test for all clients and platforms, separated by ;"/>
+	<Option Name="SkipCook" DefaultValue="false" Description="Skip the cooking stage"/>
+	<Option Name="SkipBuild" DefaultValue="false" Description="Skip the build stage"/>
+	<Option Name="SkipRun" DefaultValue="false" Description="Skip running the tests"/>
+	<Option Name="GauntletDevicePool" DefaultValue="UE4" Description="Gauntlet Device Pool to use to run target platform tests"/>
+	<Option Name="TestOnWin64" DefaultValue="true" Description="Test using Win64 host" />
+	<Option Name="TestOnMac" DefaultValue="false" Description="Test using Mac host" />
+	<Option Name="TestOnLinux" DefaultValue="false" Description="Test using Linux host" />
+	
+	<Option Name="OverrideAgentWin64" DefaultValue="" Description="Override the Win64 agent to run tests on" />
+	<Option Name="OverrideAgentMac" DefaultValue="" Description="Override the Mac agent to run tests on" />
+	<Option Name="OverrideAgentLinux" DefaultValue="" Description="Override the Linux agent to run tests on" />
+
+	<Property Name="TestNodes" Value=""/>
+	<Property Name="HostAgents" Value="Win64;Linux;Mac" />
+
+	<Property Name="ExtraArgs" Value=""/>
+	<Property Name="ExtraArgs" Value="$(ExtraArgs) -devices=$(Devices)" If="'$(Devices)' != ''"/>
+	<Property Name="ExtraArgs" Value="$(ExtraArgs) -deviceurl=$(GauntletDeviceService) -devicepool=$(GauntletDevicePool)"/>
+
+	<ForEach Name="AgentType" Values="$(HostAgents)" Separator=";">
+		<Property Name="BuildPlatform" Value=""/>
+		<Property Name="BuildPlatform" Value="$(AgentType)"/>
+		<Property Name="OverrideAgent" Value="$(OverrideAgent$(BuildPlatform))" />
+		<Property Name="AgentType" Value="$(OverrideAgent)" If="'$(OverrideAgent)' != ''"/>
+		<Agent Name="Insights Automation Prerequsites - $(BuildPlatform)" Type="$(AgentType)" If="$(TestOn$(BuildPlatform))">
+			<Node Name="Unreal Editor $(BuildPlatform)">
+				<Compile Target="UnrealEditor" Platform="$(BuildPlatform)" Configuration="$(Configuration)"  Arguments="-UBA"/>
+			</Node>
+			<Node Name="Unreal Insights $(BuildPlatform)">
+				<Compile Target="UnrealInsights" Platform="$(BuildPlatform)" Configuration="$(Configuration)" Arguments="-UBA"/>
+			</Node>
+			<Node Name="Build Cook Clients $(BuildPlatform)" Requires="Unreal Insights $(BuildPlatform)" Produces="#ClientExecutables" IgnoreModified="$(RootDir)/...">
+				<ForEach Name="ClientSpec" Values="$(Clients)" Separator=",">
+					<Property Name="ClientTarget" Value=""/>
+					<Property Name="PlatformList" Value=""/>
+					<Property Name="ProjectDir" Value=""/>
+					<Property Name="ProjectName" Value=""/>
+					<Property Name="ClientTest" Value=""/>
+					<Property Name="ClientTraces" Value=""/>
+					<Regex Pattern="(.*);(.*);(.*);(.*);(.*);(.*)" Capture="ClientTarget;PlatformList;ProjectDir;ProjectName;ClientTest;ClientTraces" Input="$(ClientSpec)"/>
+					<ForEach Name="Platform" Values="$(PlatformList)" Separator="+">
+						<Property Name="CookOption" Value=""/>
+						<Property Name="CookOption" Value="-Cook" If="!$(SkipCook)"/>
+						<Property Name="CookOption" Value="-SkipCook" If="$(SkipCook)"/>
+						<Property Name="BuildOption" Value=""/>
+						<Property Name="BuildOption" Value="-Build" If="!$(SkipBuild)"/>
+						<Property Name="BuildOption" Value="-SkipBuild" If="$(SkipBuild)"/>
+						<Command Name="BuildCookRun" Arguments="$(BuildOption) $(CookOption) -Stage -Pak -NoSubmit -NoCodeSign -notools -project=$(RootDir)/$(ProjectDir)/$(ProjectName).uproject -configuration=$(Configuration) -platform=$(Platform) -UBA"/>
+					</ForEach>
+					<Copy From="$(RootDir)/$(ProjectDir)/Saved/StagedBuilds/..." To="$(RootDir)/Client_Binaries/$(ProjectDir)" Tag="#ClientExecutables" ErrorIfNotFound="true"/>
+				</ForEach>
+			</Node>
+		</Agent>
+
+		<!-- UnrealInsights can only be launched on Test-* typed agents. -->
+		<Property Name="TestAgentType" Value="TestWin64" If="'$(AgentType)' == 'Win64'"/>
+		<Property Name="TestAgentType" Value="TestLinux" If="'$(AgentType)' == 'Linux'"/>
+		<Property Name="TestAgentType" Value="TestMac" If="'$(AgentType)' == 'Mac'"/>
+
+		<Agent Name="Insights Automation $(BuildPlatform)" Type="$(TestAgentType)" If="$(TestOn$(BuildPlatform))">
+			<Node Name="Insights Generate Traces $(BuildPlatform)" Requires="Unreal Insights $(BuildPlatform);Build Cook Clients $(BuildPlatform);#ClientExecutables" IgnoreModified="$(RootDir)/...">
+				<ForEach Name="ClientSpec" Values="$(Clients)" Separator=",">
+					<Property Name="ClientTarget" Value=""/>
+					<Property Name="PlatformList" Value=""/>
+					<Property Name="ProjectDir" Value=""/>
+					<Property Name="ProjectName" Value=""/>
+					<Property Name="ClientTest" Value=""/>
+					<Property Name="ClientTraces" Value=""/>
+					<Regex Pattern="(.*);(.*);(.*);(.*);(.*);(.*)" Capture="ClientTarget;PlatformList;ProjectDir;ProjectName;ClientTest;ClientTraces" Input="$(ClientSpec)"/>
+					<Copy From="$(RootDir)/Client_Binaries/$(ProjectDir)/..." To="$(RootDir)/$(ProjectDir)/Saved/StagedBuilds" ErrorIfNotFound="true" Overwrite="True"/>
+				</ForEach>
+				<Property Name="TestNodes" Value="$(TestNodes);Insights Generate Traces $(BuildPlatform)" If="$(GenerateTraces)"/>
+				<Property Name="GenerateTracesExtraArgs" Value=""/>
+				<Property Name="GenerateTracesExtraArgs" Value=" -WriteTraceFileOnly" If="'$(BuildPlatform)' == 'Linux'"/>
+				<Command Name="RunInsightsTests" Arguments="-test=InsightsTests -clients=$(Clients) -configuration=$(Configuration) $(ExtraArgs) $(GenerateTracesExtraArgs) -Verbose" If="!$(SkipRun)"/>
+			</Node>
+			<Node Name="Insights Viewer Mode $(BuildPlatform)" Requires="Unreal Editor $(BuildPlatform);Unreal Insights $(BuildPlatform)">
+				<Property Name="ViewerModeTests" Value="StartsWith:System.Insights.Analysis+StartsWith:System.Insights.Trace"/>
+				<Property Name="TestNodes" Value="$(TestNodes);Insights Viewer Mode $(BuildPlatform)" If="$(ViewerMode)"/>
+				<Command Name="RunInsightsTests" Arguments="-test=InsightsTests -mode=Viewer -HostTests=$(ViewerModeTests) -configuration=$(Configuration) $(ExtraArgs) -Verbose"/>
+			</Node>
+			<Node Name="Insights Hub Mode $(BuildPlatform)" Requires="Unreal Editor $(BuildPlatform);Unreal Insights $(BuildPlatform)">
+				<Property Name="HubModeTests" Value="StartsWith:System.Insights.Hub"/>
+				<Property Name="TestNodes" Value="$(TestNodes);Insights Hub Mode $(BuildPlatform)" If="$(HubMode)"/>
+				<Command Name="RunInsightsTests" Arguments="-test=InsightsTests -mode=Hub -HostTests=$(HubModeTests) -configuration=$(Configuration) $(ExtraArgs) -Verbose"/>
+			</Node>
+		</Agent>
+	</ForEach>
+
+	<Aggregate Name="Insights Tests" Requires="$(TestNodes)"/>
+</BuildGraph>

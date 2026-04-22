@@ -1,0 +1,70 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "TakeRecorderSource.h"
+#include "TakeRecorderSources.h"
+#include "UObject/SoftObjectPtr.h"
+#include "Templates/SubclassOf.h"
+#include "GameFramework/Actor.h"
+#include "TakeRecorderWorldSource.generated.h"
+
+class UTexture;
+class UTakeRecorderActorSource;
+
+#define UE_API TAKERECORDERSOURCES_API
+
+/** A recording source that records world state */
+UCLASS(Abstract, MinimalAPI, config = EditorSettings, DisplayName = "World Recorder")
+class UTakeRecorderWorldSourceSettings : public UTakeRecorderSource
+{
+public:
+	GENERATED_BODY()
+
+	UE_API UTakeRecorderWorldSourceSettings(const FObjectInitializer& ObjInit);
+
+	UE_API virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+
+	/** Record world settings */
+	UPROPERTY(config, EditAnywhere, BlueprintReadWrite, Category = "Source")
+	bool bRecordWorldSettings;
+
+	/** Add a binding and track for all actors that aren't explicitly being recorded */
+	UPROPERTY(config, EditAnywhere, BlueprintReadWrite, Category = "Source")
+	bool bAutotrackActors;
+};
+
+
+/** A recording source that records world state */
+UCLASS(MinimalAPI, Category="Actors")
+class UTakeRecorderWorldSource : public UTakeRecorderWorldSourceSettings
+{
+public:
+	GENERATED_BODY()
+
+	UE_API UTakeRecorderWorldSource(const FObjectInitializer& ObjInit);
+
+private:
+
+	// UTakeRecorderSource
+	UE_API virtual TArray<UTakeRecorderSource*> PreRecording(ULevelSequence* InSequence, FMovieSceneSequenceID InSequenceID, ULevelSequence* InRootSequence, FManifestSerializer* InManifestSerializer) override;
+	UE_API virtual TArray<UTakeRecorderSource*> PostRecording(class ULevelSequence* InSequence, class ULevelSequence* InRootSequence, const bool bCancelled) override;
+	UE_API virtual bool SupportsTakeNumber() const override { return false; }
+	UE_API virtual FText GetDisplayTextImpl() const override;
+	UE_API virtual FText GetAddSourceDisplayTextImpl() const override;		
+	UE_API virtual bool CanAddSource(UTakeRecorderSources* InSources) const override;
+
+	// This source does not support subscenes (ie. "World Settings subscene"), but the world settings actor would be placed in subscenes if the option is enabled
+	virtual bool SupportsSubscenes() const override { return false; }
+
+private:
+
+	/*
+	 * Autotrack actors in the world that aren't already being recorded
+	 */
+	void AutotrackActors(class ULevelSequence* InSequence, UWorld* InWorld);
+
+	TWeakObjectPtr<UTakeRecorderActorSource> WorldSource;
+};
+
+#undef UE_API

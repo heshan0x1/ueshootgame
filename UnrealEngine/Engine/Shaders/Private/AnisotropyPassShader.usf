@@ -1,0 +1,172 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	AnisotropyPassShader.usf: Outputs Anisotropy and World Tangent to GBufferF
+=============================================================================*/
+
+#include "Common.ush"
+#include "/Engine/Generated/Material.ush"
+#include "/Engine/Generated/VertexFactory.ush"
+#include "DeferredShadingCommon.ush"
+
+
+#if SUBSTRATE_ENABLED && SUBSTRATE_GBUFFER_FORMAT==0
+#define MATERIAL_SUBSTRATE_OPAQUE_PRECOMPUTED_LIGHTING 0 
+#define SUBSTRATE_MATERIAL_EXPORT_REQUESTED 1
+#include "/Engine/Private/Substrate/SubstrateExport.ush"
+#endif
+
+struct FAnisotropyPassVSToPS
+{
+	INVARIANT_OUTPUT float4 Position : SV_POSITION;
+	FVertexFactoryInterpolantsVSToPS Interps;
+
+	#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+		float3 PixelPositionExcludingWPO : TEXCOORD7;
+	#endif
+};
+
+#define FVertexOutput FAnisotropyPassVSToPS
+#define VertexFactoryGetInterpolants VertexFactoryGetInterpolantsVSToPS
+
+/*=============================================================================
+ * Vertex Shader
+ *============================================================================*/
+#if VERTEXSHADER
+void MainVertexShader(
+	FVertexFactoryInput Input,
+	out FVertexOutput Output 
+#if USE_GLOBAL_CLIP_PLANE
+	, out float OutGlobalClipPlaneDistance : SV_ClipDistance
+#endif
+	, out FStereoVSOutput StereoOutput
+	)
+{
+	StereoSetupVF(Input, StereoOutput);
+	
+	FVertexFactoryIntermediates VFIntermediates = GetVertexFactoryIntermediates(Input);
+	float4 WorldPos = VertexFactoryGetWorldPosition(Input, VFIntermediates);
+	float4 WorldPositionExcludingWPO = WorldPos;
+
+	float3x3 TangentToLocal = VertexFactoryGetTangentToLocal(Input, VFIntermediates);
+	FMaterialVertexParameters VertexParameters = GetMaterialVertexParameters(Input, VFIntermediates, WorldPos.xyz, TangentToLocal);
+
+	// Isolate instructions used for world position offset
+	// As these cause the optimizer to generate different position calculating instructions in each pass, resulting in self-z-fighting.
+	// This is only necessary for shaders used in passes that have depth testing enabled.
+	{
+		WorldPos.xyz += GetMaterialWorldPositionOffset(VertexParameters);
+		ApplyMaterialFirstPersonTransform(VertexParameters, WorldPos.xyz);
+	}
+
+	{
+		float4 RasterizedWorldPosition = VertexFactoryGetRasterizedWorldPosition(Input, VFIntermediates, WorldPos);
+		Output.Position = INVARIANT(mul(RasterizedWorldPosition, ResolvedView.TranslatedWorldToClip));
+	}
+
+	#if XBOXONE_BIAS_HACK
+		// XB1 needs a bias in the opposite direction to fix FORT-40853
+		// XBOXONE_BIAS_HACK is defined only in a custom node in a particular material
+		// This should be removed with a future shader compiler update
+		Output.Position.z -= 0.0001 * Output.Position.w;
+	#endif
+
+	#if USE_GLOBAL_CLIP_PLANE
+		OutGlobalClipPlaneDistance = dot(ResolvedView.GlobalClippingPlane, float4(WorldPos.xyz, 1));
+	#endif
+
+	Output.Interps = VertexFactoryGetInterpolants(Input, VFIntermediates, VertexParameters);
+
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+	Output.PixelPositionExcludingWPO = WorldPositionExcludingWPO.xyz;
+#endif	
+}
+#endif // VERTEXSHADER
+
+/*=============================================================================
+ * Pixel Shader
+ *============================================================================*/
+#if PIXELSHADER
+void MainPixelShader(
+	in INPUT_POSITION_QUALIFIERS float4 SvPosition : SV_Position,
+	FVertexFactoryInterpolantsVSToPS Input
+#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+	, float3 PixelPositionExcludingWPO : TEXCOORD7
+#endif
+	, in FStereoPSInput StereoInput
+	OPTIONAL_IsFrontFace
+	OPTIONAL_OutDepthConservative
+	, out float4 GBufferF : SV_Target0
+#if MATERIALBLENDING_MASKED_USING_COVERAGE
+	, out uint OutCoverage : SV_Coverage
+#endif
+	)
+{
+	StereoSetupPS(StereoInput);
+
+	// Manual clipping here (alpha-test, etc)
+	FMaterialPixelParameters MaterialParameters = GetMaterialPixelParameters(Input, SvPosition);
+	FPixelMaterialInputs PixelMaterialInputs;
+
+	#if USE_WORLD_POSITION_EXCLUDING_SHADER_OFFSETS
+		float4 ScreenPosition = SvPositionToResolvedScreenPosition(SvPosition);
+		float3 TranslatedWorldPosition = SvPositionToResolvedTranslatedWorld(SvPosition);
+		CalcMaterialParametersEx(MaterialParameters, PixelMaterialInputs, SvPosition, ScreenPosition, bIsFrontFace, TranslatedWorldPosition, PixelPositionExcludingWPO);	
+	#else
+		CalcMaterialParameters(MaterialParameters, PixelMaterialInputs, SvPosition, bIsFrontFace);
+	#endif
+
+#if OUTPUT_PIXEL_DEPTH_OFFSET
+	ApplyPixelDepthOffsetToMaterialParameters(MaterialParameters, PixelMaterialInputs, OutDepth);
+#endif
+
+#if MATERIALBLENDING_MASKED_USING_COVERAGE
+	OutCoverage = DiscardMaterialWithPixelCoverage(MaterialParameters, PixelMaterialInputs);
+#endif
+
+#if SUBSTRATE_ENABLED && TEMPLATE_USES_SUBSTRATE
+#if SUBSTRATE_GBUFFER_FORMAT==0
+		// Write legacy anisotropty data from Substrate
+
+	FSubstrateData SubstrateData = PixelMaterialInputs.GetFrontSubstrateData();
+	FSubstratePixelHeader SubstratePixelHeader = MaterialParameters.GetFrontSubstrateHeader();
+
+	FSubstrateIntegrationSettings Settings = InitSubstrateIntegrationSettings(false /*bForceFullyRough*/, false /*SubstrateStruct.bRoughDiffuse*/, 0/*SubstrateStruct.PeelLayersAboveDepth*/, false/*SubstrateStruct.bRoughnessTracking*/);
+
+	const float3 SurfaceWorldNormal = MaterialParameters.TangentToWorld[2].xyz;
+	const float3 V = MaterialParameters.CameraVector;
+	FExportResult Export = SubstrateMaterialExportOut(
+		Settings,
+		SubstratePixelHeader,
+		SubstrateData,
+		V,
+		SurfaceWorldNormal,
+		MaterialParameters.WorldPosition_CamRelative,
+		0.0f // Curvature
+		);
+
+	float Anisotropy = Export.Anisotropy;
+
+	// Similar to CalculateAnisotropyTangent. SUBSTRATE_TODO: merge the code and account for bottom normal.
+	// Exported tangent and normal are already normalized (from storage in SharedLocalNormal).
+	float3 WorldTangent = Export.WorldTangent;
+	float3 WorldNormal = Export.WorldNormal;
+	float3 WorldBiTangent = cross(WorldNormal, WorldTangent);
+	WorldTangent = normalize(cross(WorldBiTangent, WorldNormal));
+
+
+#else // SUBSTRATE_GBUFFER_FORMAT
+	#error Anisotropic shaders should not be enabled when using the full Substrate GBuffer.
+#endif // SUBSTRATE_GBUFFER_FORMAT
+
+#else // SUBSTRATE_ENABLED
+
+	float Anisotropy = GetMaterialAnisotropy(PixelMaterialInputs);
+	float3 WorldTangent = MaterialParameters.WorldTangent;
+
+#endif // SUBSTRATE_ENABLED
+
+	GBufferF = EncodeWorldTangentAndAnisotropy(WorldTangent, Anisotropy);
+}
+#endif // PIXELSHADER
+

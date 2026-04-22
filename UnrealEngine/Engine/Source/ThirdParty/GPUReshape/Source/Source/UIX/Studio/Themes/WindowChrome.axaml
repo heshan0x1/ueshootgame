@@ -1,0 +1,143 @@
+﻿<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<Styles
+    xmlns="https://github.com/avaloniaui"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:local="clr-namespace:Studio.Views.Controls">
+    <Design.PreviewWith>
+        <Grid Width="300" Height="500">
+            <StackPanel Orientation="Vertical">
+                <local:WindowChrome Title="Poof" Separator="True"/>
+                
+                <Button Content="Test"/>
+            </StackPanel>
+        </Grid>
+    </Design.PreviewWith>
+
+    <Style Selector="local|WindowChrome">
+        <Setter Property="HorizontalAlignment" Value="Stretch" />
+        <Setter Property="VerticalAlignment" Value="Top" />
+        <Setter Property="Template">
+            <ControlTemplate>
+                <Grid 
+                    x:Name="PART_DragGrid"
+                    Background="Transparent"
+                    IsHitTestVisible="True">
+                    <StackPanel 
+                        VerticalAlignment="Top"
+                        Margin="0 7 0 5" 
+                        Orientation="Vertical"
+                        IsHitTestVisible="False">
+                        <StackPanel 
+                            Margin="12 0 5 0"
+                            Orientation="Horizontal">
+                            <Image
+                                Width="16"
+                                Margin="1 1 0 0"
+                                Source="/Resources/Icons/Icon_NoFrame16.png" />
+
+                            <TextBlock 
+                                FontSize="13"
+                                Margin="11,1,0,0"
+                                Text="{TemplateBinding Title}"
+                                IsHitTestVisible="False"/>
+                        </StackPanel>
+                        
+                        <Separator
+                            Margin="0,10,0,0" 
+                            IsVisible="{TemplateBinding Separator}"
+                            Background="{StaticResource DockApplicationAccentBrushLow}"
+                            VerticalAlignment="Top"
+                            HorizontalAlignment="Stretch" Height="1"  Width="NaN"/>
+                    </StackPanel>
+        
+                    <StackPanel 
+                        ZIndex="100"
+                        Orientation="Horizontal"
+                        HorizontalAlignment="Right"
+                        VerticalAlignment="Top">
+                        <Button 
+                            Margin="0 0 2 0"
+                            Command="{TemplateBinding MinimizeCommand}"
+                            IsVisible="{TemplateBinding CanMinimize}"
+                            Classes="Window">
+                            <PathIcon
+                                Margin="0 1 0 0"
+                                Data="{StaticResource Minimize}" Width="12" />
+                        </Button>
+                        
+                        <Button 
+                            Margin="0 0 2 0"
+                            Command="{TemplateBinding MaximizeCommand}"
+                            IsVisible="{TemplateBinding CanMaximize}"
+                            Classes="Window">
+                            <PathIcon 
+                                Margin="0 1 0 0"
+                                Data="{TemplateBinding MaximizeIcon}" Width="12" />
+                        </Button>
+                        
+                        <Button 
+                            Command="{TemplateBinding CloseCommand}"
+                            Classes="Close">
+                            <PathIcon 
+                                Margin="0 0 0 0"
+                                Data="{StaticResource Close}" Width="12" />
+                        </Button>
+                    </StackPanel>
+                </Grid>
+            </ControlTemplate>
+        </Setter>
+    </Style>
+
+    <Style Selector="local|WindowChrome.System">
+        <Setter Property="Separator" Value="False" />
+        <Setter Property="CanMinimize" Value="True" />
+        <Setter Property="CanMaximize" Value="True" />
+        <Setter Property="Margin" Value="-5 -2 0 0" />
+    </Style>
+    
+    <Style Selector="local|WindowChrome.System Button.Close">
+        <Setter Property="CornerRadius" Value="0"/>
+        <Setter Property="Width" Value="45"/>
+        <Setter Property="Height" Value="32"/>
+    </Style>
+    
+    <Style Selector="local|WindowChrome.System Button.Close Path">
+        <Setter Property="Margin" Value="0 2 0 0"/>
+    </Style>
+    
+    <Style Selector="local|WindowChrome.System Button.Window">
+        <Setter Property="CornerRadius" Value="0"/>
+        <Setter Property="Width" Value="45"/>
+        <Setter Property="Height" Value="32"/>
+    </Style>
+</Styles>

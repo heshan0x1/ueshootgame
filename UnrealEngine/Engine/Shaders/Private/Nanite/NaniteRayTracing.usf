@@ -1,0 +1,351 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Shared/NaniteDefinitions.h"
+
+#ifndef NANITE_HIERARCHY_TRAVERSAL
+#	define NANITE_HIERARCHY_TRAVERSAL 0
+#endif
+
+#if NANITE_HIERARCHY_TRAVERSAL
+
+#	define NANITE_HIERARCHY_TRAVERSAL_TYPE (CULLING_TYPE)
+#	define GROUP_NODE_SIZE 2
+
+#	include "NaniteHierarchyTraversal.ush"
+
+#endif
+
+#include "../Common.ush"
+#include "../ShaderPrint.ush"
+#include "../WaveOpUtil.ush"
+#include "../ComputeShaderUtils.ush"
+
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+#include "NaniteCulling.ush"
+#include "NaniteCullingCommon.ush"
+#include "NaniteStreaming.ush"
+
+RWStructuredBuffer<FStreamingRequest> OutStreamingRequests;			// First entry holds count
+
+float RayTracingStreamingMinCutError;
+
+StructuredBuffer<FPackedNaniteView> PackedNaniteViews;
+
+struct FCandidateNodeRT
+{
+	uint NodeIndex;
+	uint InstanceId;
+};
+
+uint4 PackCandidateNodeRT(FCandidateNodeRT Node)
+{
+	// Leave at least one bit unused in each of the fields, so 0xFFFFFFFFu is never a valid value.
+	uint4 RawData;
+	RawData.x = Node.NodeIndex;
+	RawData.y = Node.InstanceId;
+	RawData.z = 0;
+	RawData.w = 0;
+
+	checkSlow(RawData.x != 0xFFFFFFFFu && RawData.y != 0xFFFFFFFFu);
+
+	return RawData;
+}
+
+FCandidateNodeRT UnpackCandidateNodeRT(uint4 RawData)
+{
+	FCandidateNodeRT Node;
+	Node.NodeIndex = RawData.x;
+	Node.InstanceId = RawData.y;
+	return Node;
+}
+
+uint GetCandidateNodeSizeRT() { return 8u; }
+
+uint4 LoadCandidateNodeDataRT(RWByteAddressBuffer InNodes, uint NodeIndex)
+{
+	checkSlow(NodeIndex < MaxNodes);
+	return uint4(InNodes.Load2(NodeIndex * GetCandidateNodeSizeRT()), 0, 0);
+}
+
+void StoreCandidateNodeDataRT(RWByteAddressBuffer InNodes, uint NodeIndex, uint4 RawData)
+{
+	checkSlow(NodeIndex < MaxNodes);
+	InNodes.Store2(NodeIndex * GetCandidateNodeSizeRT(), RawData.xy);
+}
+
+void StoreCandidateNodeRT(RWByteAddressBuffer InNodes, uint NodeIndex, FCandidateNodeRT Node)
+{
+	checkSlow(NodeIndex < MaxNodes);
+	StoreCandidateNodeDataRT(InNodes, NodeIndex, PackCandidateNodeRT(Node));
+}
+
+void ClearCandidateNodeRT(RWByteAddressBuffer InNodes, uint NodeIndex)
+{
+	checkSlow(NodeIndex < MaxNodes);
+	StoreCandidateNodeDataRT(InNodes, NodeIndex, 0xFFFFFFFFu);
+}
+
+#if NANITE_HIERARCHY_TRAVERSAL
+
+RWByteAddressBuffer Nodes;
+
+float2 GetProjectedEdgeScales_Offscreen(FNaniteView NaniteView, FInstanceSceneData InstanceData, FInstanceDynamicData DynamicData, float4 Bounds)	// float2(min, max)
+{
+	if( NaniteView.ViewToClip[ 3 ][ 3 ] >= 1.0f )
+	{
+		// Ortho
+		return float2( 1, 1 );
+	}
+	float3 Center = mul( float4( Bounds.xyz, 1.0f ), DynamicData.LocalToTranslatedWorld ).xyz;
+	float Radius = Bounds.w * InstanceData.NonUniformScale.w;
+
+	float ZNear = NaniteView.NearPlane;
+	float DistToClusterSq = length2( Center );	// camera origin in (0,0,0)
+	
+	float Z = sqrt(DistToClusterSq);
+	float DistToTSq = DistToClusterSq - Radius * Radius;
+	float DistToT = sqrt( max(0.0f, DistToTSq) );
+	float ScaledCosTheta = DistToT;
+	float ScaledSinTheta = Radius;
+	float ScaleToUnit = rcp( Z );
+	float By = ScaledCosTheta * ScaleToUnit;
+	float Ty = ScaledCosTheta * ScaleToUnit;
+	
+	float H = ZNear - Z;
+	if( DistToTSq < 0.0f || By * DistToT < ZNear )
+	{
+		By = 1;
+	}
+
+	if( DistToTSq < 0.0f || Ty * DistToT < ZNear )
+	{	
+		float Tx = sqrt( Radius * Radius - H * H );
+		Ty = ZNear * rsqrt( Tx * Tx + ZNear * ZNear );
+	}
+
+	float MinZ = max( Z - Radius, ZNear );
+	float MaxZ = max( Z + Radius, ZNear );
+	float MinCosAngle = Ty;
+	float MaxCosAngle = By;
+
+	if(Z + Radius > ZNear)
+		return float2( MinZ * MinCosAngle, MaxZ * MaxCosAngle );
+	else
+		return float2( 0.0f, 0.0f );
+}
+
+bool ShouldVisitChildInternal_Offscreen(
+	FNaniteView NaniteView,
+	FInstanceSceneData InstanceData,
+	FInstanceDynamicData DynamicData,
+	FNodeCullingBounds Bounds,
+	float MinLODError,
+	float MaxParentLODError,
+	inout float Priority
+)
+{
+	float2 ProjectedEdgeScales = GetProjectedEdgeScales_Offscreen(NaniteView, InstanceData, DynamicData, Bounds.Sphere);
+	float UniformScale = Bounds.MeshMinDeformScale * min3( InstanceData.NonUniformScale.x, InstanceData.NonUniformScale.y, InstanceData.NonUniformScale.z );
+	float Threshold = NaniteView.LODScale * UniformScale * MaxParentLODError;
+	if( ProjectedEdgeScales.x <= Threshold )
+	{
+		Priority = Threshold / ProjectedEdgeScales.x;	// TODO: Experiment with better priority
+		// return (ProjectedEdgeScales.y >= NaniteView.LODScale * UniformScale * MinLODError); //TODO: Doesn't currently work with streaming. MinLODError needs to also reflect leafness caused by streaming cut.
+		return true;
+	}
+	else
+	{
+		return false;
+	}
+}
+
+struct FNaniteTraversalRayTracingStreamingCallback
+{
+	uint ChildIndex;
+	uint LocalNodeIndex;
+
+	FCandidateNodeRT CandidateNode;
+
+	FNaniteView NaniteView;
+	FNaniteView OffscreenNaniteView;
+
+	FInstanceSceneData InstanceData;
+
+	bool bVisible;
+
+	uint StreamingPriorityCategory;
+	float StreamingPriority;
+
+	void Init(uint InChildIndex, uint InLocalNodeIndex, uint GroupNodeFetchIndex)
+	{
+		ChildIndex = InChildIndex;
+		LocalNodeIndex = InLocalNodeIndex;
+
+		const uint4 NodeData = GetGroupNodeData(GroupNodeFetchIndex);
+
+		CandidateNode = UnpackCandidateNodeRT(NodeData);
+
+		NaniteView = UnpackNaniteView(PackedNaniteViews[0]);
+		OffscreenNaniteView = UnpackNaniteView(PackedNaniteViews[1]);
+
+		InstanceData = GetInstanceSceneDataUnchecked(CandidateNode.InstanceId);
+
+		StreamingPriorityCategory = NaniteView.StreamingPriorityCategory;
+	}
+
+	uint GetHierarchyNodeOffset()
+	{
+		return ::GetHierarchyNodeOffset(InstanceData.NaniteHierarchyOffset, CandidateNode.NodeIndex);
+	}
+
+	bool ShouldVisitChild(FHierarchyNodeSlice HierarchyNodeSlice, bool bInVisible)
+	{
+		bVisible = bInVisible;
+
+		StreamingPriority = 0.0f;
+
+		BRANCH
+		if (bVisible)
+		{
+			bVisible = RayTracingStreamingMinCutError < HierarchyNodeSlice.MaxParentLODError;
+		}
+
+		BRANCH
+		if (bVisible)
+		{
+			FInstanceDynamicData DynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData);
+			FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceData.PrimitiveId);
+			FNodeCullingBounds NodeBounds = InitNodeCullingBounds(HierarchyNodeSlice);
+
+			// TODO: Primary view streaming
+
+			bVisible = ShouldVisitChildInternal_Offscreen(OffscreenNaniteView, InstanceData, DynamicData, NodeBounds, HierarchyNodeSlice.MinLODError, HierarchyNodeSlice.MaxParentLODError, StreamingPriority);
+		}
+
+		return bVisible;
+	}
+
+	void OnPreProcessNodeBatch(uint GroupIndex)
+	{
+		// Nothing to do
+	}
+
+	void OnPostNodeVisit(FHierarchyNodeSlice HierarchyNodeSlice)
+	{
+		if (bVisible && HierarchyNodeSlice.bLeaf)
+		{
+			RequestPageRange(OutStreamingRequests, InstanceData.NaniteRuntimeResourceID, HierarchyNodeSlice.ResourcePageRangeKey, 3, 100);
+		}
+	}
+
+	void StoreChildNode(uint StoreIndex, FHierarchyNodeSlice HierarchyNodeSlice)
+	{
+		FCandidateNodeRT Node;
+		Node.NodeIndex = HierarchyNodeSlice.ChildStartReference;
+		Node.InstanceId = CandidateNode.InstanceId;
+		StoreCandidateNodeRT(Nodes, StoreIndex, Node);
+	}
+
+	void StoreCluster(uint StoreIndex, FHierarchyNodeSlice HierarchyNodeSlice, uint ClusterIndex)
+	{
+		// do nothing
+	}
+
+	uint4 LoadPackedCluster(uint CandidateIndex)
+	{
+		check(false);
+		return 0;
+	}
+
+	bool IsNodeDataReady(uint4 RawData)
+	{
+		return RawData.x != 0xFFFFFFFFu && RawData.y != 0xFFFFFFFFu && RawData.z != 0xFFFFFFFFu;
+	}
+
+	bool LoadCandidateNodeDataToGroup(uint NodeIndex, uint GroupIndex, bool bCheckIfReady = true)
+	{
+		uint4 NodeData = LoadCandidateNodeDataRT(Nodes, NodeIndex);
+
+		bool bNodeReady = IsNodeDataReady(NodeData);
+		if (!bCheckIfReady || bNodeReady)
+		{
+			SetGroupNodeData(GroupIndex, NodeData);
+		}
+
+		return bNodeReady;
+	}
+
+	void ClearCandidateNodeData(uint NodeIndex)
+	{
+		ClearCandidateNodeRT(Nodes, NodeIndex);
+	}
+
+	void AddToClusterBatch(uint BatchIndex, uint Num)
+	{
+		check(false);
+	}
+
+	void ClearClusterBatch(uint BatchIndex)
+	{
+		check(false);
+	}
+
+	uint LoadClusterBatch(uint BatchIndex)
+	{
+		check(false);
+		return 0;
+	}
+
+	void ProcessCluster(uint4 PackedCluster)
+	{
+		check(false);
+	}
+};
+
+[numthreads(NANITE_PERSISTENT_CLUSTER_CULLING_GROUP_SIZE, 1, 1)]
+void NaniteRayTracingStreamingTraversalCS(uint GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+#if CULLING_TYPE == NANITE_CULLING_TYPE_NODES
+	NodeCull<FNaniteTraversalRayTracingStreamingCallback>(GroupID, GroupIndex, 0);
+#elif CULLING_TYPE == NANITE_CULLING_TYPE_CLUSTERS
+	ClusterCull<FNaniteTraversalRayTracingStreamingCallback>(GroupID, GroupIndex, 0);
+#endif
+}
+
+#endif
+
+#ifdef InitQueueCS
+
+#include "../InstanceCulling/InstanceCullingLoadBalancer.ush"
+
+RWStructuredBuffer<FQueueState> QueueState;
+RWByteAddressBuffer Nodes;
+
+[numthreads(64, 1, 1)]
+void InitQueueCS(uint3 GroupId : SV_GroupID, int GroupThreadIndex : SV_GroupIndex)
+{
+	FInstanceWorkSetup WorkSetup = InstanceCullingLoadBalancer_Setup(GroupId, GroupThreadIndex, 0U);
+
+	if (!WorkSetup.bValid)
+	{
+		return;
+	}
+
+	const uint InstanceId = WorkSetup.Item.InstanceDataOffset + uint(WorkSetup.LocalItemIndex);
+
+	// TODO: ray tracing instance culling
+
+	uint NodeOffset = 0;
+	WaveInterlockedAddScalar_(QueueState[0].PassState[0].NodeWriteOffset, 1, NodeOffset);
+	WaveInterlockedAddScalar(QueueState[0].PassState[0].NodeCount, 1);
+
+	{
+		FCandidateNodeRT Node;
+		Node.NodeIndex = 0;
+		Node.InstanceId = InstanceId;
+		StoreCandidateNodeRT(Nodes, NodeOffset, Node);
+	}
+}
+
+#endif

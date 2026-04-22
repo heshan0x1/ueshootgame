@@ -1,0 +1,12 @@
+﻿// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "/Engine/Shared/IndirectVirtualTextureDefinitions.h"
+
+#ifdef __cplusplus
+typedef Buffer<uint2> FIndirectVirtualTexture;
+#else // __cplusplus
+// HLSL Cross-Compiler Workaround
+#define FIndirectVirtualTexture Buffer<uint2>
+#endif // __cplusplus

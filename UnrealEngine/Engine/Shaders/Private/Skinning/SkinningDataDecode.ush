@@ -1,0 +1,185 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "../BitPacking.ush"
+#include "../SceneData.ush"
+#include "../BoneTransform.ush"
+#include "../GpuSkinCommon.ush"
+#include "/Engine/Shared/SkinningDefinitions.h"
+#include "/Engine/Shared/HLSLStaticAssert.h"
+
+#if COMPILER_SUPPORTS_HLSL2021
+
+#if USE_COMPRESSED_BONE_TRANSFORM
+
+float4x3 UnpackCompressedBoneTransform(uint4 Data0, uint4 Data1)
+{
+	float4x3 Result;
+	Result[0] = float3(f16tof32(Data0.w), f16tof32(Data0.w >> 16), f16tof32(Data1.x));
+	Result[1] = float3(f16tof32(Data1.x >> 16), f16tof32(Data1.y), f16tof32(Data1.y >> 16));
+	Result[2] = float3(f16tof32(Data1.z), f16tof32(Data1.z >> 16), f16tof32(Data1.w));
+	Result[3] = asfloat(Data0.xyz);
+	return Result;
+}
+
+float4x3 LoadCompressedBoneTransform(ByteAddressBuffer SrcBuffer, uint BaseOffset, uint BoneIndex)
+{
+	const uint Offset = BaseOffset + BoneIndex * 32u;
+
+	const uint4 Data0 = SrcBuffer.Load4(Offset);
+	const uint4 Data1 = SrcBuffer.Load4(Offset + 16);
+
+	return UnpackCompressedBoneTransform(Data0, Data1);
+}
+
+float4x3 LoadCompressedBoneTransform(RWByteAddressBuffer SrcBuffer, uint BaseOffset, uint BoneIndex)
+{
+	const uint Offset = BaseOffset + BoneIndex * 32u;
+
+	const uint4 Data0 = SrcBuffer.Load4(Offset);
+	const uint4 Data1 = SrcBuffer.Load4(Offset + 16);
+
+	return UnpackCompressedBoneTransform(Data0, Data1);
+}
+
+void StoreCompressedBoneTransform(RWByteAddressBuffer DstBuffer, uint BaseOffset, uint BoneIndex, float4x3 BoneTransform)
+{
+	const uint Offset = BaseOffset + BoneIndex * 32u;
+
+	const uint3 XAxis = f32tof16(BoneTransform[0]);
+	const uint3 YAxis = f32tof16(BoneTransform[1]);
+	const uint3 ZAxis = f32tof16(BoneTransform[2]);
+
+	const uint4 Data0 = uint4(asuint(BoneTransform[3]), XAxis.x | (XAxis.y << 16));
+	const uint4 Data1 = uint4(XAxis.z | (YAxis.x << 16), YAxis.y | (YAxis.z << 16), ZAxis.x | (ZAxis.y << 16), ZAxis.z);
+	
+	DstBuffer.Store4(Offset,		Data0);
+	DstBuffer.Store4(Offset + 16,	Data1);
+}
+
+#else
+
+float4x3 LoadCompressedBoneTransform(ByteAddressBuffer SrcBuffer, uint BaseOffset, uint BoneIndex)
+{
+	return transpose(SrcBuffer.Load<float3x4>(BaseOffset + BoneIndex * (uint)sizeof(float3x4)));
+}
+
+float4x3 LoadCompressedBoneTransform(RWByteAddressBuffer SrcBuffer, uint BaseOffset, uint BoneIndex)
+{
+	return transpose(SrcBuffer.Load<float3x4>(BaseOffset + BoneIndex * (uint)sizeof(float3x4)));
+}
+
+void StoreCompressedBoneTransform(RWByteAddressBuffer DstBuffer, uint BaseOffset, uint BoneIndex, float4x3 BoneTransform)
+{
+	const uint Address = BaseOffset + BoneIndex * (uint)sizeof(float3x4);
+	
+	const float3x4 Tmp = transpose(BoneTransform);
+	//DstBuffer.Store<float3x4>(Address, Tmp);
+	const uint4 Row0 = asuint(Tmp[0]);
+	const uint4 Row1 = asuint(Tmp[1]);
+	const uint4 Row2 = asuint(Tmp[2]);
+	DstBuffer.Store4(Address +  0, Row0);
+	DstBuffer.Store4(Address + 16, Row1);
+	DstBuffer.Store4(Address + 32, Row2);
+}
+
+#endif // !USE_COMPRESSED_BONE_TRANSFORM
+
+FSkinningHeader LoadSkinningHeader(uint InPrimitiveIndex)
+{
+	const uint Offset = InPrimitiveIndex * (uint)sizeof(FSkinningHeader);
+	return Scene.Skinning.Headers.Load<FSkinningHeader>(Offset);
+}
+
+float4x3 LoadSkinningBoneTransform(uint TransformIndex)
+{
+	return LoadCompressedBoneTransform(Scene.Skinning.BoneTransforms, 0, TransformIndex);
+}
+
+FBoneTransformWithScale LoadSkinningBoneObjectSpaceWithScale(uint BufferOffset, uint BoneIndex)
+{
+	const uint BufferOffsetBytes = BufferOffset * (uint)sizeof(float);
+	return Scene.Skinning.BoneObjectSpace.Load<FBoneTransformWithScale>(BufferOffsetBytes + BoneIndex * (uint)sizeof(FBoneTransformWithScale));
+}
+
+FBoneTransform LoadSkinningBoneObjectSpace(uint BufferOffset, uint BoneIndex)
+{
+	const uint BufferOffsetBytes = BufferOffset * (uint)sizeof(float);
+	return Scene.Skinning.BoneObjectSpace.Load<FBoneTransform>(BufferOffsetBytes + BoneIndex * (uint)sizeof(FBoneTransform));
+}
+
+FBoneMatrix ComputeBoneMatrixWithLimitedInfluences(FInstanceSceneData InstanceData, bool bPreviousTransform, uint BoneIndexOffset, FGPUSkinIndexAndWeight In, bool bExtraInfluences = GPUSKIN_USE_EXTRA_INFLUENCES)
+{
+	FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+	uint BoneTransformIndex = SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData + (bPreviousTransform ? 1 : 0)) * SkinningHeader.MaxTransformCount + BoneIndexOffset;
+
+	float4x3
+	BoneMatrix  = In.BlendWeights.x * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices.x);
+	BoneMatrix += In.BlendWeights.y * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices.y);
+#if !GPUSKIN_LIMIT_2BONE_INFLUENCES
+	BoneMatrix += In.BlendWeights.z * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices.z);
+	BoneMatrix += In.BlendWeights.w * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices.w);
+	if (bExtraInfluences)
+	{
+		BoneMatrix += In.BlendWeights2.x * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices2.x);
+		BoneMatrix += In.BlendWeights2.y * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices2.y);
+		BoneMatrix += In.BlendWeights2.z * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices2.z);
+		BoneMatrix += In.BlendWeights2.w * LoadSkinningBoneTransform(BoneTransformIndex + In.BlendIndices2.w);
+	}
+#endif // GPUSKIN_LIMIT_2BONE_INFLUENCES
+	return transpose(BoneMatrix);
+}
+
+FBoneMatrix ComputeBoneMatrixWithUnlimitedInfluences(FInstanceSceneData InstanceData, bool bPreviousTransform, uint BoneIndexOffset, Buffer<uint> InVertexWeights, uint InWeightIndexSize, uint InBlendOffsetCount)
+{
+	FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+	uint BoneTransformIndex = SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData + (bPreviousTransform ? 1 : 0)) * SkinningHeader.MaxTransformCount + BoneIndexOffset;
+
+	int NumBoneInfluences = InBlendOffsetCount & 0xff;
+	int StreamOffset = InBlendOffsetCount >> 8;
+	int BoneIndexSize = InWeightIndexSize & 0xff;
+	int BoneWeightSize = InWeightIndexSize >> 8;
+	int WeightsOffset = StreamOffset + (BoneIndexSize * NumBoneInfluences);
+
+	float4x3 BoneMatrix = float4x3(float3(0,0,0), float3(0,0,0), float3(0,0,0), float3(0, 0, 0));
+	for (int InfluenceIdx = 0; InfluenceIdx < NumBoneInfluences; InfluenceIdx++)
+	{
+		int BoneIndexOffset = StreamOffset + (BoneIndexSize * InfluenceIdx);
+		int BoneWeightOffset = WeightsOffset + InfluenceIdx * BoneWeightSize;
+		int BoneIndex = InVertexWeights[BoneIndexOffset];
+		if (BoneIndexSize > 1)
+		{
+			BoneIndex = InVertexWeights[BoneIndexOffset + 1] << 8 | BoneIndex;
+			//@todo-lh: Workaround to fix issue in SPIRVEmitter of DXC; this block must be inside the if branch
+			half BoneWeight;
+			if (BoneWeightSize > 1)
+			{
+				BoneWeight = half(InVertexWeights[BoneWeightOffset + 1] << 8 | InVertexWeights[BoneWeightOffset]) / 65535.0;
+			}
+			else
+			{
+				BoneWeight = half(InVertexWeights[BoneWeightOffset]) / 255.0f;
+			}
+			BoneMatrix += BoneWeight * LoadSkinningBoneTransform(BoneTransformIndex + BoneIndex);
+		}
+		else
+		{
+			//@todo-lh: Workaround to fix issue in SPIRVEmitter of DXC; this block must be inside the if branch
+			half BoneWeight;
+			if (BoneWeightSize > 1)
+			{
+				BoneWeight = half(InVertexWeights[BoneWeightOffset + 1] << 8 | InVertexWeights[BoneWeightOffset]) / 65535.0;
+			}
+			else
+			{
+				BoneWeight = half(InVertexWeights[BoneWeightOffset]) / 255.0f;
+			}
+			BoneMatrix += BoneWeight * LoadSkinningBoneTransform(BoneTransformIndex + BoneIndex);
+		}
+	}
+	return transpose(BoneMatrix);
+}
+
+#endif // !COMPILER_SUPPORTS_HLSL2021

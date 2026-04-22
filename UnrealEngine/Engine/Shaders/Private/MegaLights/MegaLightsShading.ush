@@ -1,0 +1,158 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+// Experimental - Stochastic lighting for Substrate
+// Select and light stochastically a single Slab for material containing several layers
+#define SUBSTRATE_STOCHASTIC_LIGHTING 0
+
+#include "MegaLights.ush"
+#include "MegaLightsMaterial.ush"
+
+FDeferredLightingSplit GetMegaLightsSplitLighting(
+	float3 TranslatedWorldPosition,
+	float3 CameraVector,
+	FMegaLightsMaterial Material,
+	float AmbientOcclusion,
+	FDeferredLightData LightData,
+	float4 LightAttenuation,
+	float Dither,
+	uint2 ScreenCoord,
+	inout float SurfaceShadow)
+#if SUBSTRATE_ENABLED && !INPUT_TYPE == INPUT_TYPE_HAIRSTRANDS
+{
+	const uint2 PixelCoord = ScreenCoord;
+
+	FDeferredLightingSplit Out = (FDeferredLightingSplit)0;
+	#if SUBSTRATE_GBUFFER_FORMAT==1 && SUBSTRATE_LOAD_FROM_MATERIALCONTAINER
+	FSubstrateAddressing SubstrateAddressing = GetSubstratePixelDataByteOffset(PixelCoord, uint2(View.BufferSizeAndInvSize.xy), Substrate.MaxBytesPerPixel);
+	FSubstratePixelHeader SubstratePixelHeader = UnpackSubstrateHeaderIn(Substrate.MaterialTextureArray, SubstrateAddressing, Substrate.TopLayerTexture);
+	const bool bIsValid = SubstratePixelHeader.ClosureCount > 0;
+	#else
+	const bool bIsValid = Material.IsValid();
+	#endif
+
+	BRANCH
+		if (bIsValid)
+		{
+			float3 V = -CameraVector;
+			float3 L = LightData.Direction;	// Already normalized
+			float3 ToLight = L;
+			float LightMask = 1;
+			if (LightData.bRadialLight)
+			{
+				LightMask = GetLocalLightAttenuation(TranslatedWorldPosition, LightData, ToLight, L);
+#if ADAPTIVE_VOLUMETRIC_SHADOW_MAP
+				//LightAttenuation *= ComputeTransmittance(TranslatedWorldPosition, LightData.TranslatedWorldPosition, 256);
+				LightAttenuation *= AVSM_SampleTransmittance(TranslatedWorldPosition, LightData.TranslatedWorldPosition);
+#endif // ADAPTIVE_VOLUMETRIC_SHADOW_MAP
+			}
+
+			if (LightMask > 0)
+			{
+				FSubstrateShadowTermInputParameters SubstrateShadowTermInputParameters = GetInitialisedSubstrateShadowTermInputParameters();
+				SubstrateShadowTermInputParameters.bEvaluateShadowTerm = true;
+				SubstrateShadowTermInputParameters.SceneDepth = Material.Depth;
+				SubstrateShadowTermInputParameters.PrecomputedShadowFactors = 1.f;  //SubstrateReadPrecomputedShadowFactors(SubstratePixelHeader, PixelCoord, SceneTexturesStruct.GBufferETexture);
+				SubstrateShadowTermInputParameters.TranslatedWorldPosition = TranslatedWorldPosition;
+				SubstrateShadowTermInputParameters.LightAttenuation = LightAttenuation;
+				SubstrateShadowTermInputParameters.Dither = Dither;
+
+				// When using stochastic material selection, 
+				// * Seek the selected closure
+				// * Force single closure evaluation
+				const bool bStochasticLighting = Substrate.bStochasticLighting > 0;
+				#if SUBSTRATE_STOCHASTIC_LIGHTING && SUBSTRATE_LOAD_FROM_MATERIALCONTAINER
+				if (bStochasticLighting)
+				{
+					#if SUBSTRATE_MATERIAL_CLOSURE_COUNT > 1
+					if (SubstratePixelHeader.ClosureCount > 1)
+					{
+						const uint AddressOffset = UnpackClosureOffsetAtIndex(Substrate.ClosureOffsetTexture[SubstrateAddressing.PixelCoords], Material.ClosureIndex, SubstratePixelHeader.ClosureCount);
+						SubstrateSeekClosure(SubstrateAddressing, AddressOffset);
+					}
+					#endif
+					SubstratePixelHeader.ClosureCount = 1;
+				}
+				#endif
+
+				FSubstrateDeferredLighting SubstrateLighting = SubstrateDeferredLighting(
+					LightData,
+					V,
+					L,
+					ToLight,
+					LightMask,
+					SubstrateShadowTermInputParameters,
+					#if SUBSTRATE_GBUFFER_FORMAT==1 && SUBSTRATE_LOAD_FROM_MATERIALCONTAINER
+					Substrate.MaterialTextureArray,
+					SubstrateAddressing,
+					SubstratePixelHeader
+					#else
+					Material.BSDF,
+					Material.BSDFTangentBasis,
+					Material.BSDFAO
+					#endif
+					);
+
+				// SUBSTRATE_TODO - Add support for SUBSTRATE_OPAQUE_ROUGH_REFRACTION_ENABLED
+				Out.DiffuseLighting = float4(SubstrateLighting.TotalDiffuseLighting, 0);
+				Out.SpecularLighting = float4(SubstrateLighting.TotalSpecularLighting, 0);
+				// SUBSTRATE_TODO - Accumulate Luminance separately
+				Out.LightingLuminance = Luminance(SubstrateLighting.TotalDiffuseLighting + SubstrateLighting.TotalSpecularLighting);
+
+				#if SUBSTRATE_STOCHASTIC_LIGHTING
+				// Account for the probability of having chosen this slab
+				if (bStochasticLighting)
+				{
+					const float InvPdf = 1.f / Material.PDF;
+					Out.DiffuseLighting   *= InvPdf;
+					Out.SpecularLighting  *= InvPdf;
+					Out.LightingLuminance *= InvPdf;
+				}
+				#endif
+			}
+		}
+	return Out;
+}
+#else // INPUT_TYPE == INPUT_TYPE_GBUFFER || INPUT_TYPE == INPUT_TYPE_HAIRSTRANDS
+{
+	return GetDynamicLightingSplit(
+		TranslatedWorldPosition, CameraVector, Material.GBuffer, AmbientOcclusion,
+		LightData, LightAttenuation, Dither, ScreenCoord,
+		SurfaceShadow);
+}
+#endif // SUBSTRATE_ENABLED
+
+#if INPUT_TYPE == INPUT_TYPE_HAIRSTRANDS
+
+#include "../HairStrands/HairStrandsVisibilityCommon.ush"
+#include "../HairStrands/HairStrandsVisibilityUtils.ush"
+#include "../HairStrands/HairStrandsCommon.ush"
+#include "../HairStrands/HairStrandsDeepTransmittanceCommon.ush"
+#include "../HairStrands/HairStrandsDeepTransmittanceDualScattering.ush" 
+
+// Compute transmittance data from a transmittance mask
+FHairTransmittanceData GetTransmittanceDataFromTransmitttanceMask(
+	FDeferredLightData LightData, 
+	FMegaLightsMaterial Material, 
+	FHairTransmittanceMask TransmittanceMask,
+	float3 TranslatedWorldPosition, 
+	float3 CameraVector)
+{
+	float3 L = LightData.Direction;
+	if (LightData.bRadialLight)
+	{
+		L = normalize(LightData.TranslatedWorldPosition - TranslatedWorldPosition);
+	}
+	const float3 V = normalize(-CameraVector);
+
+	return GetHairTransmittance(
+		V,
+		L,
+		Material.GBuffer,
+		TransmittanceMask,
+		View.HairScatteringLUTTexture,
+		HairScatteringLUTSampler,
+		View.HairComponents);
+}
+#endif

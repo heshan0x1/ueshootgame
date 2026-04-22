@@ -1,0 +1,9 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+#include "Common.ush"
+
+void MainPS(float4 SVPos : SV_Position, out float OutDepth : SV_Depth)
+{
+	OutDepth = SVPos.z;
+}

@@ -1,0 +1,1049 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "NaniteShadeCommon.ush"
+
+#ifdef OVERRIDE_RTWRITEMASKPROCESSING_USH
+#include "/Platform/Private/RTWriteMaskLookup.ush"
+#endif
+
+#ifndef OPTIMIZE_WRITE_MASK
+#define OPTIMIZE_WRITE_MASK 0
+#endif
+
+#include "../MortonCode.ush"
+
+uint4 ViewRect;
+#if OPTIMIZE_WRITE_MASK
+uint ValidWriteMask;
+#endif
+uint2 DispatchOffsetTL;
+uint  ShadingBinCount;
+uint  DummyZero;
+uint  SubTileMatch;
+
+#define SHADING_BIN_COUNT		(SHADING_BIN_PASS == NANITE_SHADING_BIN_COUNT)
+#define SHADING_BIN_RESERVE		(SHADING_BIN_PASS == NANITE_SHADING_BIN_RESERVE)
+#define SHADING_BIN_SCATTER		(SHADING_BIN_PASS == NANITE_SHADING_BIN_SCATTER)
+#define SHADING_BIN_VALIDATE	(SHADING_BIN_PASS == NANITE_SHADING_BIN_VALIDATE)
+#define SHADING_BIN_CMASK_CLEAR	(SHADING_BIN_PASS == NANITE_SHADING_BIN_CMASK_CLEAR)
+
+#define BINNING_THREADS_PER_SHADING_TILE  (COMPUTE_MATERIAL_GROUP_SIZE / 4)
+
+#define GATHER4_OPTIMIZATION 0
+
+#if BINNING_TECHNIQUE == 1
+#define SHADING_BIN_TILE_SIZE_BITS 5
+#else
+#define SHADING_BIN_TILE_SIZE_BITS 3
+#endif
+
+#define SHADING_BIN_TILE_SIZE		(1u << SHADING_BIN_TILE_SIZE_BITS)
+#define SHADING_BIN_TILE_THREADS	(SHADING_BIN_TILE_SIZE * SHADING_BIN_TILE_SIZE)
+
+// Use separate invalid values for each pixel to simplify VRS logic
+#define INVALID_BIN0		(-1)
+#define INVALID_BIN1		(-2)
+#define INVALID_BIN2		(-3)
+#define INVALID_BIN3		(-4)
+
+bool IsValidBin(int BinIndex)
+{
+	return BinIndex >= 0;
+}
+
+#if OPTIMIZE_WRITE_MASK
+
+#ifndef NUM_EXPORTS
+#define NUM_EXPORTS 1
+#endif
+
+RWByteAddressBuffer OutCMaskBuffer_0;
+
+#if NUM_EXPORTS > 1
+RWByteAddressBuffer OutCMaskBuffer_1;
+#endif
+
+#if NUM_EXPORTS > 2
+RWByteAddressBuffer OutCMaskBuffer_2;
+#endif
+
+#if NUM_EXPORTS > 3
+RWByteAddressBuffer OutCMaskBuffer_3;
+#endif
+
+#if NUM_EXPORTS > 4
+RWByteAddressBuffer OutCMaskBuffer_4;
+#endif
+
+#if NUM_EXPORTS > 5
+RWByteAddressBuffer OutCMaskBuffer_5;
+#endif
+
+#if NUM_EXPORTS > 6
+RWByteAddressBuffer OutCMaskBuffer_6;
+#endif
+
+#if NUM_EXPORTS > 7
+RWByteAddressBuffer OutCMaskBuffer_7;
+#endif
+
+static const RWByteAddressBuffer CMaskExports[] =
+{
+	OutCMaskBuffer_0,
+#if NUM_EXPORTS > 1
+	OutCMaskBuffer_1,
+#endif
+#if NUM_EXPORTS > 2
+	OutCMaskBuffer_2,
+#endif
+#if NUM_EXPORTS > 3
+	OutCMaskBuffer_3,
+#endif
+#if NUM_EXPORTS > 4
+	OutCMaskBuffer_4,
+#endif
+#if NUM_EXPORTS > 5
+	OutCMaskBuffer_5,
+#endif
+#if NUM_EXPORTS > 6
+	OutCMaskBuffer_6,
+#endif
+#if NUM_EXPORTS > 7
+	OutCMaskBuffer_7
+#endif
+};
+
+#endif
+
+
+#if VARIABLE_SHADING_RATE
+uint ShadingRateTileSizeBits;
+Texture2D<uint> ShadingRateImage;
+#endif
+
+#if SHADING_BIN_COUNT || SHADING_BIN_SCATTER
+Texture2D<uint> ShadingMask;
+SamplerState ShadingMaskSampler;
+#endif
+
+// Headers stored at the beginning, followed by bin data starting at ShadingBinDataByteOffset
+RWByteAddressBuffer OutShadingBinData;
+uint ShadingBinDataByteOffset;
+
+FNaniteShadingBinMeta GetShadingBinMeta(uint ShadingBin)
+{
+	return OutShadingBinData.Load<FNaniteShadingBinMeta>(ShadingBin * NANITE_SHADING_BIN_META_BYTES);
+}
+
+#if SHADING_BIN_RESERVE
+RWStructuredBuffer<uint> OutShadingBinAllocator;
+RWByteAddressBuffer OutShadingBinArgs;
+StructuredBuffer<FNaniteShadingBinMeta> ShadingBinMeta;
+#endif
+
+#if GATHER_STATS
+RWStructuredBuffer<FNaniteShadingBinStats> OutShadingBinStats;
+#endif
+
+#if SHADING_BIN_COUNT || SHADING_BIN_RESERVE || SHADING_BIN_SCATTER || SHADING_BIN_VALIDATE
+RWStructuredBuffer<FNaniteShadingBinScatterCounters> OutShadingBinScatterCounters;
+#endif
+
+#if SHADING_BIN_RESERVE
+RWStructuredBuffer<FNaniteShadingBinScatterRanges> OutShadingBinScatterRanges;
+#endif
+
+#if SHADING_BIN_SCATTER
+StructuredBuffer<FNaniteShadingBinScatterRanges> ShadingBinScatterRanges;
+#endif
+
+#if SHADING_BIN_COUNT || SHADING_BIN_SCATTER
+
+groupshared int GroupVotedBin;
+
+groupshared uint GroupFullTileCount_LooseCount;		// 16:16
+groupshared uint GroupFullTileOffset;
+groupshared uint GroupLooseOffset;
+groupshared uint GroupEarlyOut;
+
+uint PackShadingPixel(uint2 TopLeft, uint2 VRSShift, uint WriteMask)
+{
+	// To handle up to 16k resolutions, we have to exploit that coarse pixels are always aligned and write mask bits depend on VRS mode.
+	
+	// Data layout depending on VRS mode
+	// (0,0)	VRSShift.y[31] VRSShift.x[30] WriteMask[29:28]	CoarseTopLeft.y[27:14] CoarseTopLeft.x[13:0]
+	// (1,0)	VRSShift.y[31] VRSShift.x[30] WriteMask[29:27]	CoarseTopLeft.y[26:13] CoarseTopLeft.x[12:0]
+	// (0,1)	VRSShift.y[31] VRSShift.x[30] WriteMask[29:27]	CoarseTopLeft.y[26:14] CoarseTopLeft.x[13:0]
+	// (1,1)	VRSShift.y[31] VRSShift.x[30] WriteMask[29:26]	CoarseTopLeft.y[25:13] CoarseTopLeft.x[12:0]
+	
+	checkSlow(VRSShift.x == 0u || (TopLeft.x & 1u) == 0u);
+	checkSlow(VRSShift.y == 0u || (TopLeft.y & 1u) == 0u);
+	checkSlow(WriteMask < (1u << (2 + VRSShift.x + VRSShift.y)));
+	
+	uint PackedElement = WriteMask;
+	PackedElement = ((PackedElement << 14) | TopLeft.y) >> VRSShift.y;		// Optionally reduce bits from 14 to 13, with implicit zero bit
+	PackedElement = ((PackedElement << 14) | TopLeft.x) >> VRSShift.x;
+	return (VRSShift.y << 31) | (VRSShift.x << 30) | PackedElement;
+}
+
+uint2 PackShadingQuad(uint2 TopLeft, uint2 VRSShift, uint WriteMask)
+{
+	uint2 Packed;
+	Packed.x = (VRSShift.y << 29) | (VRSShift.x << 28) | (TopLeft.y << 14) | TopLeft.x;
+	Packed.y = WriteMask;
+	return Packed;
+}
+
+uint ConvertQuadCoverageMaskToWriteMask(uint Coverage)
+{
+	uint WriteMask = Coverage;					// 0000 0000 0000 WZYX
+	WriteMask = WriteMask | (WriteMask << 3);	// 0000 0000 0WZY ?ZYX
+	WriteMask = WriteMask | (WriteMask << 6);	// 000W ZY?Z Y?ZY ?ZYX
+	return WriteMask & 0x1111u;					// 000W 000Z 000Y 000X
+}
+
+void UpdateVRSActiveAndWriteMasks(uint ActiveMask, uint2 VRSShift, inout int4 ShadingBins, inout uint WriteMasks)
+{
+	// Mask out any pixel that doesn't need to be evaluated at the current shading rate
+	// and add it to the write mask of the pixel that should scatter write it instead.
+
+	const bool bHalfX = (VRSShift.x != 0u);
+	const bool bHalfY = (VRSShift.y != 0u);
+	const bool bHalfXY = bHalfX && bHalfY;
+
+	WriteMasks = (ActiveMask * 0x1111u) & 0x8421;	// WZYX -> W000 0Z00 00Y0 000X
+
+	if (bHalfX  && ShadingBins.x == ShadingBins.y) { ShadingBins.y = INVALID_BIN1; WriteMasks |= 0x0002; }
+	if (bHalfY  && ShadingBins.x == ShadingBins.z) { ShadingBins.z = INVALID_BIN2; WriteMasks |= 0x0004; }
+	if (bHalfXY && ShadingBins.x == ShadingBins.w) { ShadingBins.w = INVALID_BIN3; WriteMasks |= 0x0008; }
+
+	if (bHalfXY && ShadingBins.y == ShadingBins.z) { ShadingBins.z = INVALID_BIN2; WriteMasks |= 0x0040; }
+	if (bHalfY  && ShadingBins.y == ShadingBins.w) { ShadingBins.w = INVALID_BIN3; WriteMasks |= 0x0080; }
+
+	if (bHalfX  && ShadingBins.z == ShadingBins.w) { ShadingBins.w = INVALID_BIN3; WriteMasks |= 0x0800; }
+}
+
+bool IsFullTile(bool bFullQuad)
+{
+	BRANCH
+	if (WaveGetLaneCount() >= BINNING_THREADS_PER_SHADING_TILE)
+	{
+		const uint WaveLaneIndex = WaveGetLaneIndex();
+		const uint ShadingTileFirstThread = WaveLaneIndex & ~(BINNING_THREADS_PER_SHADING_TILE - 1u) & 31u;
+
+		const uint2 Ballot = WaveBallot(bFullQuad);
+		const uint Mask = BitFieldMaskU32(BINNING_THREADS_PER_SHADING_TILE, ShadingTileFirstThread);
+
+		return ((WaveLaneIndex >= 32 ? Ballot.y : Ballot.x) & Mask) == Mask;
+	}
+	return false;
+}
+
+template<bool bSingleWave, bool bQuadMode>
+void AllocateElements(uint Bin, uint ThreadIndex, uint QuadFullTileCount, uint QuadLooseCount, inout uint FullTileDataOffset, inout uint LooseDataOffset)
+{
+	uint WaveFullTileCount;
+	uint WaveLooseCount;
+	uint WaveFullTileCount_LooseCount;
+	uint PrefixFullTileCount_LooseCount;
+
+	if (bQuadMode)
+	{
+		WaveFullTileCount	= WaveActiveCountBits(QuadFullTileCount != 0);
+		WaveLooseCount		= WaveActiveCountBits(QuadLooseCount != 0);
+		
+		FullTileDataOffset	= WavePrefixCountBits(QuadFullTileCount != 0);
+		LooseDataOffset		= WavePrefixCountBits(QuadLooseCount != 0);
+
+		WaveFullTileCount_LooseCount	= (WaveLooseCount << 16) | WaveFullTileCount;
+		PrefixFullTileCount_LooseCount	= (LooseDataOffset << 16) | FullTileDataOffset;
+	}
+	else
+	{
+		const uint FullTileCount_LooseCount = (QuadLooseCount << 16) | QuadFullTileCount;
+
+		PrefixFullTileCount_LooseCount	= WavePrefixSum(FullTileCount_LooseCount);
+		WaveFullTileCount_LooseCount	= WaveReadLaneAt(PrefixFullTileCount_LooseCount + FullTileCount_LooseCount, WaveGetLaneCount() - 1u);
+		
+
+		WaveFullTileCount		= (WaveFullTileCount_LooseCount & 0xFFFFu);
+		WaveLooseCount			= (WaveFullTileCount_LooseCount >> 16);
+
+		FullTileDataOffset		= (PrefixFullTileCount_LooseCount & 0xFFFFu);
+		LooseDataOffset			= (PrefixFullTileCount_LooseCount >> 16);
+	}
+
+	if (bSingleWave)
+	{
+		uint WaveFullTileOffset = 0;
+		uint WaveLooseOffset = 0;
+		BRANCH
+		if (WaveIsFirstLane())
+		{
+			InterlockedAdd(OutShadingBinScatterCounters[Bin].FullTileElementCount, WaveFullTileCount, WaveFullTileOffset);
+			InterlockedAdd(OutShadingBinScatterCounters[Bin].LooseElementCount, WaveLooseCount, WaveLooseOffset);
+		}
+		FullTileDataOffset += WaveReadLaneFirst(WaveFullTileOffset);
+		LooseDataOffset += WaveReadLaneFirst(WaveLooseOffset);
+	}
+	else
+	{
+		uint WaveFullTileOffset_LooseOffset = 0;
+
+		BRANCH
+		if (WaveIsFirstLane())
+		{
+			InterlockedAdd(GroupFullTileCount_LooseCount, WaveFullTileCount_LooseCount, WaveFullTileOffset_LooseOffset);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		BRANCH
+		if (ThreadIndex == 0)
+		{
+			const uint TotalFullTileCount = GroupFullTileCount_LooseCount & 0xFFFF;
+			const uint TotalLooseCount = GroupFullTileCount_LooseCount >> 16;
+
+			InterlockedAdd(OutShadingBinScatterCounters[Bin].FullTileElementCount, TotalFullTileCount, GroupFullTileOffset);
+			InterlockedAdd(OutShadingBinScatterCounters[Bin].LooseElementCount, TotalLooseCount, GroupLooseOffset);
+		}
+		GroupMemoryBarrierWithGroupSync();
+
+		FullTileDataOffset += GroupFullTileOffset + (WaveReadLaneFirst(WaveFullTileOffset_LooseOffset) & 0xFFFFu);
+		LooseDataOffset += GroupLooseOffset + (WaveReadLaneFirst(WaveFullTileOffset_LooseOffset) >> 16);
+		GroupMemoryBarrierWithGroupSync();
+	}
+}
+
+template<typename FTask, bool bGroupUniform, bool bAllowInactiveLanes>
+void BinScalarization(FTask Task, int4 ShadingBins, uint ThreadIndex)
+{
+	if (bGroupUniform)
+	{
+		while (true)
+		{
+			const int MaxBin = max(max3(ShadingBins.x, ShadingBins.y, ShadingBins.z), ShadingBins.w);
+
+			GroupMemoryBarrierWithGroupSync();
+			if (ThreadIndex == 0)
+			{
+				GroupVotedBin = INVALID_BIN0;
+				GroupFullTileCount_LooseCount = 0u;
+			}
+			GroupMemoryBarrierWithGroupSync();
+			if (IsValidBin(MaxBin))
+			{
+				if(WaveIsFirstLane())
+				{
+					InterlockedMax(GroupVotedBin, MaxBin);
+				}
+			}
+			GroupMemoryBarrierWithGroupSync();
+			const int VotedBin = GroupVotedBin;
+			if (!IsValidBin(VotedBin))
+				break;
+
+			if (!bAllowInactiveLanes || IsValidBin(MaxBin))
+			{
+				Task.ProcessBin(ShadingBins, VotedBin, MaxBin, ThreadIndex);
+			}
+		}
+	}
+	else
+	{
+		int MaxBin = max(max3(ShadingBins.x, ShadingBins.y, ShadingBins.z), ShadingBins.w);
+		while (WaveActiveAnyTrue(IsValidBin(MaxBin)))
+		{
+			if (bAllowInactiveLanes)
+			{
+				if (IsValidBin(MaxBin))
+				{
+					const int VotedBin = WaveReadLaneFirst(MaxBin);
+					Task.ProcessBin(ShadingBins, VotedBin, MaxBin, ThreadIndex);
+				}
+			}
+			else
+			{
+				uint2 Mask = WaveBallot(IsValidBin(MaxBin));
+				const uint BitIndex = Mask.x ? firstbitlow(Mask.x) : (firstbitlow(Mask.y) + 32u);
+				const int VotedBin = WaveReadLaneAt(MaxBin, BitIndex);
+				Task.ProcessBin(ShadingBins, VotedBin, MaxBin, ThreadIndex);
+			}
+			MaxBin = max(max3(ShadingBins.x, ShadingBins.y, ShadingBins.z), ShadingBins.w);
+		}
+	}
+
+	Task.Finish(ShadingBins);
+}
+
+struct FCountPixelsTask
+{
+	void ProcessBin(inout int4 ShadingBins, int VotedBin, uint LaneBin, uint ThreadIndex)
+	{
+		uint WavePixelCount = 0;
+		UNROLL
+		for (uint i = 0u; i < 4u; ++i)
+		{
+			const bool bMatch = (ShadingBins[i] == VotedBin);
+			ShadingBins[i] = bMatch ? (INVALID_BIN0 - i) : ShadingBins[i];
+			WavePixelCount += WaveActiveCountBits(bMatch);
+		}
+
+		if (WaveIsFirstLane())
+		{
+			// Loose vs Full-Time doesn't matter for counting pass, so just count everything as loose.
+			InterlockedAdd(OutShadingBinScatterCounters[VotedBin].LooseElementCount, WavePixelCount);
+		}
+	}
+
+	void Finish(int4 ShadingBins) {};
+};
+
+#if SHADING_BIN_SCATTER
+
+template<bool bSingleWave>
+struct FScatterPixelsTask
+{
+	uint2 QuadTLCoord;
+	uint2 VRSShift;
+	uint WriteMasks;
+	uint4 DataWriteOffsets;
+
+	void Init(uint2 InQuadTLCoord, uint2 InVRSShift, uint InWriteMasks)
+	{
+		QuadTLCoord = InQuadTLCoord;
+		VRSShift = InVRSShift;
+		WriteMasks = InWriteMasks;
+	}
+
+	void ProcessBin(inout int4 ShadingBins, int VotedBin, int LaneBin, uint ThreadIndex)
+	{
+		const uint WaveLaneIndex = WaveGetLaneIndex();
+
+		uint PixelCount = 0;
+
+		bool4 bBinMatch;
+		UNROLL
+		for (uint i = 0u; i < 4u; ++i)
+		{
+			bBinMatch[i] = (ShadingBins[i] == VotedBin);
+			PixelCount += bBinMatch[i] ? 1 : 0;
+		}
+
+		const bool bFullTile		= IsFullTile(PixelCount == 4);
+
+		const bool bWriteFullTile	= ( bFullTile && (PixelCount != 0u));
+		const bool bWriteLoose		= (!bFullTile && (PixelCount != 0u));
+
+		const uint FullTileCount	= bWriteFullTile ? 4u : 0u;
+		const uint LooseCount		= bWriteLoose ? PixelCount : 0u;
+
+		uint FullTileDataOffset;
+		uint LooseDataOffset;
+		AllocateElements<bSingleWave, false>(VotedBin, ThreadIndex, FullTileCount, LooseCount, FullTileDataOffset, LooseDataOffset);
+
+		uint DataWriteOffset;
+		if (bFullTile)
+		{ 
+			DataWriteOffset = ShadingBinDataByteOffset + (ShadingBinScatterRanges[VotedBin].RangeStart + FullTileDataOffset) * 4u;
+		}
+		else
+		{
+			DataWriteOffset = ShadingBinDataByteOffset + (ShadingBinScatterRanges[VotedBin].RangeEnd - LooseDataOffset - PixelCount) * 4u;
+		}
+		
+		// Mark bin invalid and store the write offset
+		uint WriteOffsetEncodedAsBinIndex = (INVALID_BIN3 - 1) - DataWriteOffset;
+
+		UNROLL
+		for (uint i = 0; i < 4; i++)
+		{
+			if (bBinMatch[i])
+			{
+				ShadingBins[i] = WriteOffsetEncodedAsBinIndex;
+				WriteOffsetEncodedAsBinIndex -= 4;
+			}
+		}
+	}
+
+	void Finish(int4 ShadingBins)
+	{
+		const uint2 VRSMask = 0xFFFFFFFFu << VRSShift;
+
+		UNROLL
+		for (uint PixelIndex = 0; PixelIndex < 4; PixelIndex++)
+		{
+			const uint BinIndex = ShadingBins[PixelIndex];
+			if (BinIndex < INVALID_BIN3)
+			{
+				const uint DataWriteOffset = (INVALID_BIN3 - 1) - BinIndex;
+				const uint2 PixelCoord = QuadTLCoord + uint2(PixelIndex & 1u, PixelIndex >> 1);
+				const uint2 CoarsePixelTL = PixelCoord & VRSMask;
+				const uint WriteMask = BitFieldExtractU32(WriteMasks, 4, PixelIndex * 4);
+				OutShadingBinData.Store(DataWriteOffset, PackShadingPixel(CoarsePixelTL, VRSShift, WriteMask));
+			}
+		}
+	}
+};
+
+#endif // SHADING_BIN_SCATTER
+
+struct FCountQuadsTask
+{
+	bool bWaveQuadVRS;
+	uint ShadingRate;
+
+	void Init(bool bInWaveQuadVRS, uint InShadingRate)
+	{
+		bWaveQuadVRS = bInWaveQuadVRS;
+		ShadingRate = InShadingRate;
+	}
+
+	void ProcessBin(inout int4 ShadingBins, int VotedBin, int LaneBin, uint ThreadIndex)
+	{	
+		bool bWriteQuad = false;
+		UNROLL
+		for (uint i = 0u; i < 4u; ++i)
+		{
+			const bool bMatch = (ShadingBins[i] == VotedBin);
+			ShadingBins[i] = bMatch ? (INVALID_BIN0 - i) : ShadingBins[i];
+			bWriteQuad |= bMatch;
+		}
+
+		BRANCH
+		if (bWaveQuadVRS)
+		{
+			const uint WaveLaneIndex = WaveGetLaneIndex();
+			const uint BlockThreadIndex = WaveLaneIndex & 3u;
+			const uint BlockFirstThread = WaveLaneIndex & 28u;
+
+			const uint2 Ballot = WaveBallot(bWriteQuad);
+			const uint Mask2x2 = BitFieldExtractU32(WaveLaneIndex >= 32 ? Ballot.y : Ballot.x, 4, BlockFirstThread);
+
+			const uint TestMask =	(ShadingRate == D3D12_SHADING_RATE_2X2) ? 0xF :
+									(ShadingRate == D3D12_SHADING_RATE_2X1) ? ((BlockThreadIndex & 2) ? 0xC : 0x3) :
+									(ShadingRate == D3D12_SHADING_RATE_1X2) ? ((BlockThreadIndex & 1) ? 0xA : 0x5) :
+									(1u << BlockThreadIndex);
+
+			bWriteQuad = (firstbitlow(Mask2x2 & TestMask) == BlockThreadIndex);
+		}
+					
+		if (bWriteQuad)
+		{
+			const uint AddCount = WaveActiveCountBits(true);
+			if (WaveIsFirstLane())
+			{
+				// Loose vs Full-Time doesn't matter for counting pass, so just count everything as loose.
+				InterlockedAdd(OutShadingBinScatterCounters[VotedBin].LooseElementCount, AddCount);
+			}
+		}
+	}
+
+	void Finish(int4 ShadingBins) {};
+};
+
+#if SHADING_BIN_SCATTER
+
+template<bool bSingleWave>
+struct FScatterQuadsTask
+{
+	bool bWaveQuadVRS;
+	uint2 QuadTLCoord;
+	uint2 VRSShift;
+	uint ShadingRate;
+	uint WriteMasks;
+
+	void Init(bool bInWaveQuadVRS, uint2 InQuadTLCoord, uint2 InVRSShift, uint InShadingRate, uint InWriteMasks)
+	{
+		bWaveQuadVRS = bInWaveQuadVRS;
+		QuadTLCoord = InQuadTLCoord;
+		VRSShift = InVRSShift;
+		ShadingRate = InShadingRate;
+		WriteMasks = InWriteMasks;
+	}
+
+	void ProcessBin(inout int4 ShadingBins, int VotedBin, int LaneBin, uint ThreadIndex)
+	{
+		uint OutputWriteMask = 0u;
+		UNROLL
+		for (uint i = 0u; i < 4u; ++i)
+		{
+			const bool bMatch = (ShadingBins[i] == VotedBin);
+			ShadingBins[i] = bMatch ? (INVALID_BIN0 - i) : ShadingBins[i];
+			OutputWriteMask |= (bMatch ? (1u << (i * 4)) : 0u);
+		}
+
+		const bool bFullTile = IsFullTile(OutputWriteMask == 0x1111u);
+
+		const uint WaveLaneIndex = WaveGetLaneIndex();
+		const uint BlockThreadIndex = WaveLaneIndex & 3u;
+		const uint BlockFirstThread = WaveLaneIndex & 28u;
+
+		BRANCH
+		if(bWaveQuadVRS && WaveActiveAnyTrue(ShadingRate != D3D12_SHADING_RATE_1X1))
+		{
+			// Combine the individual active write masks into a single quad mask for the current bin
+			uint QuadMask = WriteMasks & (OutputWriteMask * 0xFu);
+
+			// Merge down to single 4-bit mask
+			QuadMask |= QuadMask >> 8;
+			QuadMask |= QuadMask >> 4;
+			QuadMask &= 0xF;
+
+			// Assemble Quad masks into a 2x2 quad (4x4 pixel) mask
+			const uint BlockShift = (BlockThreadIndex * 4);
+			uint BlockMask = QuadMask << BlockShift;
+
+			BlockMask |= QuadReadAcrossX(BlockMask);
+			BlockMask |= QuadReadAcrossY(BlockMask);
+
+			const uint ShiftedBlockMask = BlockMask >> BlockShift;
+				
+			// Calculate write masks for the individual lanes from the block mask
+			if (ShadingRate == D3D12_SHADING_RATE_2X2)
+			{
+				OutputWriteMask = BlockThreadIndex ? 0 : BlockMask;
+			}
+			else if (ShadingRate == D3D12_SHADING_RATE_2X1)
+			{
+				OutputWriteMask = (BlockThreadIndex & 1) ? 0u : ShiftedBlockMask;
+				OutputWriteMask = (OutputWriteMask & 0x0033u) | ((OutputWriteMask << 6) & 0x3300u);
+			}
+			else if (ShadingRate == D3D12_SHADING_RATE_1X2)
+			{
+				OutputWriteMask = (BlockThreadIndex & 2) ? 0u : ShiftedBlockMask;
+				OutputWriteMask = (OutputWriteMask & 0x0505u) | ((OutputWriteMask << 3) & 0x5050u);
+			}
+		}
+
+		const bool bWriteQuad		= (OutputWriteMask != 0u);
+		const bool bWriteFullTile	= (bFullTile && bWriteQuad);
+		const bool bWriteLoose		= (!bFullTile && bWriteQuad);
+
+		uint FullTileDataOffset;
+		uint LooseDataOffset;
+
+		AllocateElements<bSingleWave, true>(VotedBin, ThreadIndex, bWriteFullTile ? 1 : 0, bWriteLoose ? 1 : 0, FullTileDataOffset, LooseDataOffset);
+			
+		if (bWriteQuad)
+		{
+			const uint RangeStart = ShadingBinScatterRanges[VotedBin].RangeStart;
+
+			const uint2 PackedShadingQuad = PackShadingQuad(QuadTLCoord, VRSShift, OutputWriteMask);
+
+			BRANCH
+			if (bWriteFullTile)
+			{
+				OutShadingBinData.Store2(ShadingBinDataByteOffset + (RangeStart * 4 + FullTileDataOffset * 8), PackedShadingQuad);
+			}
+			else
+			{
+				const uint BaseAddress = ShadingBinScatterRanges[VotedBin].RangeEnd;
+				OutShadingBinData.Store2(ShadingBinDataByteOffset + (BaseAddress * 4u - LooseDataOffset * 8u - 8u), PackedShadingQuad);
+			}
+
+#if GATHER_STATS
+			const uint NumHelpers = 4	- ((OutputWriteMask & 0x000Fu) != 0u)
+										- ((OutputWriteMask & 0x00F0u) != 0u)
+										- ((OutputWriteMask & 0x0F00u) != 0u)
+										- ((OutputWriteMask & 0xF000u) != 0u);
+			WaveInterlockedAdd(OutShadingBinStats[0].TotalHelperCount, NumHelpers);
+#endif
+		}
+	}
+
+	void Finish(int4 ShadingBins) {}
+};
+
+#endif // SHADING_BIN_SCATTER
+
+template<bool bSingleWave>
+void BinShadingQuad(uint2 Coord, uint ThreadIndex)
+{
+	const uint2 QuadTLCoord = uint2(Coord << 1u) + DispatchOffsetTL;
+
+	const bool4 ValidMask = bool4(
+		QuadTLCoord.x >= ViewRect.x && QuadTLCoord.x < ViewRect.z,
+		QuadTLCoord.y >= ViewRect.y && QuadTLCoord.y < ViewRect.w,
+		QuadTLCoord.x + 1u >= ViewRect.x && QuadTLCoord.x + 1u < ViewRect.z,
+		QuadTLCoord.y + 1u >= ViewRect.y && QuadTLCoord.y + 1u < ViewRect.w
+	);
+
+	const uint4 QuadShadingMask = uint4(	all(ValidMask.xy) ? ShadingMask[QuadTLCoord + uint2(0, 0)] : 0u,
+											all(ValidMask.zy) ? ShadingMask[QuadTLCoord + uint2(1, 0)] : 0u,
+											all(ValidMask.xw) ? ShadingMask[QuadTLCoord + uint2(0, 1)] : 0u,
+											all(ValidMask.zw) ? ShadingMask[QuadTLCoord + uint2(1, 1)] : 0u);
+	
+	const FShadingMask ShadingMask[4] = {	UnpackShadingMask(QuadShadingMask.x),
+											UnpackShadingMask(QuadShadingMask.y),
+											UnpackShadingMask(QuadShadingMask.z),
+											UnpackShadingMask(QuadShadingMask.w) };
+
+	const bool4 ValidPixels = bool4(		ShadingMask[0].bIsNanitePixel,
+											ShadingMask[1].bIsNanitePixel,
+											ShadingMask[2].bIsNanitePixel,
+											ShadingMask[3].bIsNanitePixel);
+
+	const uint ActiveMask = PackQuadMask(ValidPixels);
+
+	BRANCH
+	if (SHADING_BIN_SCATTER && !bSingleWave)
+	{
+		if(ThreadIndex == 0) GroupEarlyOut = 1;
+		GroupMemoryBarrierWithGroupSync();
+
+		if (ActiveMask != 0)
+		{
+			if (WaveIsFirstLane())
+			{
+				GroupEarlyOut = 0;
+			}
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+
+		if (GroupEarlyOut != 0)
+		{
+			// Quad is entirely non-Nanite or out of bounds.
+			return;
+		}
+	}
+	else
+	{
+		if (!WaveActiveAnyTrue((ActiveMask | DummyZero) != 0))
+		{
+			// Quad is entirely non-Nanite or out of bounds.
+			return;
+		}
+	}
+
+	const uint WaveLaneIndex = WaveGetLaneIndex();
+	const uint BlockThreadIndex = WaveLaneIndex & 3u;
+	const uint BlockFirstThread = WaveLaneIndex & 28u;
+
+	const uint4 MaterialFlagValues = uint4(	ValidPixels.x ? GetShadingBinMeta(ShadingMask[0].ShadingBin).MaterialFlags : 0u,
+											ValidPixels.y ? GetShadingBinMeta(ShadingMask[1].ShadingBin).MaterialFlags : 0u,
+											ValidPixels.z ? GetShadingBinMeta(ShadingMask[2].ShadingBin).MaterialFlags : 0u,
+											ValidPixels.w ? GetShadingBinMeta(ShadingMask[3].ShadingBin).MaterialFlags : 0u);
+
+	const FNaniteMaterialFlags MaterialFlags[4] = { UnpackNaniteMaterialFlags(MaterialFlagValues.x),
+													UnpackNaniteMaterialFlags(MaterialFlagValues.y),
+													UnpackNaniteMaterialFlags(MaterialFlagValues.z),
+													UnpackNaniteMaterialFlags(MaterialFlagValues.w) };
+
+#if VARIABLE_SHADING_RATE
+	uint PixelShadingRate = clamp(ShadingRateImage[QuadTLCoord.xy >> ShadingRateTileSizeBits] & 0xFu, D3D12_SHADING_RATE_1X1, D3D12_SHADING_RATE_2X2);
+
+	if ((ValidPixels.x && !MaterialFlags[0].bAllowVRS) ||
+		(ValidPixels.y && !MaterialFlags[1].bAllowVRS) || 
+		(ValidPixels.z && !MaterialFlags[2].bAllowVRS) || 
+		(ValidPixels.w && !MaterialFlags[3].bAllowVRS))
+		PixelShadingRate = D3D12_SHADING_RATE_1X1;
+
+	const bool bWavePixelVRS = WaveActiveAnyTrue(PixelShadingRate != D3D12_SHADING_RATE_1X1);
+	
+	bool bWaveQuadVRS = false;
+	uint QuadShadingRate = PixelShadingRate;
+	BRANCH
+	if(bWavePixelVRS)
+	{
+		// Vote across 2x2 quad blocks (4x4 pixels) to pick a shared mode that is at least as high resolution in both x and y.
+		const uint2 FullResXBallot = WaveBallot(PixelShadingRate == D3D12_SHADING_RATE_1X1 || PixelShadingRate == D3D12_SHADING_RATE_1X2);
+		const uint2 FullResYBallot = WaveBallot(PixelShadingRate == D3D12_SHADING_RATE_1X1 || PixelShadingRate == D3D12_SHADING_RATE_2X1);
+		const uint BlockFullResXMask = BitFieldExtractU32(WaveLaneIndex >= 32 ? FullResXBallot.y : FullResXBallot.x, 4, BlockFirstThread);
+		const uint BlockFullResYMask = BitFieldExtractU32(WaveLaneIndex >= 32 ? FullResYBallot.y : FullResYBallot.x, 4, BlockFirstThread);
+		QuadShadingRate = BlockFullResXMask ?	(BlockFullResYMask ? D3D12_SHADING_RATE_1X1 : D3D12_SHADING_RATE_1X2) :
+												(BlockFullResYMask ? D3D12_SHADING_RATE_2X1 : D3D12_SHADING_RATE_2X2);
+		bWaveQuadVRS = WaveActiveAnyTrue(QuadShadingRate != D3D12_SHADING_RATE_1X1);
+	}
+#else
+	const uint PixelShadingRate = D3D12_SHADING_RATE_1X1;
+	const uint QuadShadingRate = D3D12_SHADING_RATE_1X1;
+	const bool bWavePixelVRS = false;
+	const bool bWaveQuadVRS = false;
+#endif
+
+	const uint2 PixelVRSShift = uint2(	PixelShadingRate == D3D12_SHADING_RATE_2X1 || PixelShadingRate == D3D12_SHADING_RATE_2X2,
+										PixelShadingRate == D3D12_SHADING_RATE_1X2 || PixelShadingRate == D3D12_SHADING_RATE_2X2);
+	const uint2 QuadVRSShift = uint2(	QuadShadingRate == D3D12_SHADING_RATE_2X1 || QuadShadingRate == D3D12_SHADING_RATE_2X2,
+										QuadShadingRate == D3D12_SHADING_RATE_1X2 || QuadShadingRate == D3D12_SHADING_RATE_2X2);
+
+	// Mask invalid shading bins with distinct invalid values, so invalid bins don't compare equal to each other.
+	int4 PixelShadingBins = int4(
+		(ValidPixels.x && MaterialFlags[0].bNoDerivativeOps) ? ShadingMask[0].ShadingBin : INVALID_BIN0,
+		(ValidPixels.y && MaterialFlags[1].bNoDerivativeOps) ? ShadingMask[1].ShadingBin : INVALID_BIN1,
+		(ValidPixels.z && MaterialFlags[2].bNoDerivativeOps) ? ShadingMask[2].ShadingBin : INVALID_BIN2,
+		(ValidPixels.w && MaterialFlags[3].bNoDerivativeOps) ? ShadingMask[3].ShadingBin : INVALID_BIN3
+	);
+
+	int4 QuadShadingBins = int4(
+		(ValidPixels.x && !MaterialFlags[0].bNoDerivativeOps) ? ShadingMask[0].ShadingBin : INVALID_BIN0,
+		(ValidPixels.y && !MaterialFlags[1].bNoDerivativeOps) ? ShadingMask[1].ShadingBin : INVALID_BIN1,
+		(ValidPixels.z && !MaterialFlags[2].bNoDerivativeOps) ? ShadingMask[2].ShadingBin : INVALID_BIN2,
+		(ValidPixels.w && !MaterialFlags[3].bNoDerivativeOps) ? ShadingMask[3].ShadingBin : INVALID_BIN3
+	);
+
+	uint QuadWriteMasks;			// 4:4:4:4 write mask. A 4-bits mask per pixel of the current quad. Each mask indicating where in the quad to write that pixel.
+	uint CoarsePixelWriteMasks;		// Same as above, but masks are relative to the top-left of the coarse pixel, instead of the quad.
+	QuadWriteMasks = CoarsePixelWriteMasks = ConvertQuadCoverageMaskToWriteMask(ActiveMask);
+
+	BRANCH
+	if (bWavePixelVRS)
+	{
+		UpdateVRSActiveAndWriteMasks(ActiveMask, PixelVRSShift, PixelShadingBins, CoarsePixelWriteMasks);
+
+		// Adjust write masks to be local to the coarse pixel instead of being relative to top-left of the quad
+		CoarsePixelWriteMasks = (PixelVRSShift.x == 0) ? BitFieldInsertU32(0xF0F0, CoarsePixelWriteMasks >> 1, CoarsePixelWriteMasks) : CoarsePixelWriteMasks;
+		CoarsePixelWriteMasks = (PixelVRSShift.y == 0) ? BitFieldInsertU32(0xFF00, CoarsePixelWriteMasks >> 2, CoarsePixelWriteMasks) : CoarsePixelWriteMasks;
+	}
+	
+	BRANCH
+	if(bWaveQuadVRS)
+	{
+		UpdateVRSActiveAndWriteMasks(ActiveMask, QuadVRSShift, QuadShadingBins, QuadWriteMasks);
+	}
+
+#if SHADING_BIN_COUNT
+
+	// Pixel binning
+	FCountPixelsTask CountPixelsTask;
+	BinScalarization<FCountPixelsTask, false, true>(CountPixelsTask, PixelShadingBins, ThreadIndex);
+
+	// Quad binning
+	FCountQuadsTask CountQuadsTask;
+	CountQuadsTask.Init(bWaveQuadVRS, QuadShadingRate);
+	BinScalarization<FCountQuadsTask, false, true>(CountQuadsTask, QuadShadingBins, ThreadIndex);
+
+#elif SHADING_BIN_SCATTER
+
+#if GATHER_STATS
+	WaveInterlockedAdd(OutShadingBinStats[0].TotalNanitePixels, countbits(ActiveMask));
+#endif
+	
+	// Pixel Binning
+	FScatterPixelsTask<bSingleWave> ScatterPixelsTask;
+	ScatterPixelsTask.Init(QuadTLCoord, PixelVRSShift, CoarsePixelWriteMasks);
+	BinScalarization<FScatterPixelsTask<bSingleWave>, !bSingleWave, false>(ScatterPixelsTask, PixelShadingBins, ThreadIndex);
+
+	// Quad binning
+	FScatterQuadsTask<bSingleWave> ScatterQuadsTask;
+	ScatterQuadsTask.Init(bWaveQuadVRS, QuadTLCoord, QuadVRSShift, QuadShadingRate, QuadWriteMasks);
+	BinScalarization<FScatterQuadsTask<bSingleWave>, !bSingleWave, false>(ScatterQuadsTask, QuadShadingBins, ThreadIndex);
+#endif
+
+#if OPTIMIZE_WRITE_MASK
+	// NOTE: It should be only necessary to test the TL pixel's cmask index/shift, since a quad shouldn't be able to span multiple nibbles.
+	uint CMaskIndex;
+	uint CMaskShift;
+	ComputeCMaskIndexAndShift(QuadTLCoord / 8u, CMaskIndex, CMaskShift);
+
+	uint CMaskTileBitIndex = (ThreadIndex >> 2) & 3u; // 4 threads cover 4x4 CMask tile.
+
+	const bool bSubTileMatch = (SubTileMatch == 1u);
+	if(bSubTileMatch)
+	{
+		// Remap to the target CMASK subtile mode (may not be TL, TR, BL, BR)
+		CMaskTileBitIndex = BitFieldExtractU32(GetSubTileOrder(), 4, CMaskTileBitIndex * 4);
+	}
+	const uint CMaskBitOffset = (CMaskIndex & 0x3) * 8u + CMaskShift;
+	const uint CMaskValue4x4 = (1u << (CMaskBitOffset + CMaskTileBitIndex));
+
+	// Calculate 4x4 pixel write masks. Set bit means all 4x4 pixels are written
+	const uint WriteMaskQuad = BitFieldExtractU32(MaterialFlagValues[0] & MaterialFlagValues[1] & MaterialFlagValues[2] & MaterialFlagValues[3], 8u, 24u);
+	uint WriteMask4x4 = WriteMaskQuad;
+	WriteMask4x4 &= QuadReadAcrossX(WriteMask4x4);
+	WriteMask4x4 &= QuadReadAcrossY(WriteMask4x4);
+
+	uint Mask = ValidWriteMask;
+
+	UNROLL
+	for (uint Export = 0; Export < NUM_EXPORTS; ++Export)
+	{
+		// Remaps from compacted (valid) targets to sparse write mask indices
+		// i.e. Export0 can be MRT1 which is represented as bit index 1 in ValidWriteMask
+		//   - 0 is MRT0/SceneColor which isn't valid to export
+		uint MaskIndex = firstbitlow(Mask);
+		Mask &= Mask - 1u;
+
+		const bool bWriteCMask4x4 = BitFieldExtractU32(WriteMask4x4, 1, MaskIndex) != 0;
+
+		uint CMaskValue = bWriteCMask4x4 ? CMaskValue4x4 : 0u;
+
+		// Combine CMask bits to form full 8x8 CMask tile to minimize number of atomics
+		CMaskValue |= WaveLaneSwizzleGCN(CMaskValue, 0x1F, 0x00, 0x04);
+		CMaskValue |= WaveLaneSwizzleGCN(CMaskValue, 0x1F, 0x00, 0x08);
+
+		// Write out 4x4 subtile cmask or 8x8 full tile cmask
+		const bool bLaneWrite = ((ThreadIndex & 15) == 0) && select(bSubTileMatch, CMaskValue != 0, countbits(CMaskValue) == 4);
+		if (bLaneWrite)
+		{
+			CMaskExports[Export].InterlockedOr(CMaskIndex, CMaskValue);
+		}
+	}
+#endif // OPTIMIZE_WRITE_MASK
+}
+
+[numthreads(SHADING_BIN_TILE_THREADS, 1, 1)]
+void ShadingBinBuildCS(uint ThreadIndex : SV_GroupIndex, uint2 GroupId : SV_GroupID)
+{
+	uint2 Coord = GroupId.xy * SHADING_BIN_TILE_SIZE;
+	Coord += ZOrder2D(ThreadIndex, 3);
+	
+	const bool bSingleWave = WaveGetLaneCount() >= SHADING_BIN_TILE_THREADS;	// Constant at compile/optimization time
+	
+	BRANCH
+	if(bSingleWave)
+		BinShadingQuad<true>(Coord, ThreadIndex);
+	else
+		BinShadingQuad<false>(Coord, ThreadIndex);
+}
+
+#elif SHADING_BIN_RESERVE
+
+[numthreads(64, 1, 1)]
+void ShadingBinReserveCS(uint ShadingBin : SV_DispatchThreadID)
+{
+	if (ShadingBin >= ShadingBinCount)
+		return;
+
+	const FNaniteMaterialFlags MaterialFlags = UnpackNaniteMaterialFlags(GetShadingBinMeta(ShadingBin).MaterialFlags);
+
+	uint BinPixelCount;
+	if (MaterialFlags.bNoDerivativeOps)
+	{
+		BinPixelCount = OutShadingBinScatterCounters[ShadingBin].LooseElementCount;
+
+		if (BinPixelCount > 0)
+		{
+			uint RangeStart;
+			InterlockedAdd(OutShadingBinAllocator[0], BinPixelCount, RangeStart);
+			OutShadingBinData.Store((ShadingBin * NANITE_SHADING_BIN_META_BYTES) + NANITE_SHADING_BIN_META_RANGE_START_OFFSET, RangeStart);
+			OutShadingBinData.Store((ShadingBin * NANITE_SHADING_BIN_META_BYTES) + NANITE_SHADING_BIN_META_ELEMENT_COUNT_OFFSET, BinPixelCount);
+
+			OutShadingBinScatterRanges[ShadingBin].RangeStart = RangeStart;
+			OutShadingBinScatterRanges[ShadingBin].RangeEnd = RangeStart + BinPixelCount;
+			OutShadingBinScatterCounters[ShadingBin].LooseElementCount = 0;
+			OutShadingBinScatterCounters[ShadingBin].FullTileElementCount = 0;
+		}
+
+#if GATHER_STATS
+		const uint WaveBinPixelCount = WaveActiveSum(BinPixelCount);
+		if (WaveIsFirstLane())
+		{
+			InterlockedAdd(OutShadingBinStats[0].TotalShadedPixels, WaveBinPixelCount);
+		}
+#endif
+	}
+	else
+	{
+		const uint BinQuadCount = OutShadingBinScatterCounters[ShadingBin].LooseElementCount;
+
+		if (BinQuadCount > 0)
+		{
+			uint RangeStart;
+			InterlockedAdd(OutShadingBinAllocator[0], BinQuadCount * 2, RangeStart);
+			OutShadingBinData.Store((ShadingBin * NANITE_SHADING_BIN_META_BYTES) + NANITE_SHADING_BIN_META_RANGE_START_OFFSET, RangeStart);
+			OutShadingBinData.Store((ShadingBin * NANITE_SHADING_BIN_META_BYTES) + NANITE_SHADING_BIN_META_ELEMENT_COUNT_OFFSET, BinQuadCount);
+
+			OutShadingBinScatterRanges[ShadingBin].RangeStart = RangeStart;
+			OutShadingBinScatterRanges[ShadingBin].RangeEnd = RangeStart + BinQuadCount * 2;
+			OutShadingBinScatterCounters[ShadingBin].LooseElementCount = 0;
+			OutShadingBinScatterCounters[ShadingBin].FullTileElementCount = 0;
+		}
+
+		const uint ArgsOffset = ShadingBin * 4u;
+
+		// Includes helper lanes
+		BinPixelCount = BinQuadCount * 4u;
+
+#if GATHER_STATS
+		const uint WaveBinQuadCount = WaveActiveSum(BinQuadCount);
+		if (WaveIsFirstLane())
+		{
+			InterlockedAdd(OutShadingBinStats[0].TotalShadedQuads, WaveBinQuadCount);
+		}
+#endif
+	}
+	
+	uint4 ShadingBinArgs;
+	ShadingBinArgs.x = DivideAndRoundUp(BinPixelCount, COMPUTE_MATERIAL_GROUP_SIZE);	// ThreadGroupCountX
+	ShadingBinArgs.y = 1u;										// ThreadGroupCountY
+	ShadingBinArgs.z = 1u;										// ThreadGroupCountZ
+	ShadingBinArgs.w = 0u;										// Reserved / Unused
+	OutShadingBinArgs.Store4(ShadingBin * 16u, ShadingBinArgs);
+}
+#elif SHADING_BIN_VALIDATE
+
+[numthreads(64, 1, 1)]
+void ShadingBinValidateCS(uint ShadingBin : SV_DispatchThreadID)
+{
+	if (ShadingBin >= ShadingBinCount)
+		return;
+
+	const FNaniteShadingBinMeta ShadingBinMeta = GetShadingBinMeta(ShadingBin);
+	const uint WrittenCount = OutShadingBinScatterCounters[ShadingBin].LooseElementCount + OutShadingBinScatterCounters[ShadingBin].FullTileElementCount;
+
+	if (ShadingBinMeta.ElementCount != WrittenCount)
+	{
+		PLATFORM_BREAK();
+	}
+}
+
+#elif SHADING_BIN_CMASK_CLEAR
+
+uint2 ClearTileRectMin;
+uint2 ClearTileRectSize;
+
+[numthreads(8, 8, 1)]
+void ClearCMaskRectCS(uint2 DispatchThreadID : SV_DispatchThreadID)
+{
+	bool bActive = all(DispatchThreadID < ClearTileRectSize);
+
+	const uint2 TileCoord = ClearTileRectMin + DispatchThreadID;
+
+	uint CMaskByteAddress;
+	uint CMaskShift;
+	ComputeCMaskIndexAndShift(TileCoord, CMaskByteAddress, CMaskShift);
+	
+	const uint Value = 0xFu << ((CMaskByteAddress & 3u) * 8u + CMaskShift);
+	const uint AlignedAddress = CMaskByteAddress & ~3u;
+
+	uint WriteAddress = 0;
+	uint WriteValue = 0;
+
+	// For now, just scalarize to avoid atomic contention, so we don't have to worry about the specifics of the cmask layout.
+	while (WaveActiveAnyTrue(bActive))
+	{
+		if (bActive)
+		{
+			const uint ScalarAlignedAddress = WaveReadLaneFirst(AlignedAddress);
+
+			if (AlignedAddress == ScalarAlignedAddress)
+			{
+				const uint ScalarValue = WaveActiveBitOr(Value);
+
+				if (WaveIsFirstLane())
+				{
+					WriteAddress = ScalarAlignedAddress;
+					WriteValue = ScalarValue;
+				}
+
+				bActive = false;
+			}
+		}
+	}
+
+	if (WriteValue != 0u)
+	{
+		uint Mask = ValidWriteMask;
+		UNROLL
+		for (uint Export = 0; Export < NUM_EXPORTS; ++Export)
+		{
+			uint MaskIndex = firstbitlow(Mask);
+			Mask &= Mask - 1u;
+ 
+			CMaskExports[Export].InterlockedOr(WriteAddress, WriteValue);
+		}
+	}
+}
+
+#endif

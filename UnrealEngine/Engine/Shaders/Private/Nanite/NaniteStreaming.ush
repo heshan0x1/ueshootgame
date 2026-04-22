@@ -1,0 +1,49 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "../WaveOpUtil.ush"
+#include "/Engine/Shared/NaniteDefinitions.h"
+
+struct FStreamingRequest
+{
+	uint RuntimeResourceID_Magic;
+	uint ResourcePageRangeKey;
+	uint Priority_Magic;
+};
+
+uint StreamingRequestsBufferVersion;
+uint StreamingRequestsBufferSize;
+
+void RequestPageRange( RWStructuredBuffer<FStreamingRequest> RequestsBuffer, uint RuntimeResourceID, uint ResourcePageRangeKey, uint PriorityCategory, float Priority )
+{
+	const uint NumPagesOrPageRanges = ResourcePageRangeKey & NANITE_PAGE_RANGE_KEY_COUNT_MASK;
+	const bool bHasStreamingPages = (ResourcePageRangeKey & NANITE_PAGE_RANGE_KEY_FLAG_HAS_STREAMING_PAGES) != 0;
+	if ((RenderFlags & NANITE_RENDER_FLAG_OUTPUT_STREAMING_REQUESTS) && NumPagesOrPageRanges > 0 && bHasStreamingPages)
+	{
+		uint Index;
+		WaveInterlockedAddScalar_(RequestsBuffer[0].RuntimeResourceID_Magic, 1, Index);	// HACK: Store count in RuntimeResourceID_Magic of first request.
+
+		if (Index < StreamingRequestsBufferSize - 1)
+		{
+			const uint MinPriority				= NANITE_SANITY_CHECK_STREAMING_REQUESTS ? (1u << NANITE_STREAMING_REQUEST_MAGIC_BITS) : 1u;
+			const uint UIntPriority				= clamp((PriorityCategory << 30) | (asuint(Priority) >> 2), MinPriority, NANITE_MAX_PRIORITY_BEFORE_PARENTS);
+
+			FStreamingRequest Request;
+#if NANITE_SANITY_CHECK_STREAMING_REQUESTS
+			Request.RuntimeResourceID_Magic		= (RuntimeResourceID << NANITE_STREAMING_REQUEST_MAGIC_BITS);
+			Request.ResourcePageRangeKey		= ResourcePageRangeKey;
+			Request.Priority_Magic				= UIntPriority & ~NANITE_STREAMING_REQUEST_MAGIC_MASK;		// Mask off low bits to leave space for magic
+			const uint FrameNibble				= StreamingRequestsBufferVersion & 0xF;
+			Request.RuntimeResourceID_Magic		|= 0x10 | FrameNibble;
+			Request.Priority_Magic				|= 0x20 | FrameNibble;
+#else
+			Request.RuntimeResourceID_Magic		= RuntimeResourceID;
+			Request.ResourcePageRangeKey		= ResourcePageRangeKey;
+			Request.Priority_Magic				= UIntPriority;
+#endif
+			RequestsBuffer[Index + 1]			= Request;
+		}
+	}
+}

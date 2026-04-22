@@ -1,0 +1,103 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Float R11G11B10 max
+#define INVALID_LIGHTING half3(65024.0, 65024.0, 64512.0)
+
+bool IsLightingValid(half3 V)
+{
+	return !all(V == INVALID_LIGHTING);
+}
+
+half3 LumenRGBToYCoCg(half3 RGB)
+{
+	half Y  = dot(RGB, half3( 0.25, 0.5, 0.25));
+	half Co = dot(RGB, half3( 0.5, 0, -0.5));
+	half Cg = dot(RGB, half3(-0.25, 0.5, -0.25));
+	
+	half3 YCoCg = half3(Y, Co, Cg);
+	return YCoCg;
+}
+
+half3 LumenYCoCgToRGB(half3 YCoCg)
+{
+	half Y  = YCoCg.x;
+	half Co = YCoCg.y;
+	half Cg = YCoCg.z;
+
+	half R = Y + Co - Cg;
+	half G = Y + Cg;
+	half B = Y - Co - Cg;
+
+	half3 RGB = half3(R, G, B);
+	return RGB;
+}
+
+float3 LumenRGBToYCoCgSafe(float3 RGB)
+{
+	return IsLightingValid(RGB) ? LumenRGBToYCoCg(RGB) : INVALID_LIGHTING;
+}
+
+// [Moving Frostbite to Physically Based Rendering 3.0]
+// Approximates factor in Lerp(N, R, factor) = dominant direction of a GGX lobe
+float GetSpecularDominantDirFactor(float Roughness)
+{
+	float S = saturate(1.0f - Roughness);
+	return S * (sqrt(S) + Roughness);
+}
+
+// [Moving Frostbite to Physically Based Rendering 3.0]
+float GetSpecularLobeHalfAngle(float Roughness)
+{
+	float E = 0.75f; // Percentage of preserved energy
+	float LobeHalfAngle = AtanFast((Pow2(Roughness) * E) / (1.0f - E));
+	return LobeHalfAngle;
+}
+
+float ReflectionsDenoiserOneOverTonemapRange;
+
+float3 RGBToDenoiserSpace(float3 V)
+{
+	if (IsLightingValid(V))
+	{
+		float Weight = 1.0f / (1.0f + Luminance(V) * ReflectionsDenoiserOneOverTonemapRange);
+		V = V * Weight;
+	}
+
+	return V;
+}
+
+float4 RGBAToDenoiserSpace(float4 V)
+{
+	V.xyz = RGBToDenoiserSpace(V.xyz);
+	return V;
+}
+
+float3 DenoiserSpaceToRGB(float3 V)
+{
+	if (IsLightingValid(V))
+	{
+		float InvWeight = 1.0f / (1.0f - Luminance(V) * ReflectionsDenoiserOneOverTonemapRange);
+		V = V * InvWeight;
+	}
+
+	return V;
+}
+
+half PackNumFramesAccumulated(half X)
+{
+	// Assume UInt8 quantization
+	return X / 32.0 + 0.5 / 255.0;
+}
+
+half UnpackNumFramesAccumulated(half X)
+{
+	return X * 32.0;
+}
+
+uint GetMaxFramesAccumulated(uint MaxFrames, float Roughness)
+{
+	// Speedup accumulation for mirror reflections in order to reduce ghosting and other artifacts
+	// Mirror reflections don't need many samples to converge and can be mostly handled by TAA
+	MaxFrames = lerp(2, MaxFrames, saturate(Roughness / 0.05f));
+	return MaxFrames;
+}

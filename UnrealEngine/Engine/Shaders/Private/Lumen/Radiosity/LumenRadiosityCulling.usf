@@ -1,0 +1,108 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================
+	LumenRadiosityCulling.usf
+=============================================================================*/
+
+#include "../../Common.ush"
+#include "../LumenCardCommon.ush"
+#include "../LumenCardTile.ush"
+#include "../SurfaceCache/LumenSurfaceCache.ush"
+#include "LumenRadiosity.ush"
+
+StructuredBuffer<uint> CardPageIndexAllocator;
+StructuredBuffer<uint> CardPageIndexData;
+
+RWStructuredBuffer<uint> RWCardTileAllocator;
+RWStructuredBuffer<uint> RWCardTileData;
+
+RWStructuredBuffer<uint> RWRadiosityTileAllocator;
+RWStructuredBuffer<uint> RWRadiosityTileData;
+
+/**
+ * Build a list of radiosity tiles
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void BuildRadiosityTilesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 DispatchThreadId : SV_DispatchThreadID,
+	uint3 GroupThreadId : SV_GroupThreadID)
+{
+	// One thread per tile
+	uint LinearLightTileOffset = (GroupId.x % 4);
+	uint IndexInIndexBuffer = GroupId.x / 4;
+
+	uint2 TileCoord;
+	TileCoord.x = (LinearLightTileOffset % 2) * 8 + GroupThreadId.x;
+	TileCoord.y = (LinearLightTileOffset / 2) * 8 + GroupThreadId.y;
+
+	if (IndexInIndexBuffer < CardPageIndexAllocator[0])
+	{
+		uint CardPageIndex = CardPageIndexData[IndexInIndexBuffer];
+		FLumenCardPageData CardPage = GetLumenCardPageData(CardPageIndex);
+		if (CardPage.CardIndex >= 0)
+		{
+			FLumenCardData Card = GetLumenCardData(CardPage.CardIndex);
+
+			const uint2 SizeInTiles = CardPage.SizeInTexels / CARD_TILE_SIZE;
+
+			if (all(TileCoord < SizeInTiles))
+			{
+				float2 UVMin = float2(TileCoord) / SizeInTiles;
+				float2 UVMax = float2(TileCoord + 1) / SizeInTiles;
+
+				float SwapY = UVMin.y;
+				UVMin.y = 1.0f - UVMax.y;
+				UVMax.y = 1.0f - SwapY;
+
+				uint ViewIndex = GetCardViewIndex(CardPage, Card, UVMin, UVMax, float2(0, 1), NumViews, false);
+
+				FCardTileData CardTile;
+				CardTile.CardPageIndex = CardPageIndex;
+				CardTile.TileCoord = TileCoord;
+
+				uint NextTileIndex = 0;
+				InterlockedAdd(RWCardTileAllocator[0], 1, NextTileIndex);
+				RWCardTileData[NextTileIndex] = PackCardTileData(CardTile);
+
+				if (RadiosityTileSizeInProbes == 1)
+				{
+					// Indirection data per probe
+					for (uint ProbeY = 0; ProbeY < CardTileSizeInProbes; ++ProbeY)
+					{
+						for (uint ProbeX = 0; ProbeX < CardTileSizeInProbes; ++ProbeX)
+						{
+							uint2 ProbeCoord = uint2(ProbeX, ProbeY);
+							uint2 CoordInTile = ProbeCoord * ProbeSpacingInCardTexels + GetProbeJitter(CardPage.IndirectLightingTemporalIndex);
+							uint2 CoordInPage = TileCoord * CARD_TILE_SIZE + CoordInTile;
+
+							FRadiosityTexel RadiosityTexel = GetRadiosityTexel(CardPage, CoordInPage);
+
+							if (RadiosityTexel.bInsideAtlas && RadiosityTexel.bValid)
+							{
+								InterlockedAdd(RWRadiosityTileAllocator[ViewIndex], 1, NextTileIndex);
+
+								FRadiosityTileData RadiosityTile;
+								RadiosityTile.CardPageIndex = CardPageIndex;
+								RadiosityTile.TileCoord = TileCoord * CardTileSizeInProbes + ProbeCoord;
+
+								RWRadiosityTileData[ViewIndex * MaxRadiosityTiles + NextTileIndex] = PackRadiosityTileData(RadiosityTile);
+							}
+						}
+					}
+				}
+				else
+				{
+					// Indirection data per card tile
+					InterlockedAdd(RWRadiosityTileAllocator[ViewIndex], 1, NextTileIndex);
+
+					FRadiosityTileData RadiosityTile;
+					RadiosityTile.CardPageIndex = CardPageIndex;
+					RadiosityTile.TileCoord = TileCoord;
+
+					RWRadiosityTileData[ViewIndex * MaxRadiosityTiles + NextTileIndex] = PackRadiosityTileData(RadiosityTile);
+				}
+			}
+		}
+	}
+}

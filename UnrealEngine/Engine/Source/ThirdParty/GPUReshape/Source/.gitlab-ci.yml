@@ -1,0 +1,70 @@
+variables:
+  FF_USE_FASTZIP: "true"
+  ARTIFACT_COMPRESSION_LEVEL: "fast"
+
+stages:
+  - build
+  - package
+
+build_release:
+  tags:
+  - gpu-reshape
+  stage: build
+  script:
+  - 'cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_CONFIGURATION_TYPES:STRING="RelWithDebInfo" -DINSTALL_THIRD_PARTY:BOOL="1" -B "cmake-build-vs2022" -DCMAKE_VS_NUGET_PACKAGE_RESTORE=ON'
+  - 'cmake -P Build/Utils/CSProjPatch.cmake cmake-build-vs2022'
+  - 'dotnet restore "cmake-build-vs2022/GPU-Reshape.sln"'
+  # Workaround for https://gitlab.kitware.com/cmake/cmake/-/issues/18026
+  #  'cmake --build cmake-build-vs2022 --config RelWithDebInfo --parallel 4 -- /p:CL_MPcount=16'
+  - '"cmake-build-vs2022/GRS_MSBuild.bat" "cmake-build-vs2022/GPU-Reshape.sln" /p:Configuration=RelWithDebInfo'
+  artifacts:
+    name: "GPU-Reshape-Release-$CI_COMMIT_SHORT_SHA"
+    paths:
+    - Bin/MSVC/RelWithDebInfo/
+
+build_debug:
+  tags:
+  - windows
+  - amd64
+  stage: build
+  when: manual
+  script:
+  - 'cmake -G "Visual Studio 17 2022" -A x64 -DCMAKE_CONFIGURATION_TYPES:STRING="Debug" -DINSTALL_THIRD_PARTY:BOOL="1" -B "cmake-build-vs2022" -DCMAKE_VS_NUGET_PACKAGE_RESTORE=ON'
+  - 'cmake -P Build/Utils/CSProjPatch.cmake cmake-build-vs2022'
+  - 'dotnet restore "cmake-build-vs2022/GPU-Reshape.sln"'
+  # Workaround for https://gitlab.kitware.com/cmake/cmake/-/issues/18026
+  #  'cmake --build cmake-build-vs2022 --config Debug --parallel 4 -- /p:CL_MPcount=16'
+  - '"cmake-build-vs2022/GRS_MSBuild.bat" "cmake-build-vs2022/GPU-Reshape.sln" /p:Configuration=Debug'
+  artifacts:
+    name: "GPU-Reshape-Debug-$CI_COMMIT_SHORT_SHA"
+    paths:
+    - Bin/MSVC/Debug/
+
+package_release:
+  tags:
+  - windows
+  - amd64
+  stage: package
+  dependencies:
+  - build_release
+  script:
+  - '"Build\Scripts\Package.bat" MSVC/RelWithDebInfo'
+  artifacts:
+    name: "GPU-Reshape-Release-$CI_COMMIT_SHORT_SHA"
+    paths:
+    - Package/MSVC/RelWithDebInfo/
+
+package_debug:
+  tags:
+  - windows
+  - amd64
+  stage: package
+  when: manual
+  dependencies:
+  - build_debug
+  script:
+  - '"Build\Scripts\Package.bat" MSVC/Debug'
+  artifacts:
+    name: "GPU-Reshape-Debug-$CI_COMMIT_SHORT_SHA"
+    paths:
+    - Package/MSVC/Debug/

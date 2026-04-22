@@ -1,0 +1,97 @@
+﻿// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Shared/MaterialCacheDefinitions.h"
+#include "/Engine/Private/GammaCorrectionCommon.ush"
+#include "/Engine/Private/BlockCompressionCommon.ush"
+#include "/Engine/Private/BCCompressionCommon.ush"
+
+StructuredBuffer<FMaterialCachePageWriteData> PageWriteData;
+
+RWTexture2D<uint4>  RWVTLayerCompressed;
+RWTexture2D<float4> RWVTLayerUncompressed;
+SamplerState        TextureSampler;
+
+Texture2DArray<float4> ABuffer;
+
+uint   BlockOrThreadCount;
+float2 TexelSize;
+uint   bSRGB;
+
+[numthreads(8, 8, 1)]
+void WritePagesMain(uint3 DTid : SV_DispatchThreadID)
+{
+	uint2 BlockOrThreadIndex = DTid.xy;
+	
+	if (any(BlockOrThreadIndex.xy >= BlockOrThreadCount.xx))
+	{
+		return;
+	}
+
+	const FMaterialCachePageWriteData Data = PageWriteData[DTid.z];
+	
+#if COMPRESS_MODE == BC_NONE
+	static const uint BlockSH = 0;
+#else // COMPRESS_MODE == BC_NONE
+	static const uint BlockSH = 2;
+#endif // COMPRESS_MODE == BC_NONE
+	
+	const uint3  ABufferPhysicalLocation = Data.ABufferPhysicalPosition + uint3(BlockOrThreadIndex.xy << BlockSH, 0);
+	const float3 ABufferPhysicalUV       = float3(ABufferPhysicalLocation.xy * TexelSize.xy + TexelSize.xy * 0.5f, ABufferPhysicalLocation.z);
+	const uint2  VTPhysicalLocation      = (Data.VTPhysicalPosition >> BlockSH) + BlockOrThreadIndex.xy;
+
+#if COMPRESS_MODE == BC_NONE
+	// If uncompressed, just copy it
+	// It does raise the question if we should somehow render it directly
+	RWVTLayerUncompressed[VTPhysicalLocation] = ABuffer[ABufferPhysicalLocation];
+#elif COMPRESS_MODE == BC1 // COMPRESS_MODE == BC_NONE
+	float3 BlockRGB[16];
+	ReadBlockRGB(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockRGB);
+
+	if (bSRGB)
+	{
+		RWVTLayerCompressed[VTPhysicalLocation] = float4(CompressBC1Block_SRGB(BlockRGB), 0, 0);
+	}
+	else
+	{
+		RWVTLayerCompressed[VTPhysicalLocation] = float4(CompressBC1Block(BlockRGB), 0, 0);
+	}
+#elif COMPRESS_MODE == BC3 // COMPRESS_MODE == BC1
+	float3 BlockRGB[16];
+	ReadBlockRGB(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockRGB);
+	float BlockA[16];
+	ReadBlockAlpha(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockA);
+
+	if (bSRGB)
+	{
+		RWVTLayerCompressed[VTPhysicalLocation] = CompressBC3Block_SRGB(BlockRGB, BlockA);
+	}
+	else
+	{
+		RWVTLayerCompressed[VTPhysicalLocation] = CompressBC3Block(BlockRGB, BlockA);
+	}
+#elif COMPRESS_MODE == BC4 // COMPRESS_MODE == BC3
+	float BlockX[16];
+	ReadBlockX(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockX);
+
+	RWVTLayerCompressed[VTPhysicalLocation] = float4(CompressBC4Block(BlockX), 0, 0);
+#elif COMPRESS_MODE == BC5 // COMPRESS_MODE == BC4
+	float BlockX[16];
+	float BlockY[16];
+	ReadBlockXY(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockX, BlockY);
+
+	RWVTLayerCompressed[VTPhysicalLocation] = CompressBC5Block(BlockX, BlockY);
+#elif COMPRESS_MODE == BC6 // COMPRESS_MODE == BC5
+	float3 BlockRGB[16];
+	ReadBlockRGB(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockRGB);
+
+	RWVTLayerCompressed[VTPhysicalLocation] = CompressBC6HBlock(BlockRGB);
+#elif COMPRESS_MODE == BC7 // COMPRESS_MODE == BC6
+	float3 BlockRGB[16];
+	ReadBlockRGB(ABuffer, TextureSampler, ABufferPhysicalUV, TexelSize.xy, BlockRGB);
+
+	RWVTLayerCompressed[VTPhysicalLocation] = CompressBC7Block(BlockRGB);
+#else // COMPRESS_MODE == BC7
+	#error Unexpected compression mode
+#endif // COMPRESS_MODE == BC7
+}

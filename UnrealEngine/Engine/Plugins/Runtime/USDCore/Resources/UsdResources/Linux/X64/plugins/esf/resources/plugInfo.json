@@ -1,0 +1,15 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                }
+            },
+            "LibraryPath": "../../../../../../Source/ThirdParty/USD/Unix/x86_64-unknown-linux-gnu/lib/libusd_esf.so",
+            "Name": "esf",
+            "ResourcePath": "resources",
+            "Root": "..",
+            "Type": "library"
+        }
+    ]
+}

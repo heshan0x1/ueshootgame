@@ -1,0 +1,167 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define SUBSTRATE_MATERIALCONTAINER_IS_VIEWRESOURCE 1
+
+#include "../Common.ush"
+#include "LumenMaterial.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../BRDF.ush"
+#include "../MonteCarlo.ush"
+#include "../BlueNoise.ush"
+#include "../ShadingModelsSampling.ush"
+#include "../SceneTextureParameters.ush"
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingDeferredShadingCommon.ush"
+#include "LumenHairTracing.ush"
+#include "LumenPosition.ush"
+#include "LumenScreenProbeCommon.ush"
+#include "LumenScreenSpaceBentNormal.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 1
+#endif
+
+RaytracingAccelerationStructure TLAS;
+
+#if OUTPUT_BENT_NORMAL
+	RWTexture2DArray<uint> RWShortRangeAO;
+#else
+	RWTexture2DArray<UNORM float> RWShortRangeAO;
+#endif
+
+Texture2D<float> DownsampledSceneDepth;
+Texture2D<UNORM float3> DownsampledWorldNormal;
+
+uint NumRays;
+float NormalBias;
+float MaxScreenTraceFraction;
+uint2 ShortRangeAOViewMin;
+uint2 ShortRangeAOViewSize;
+
+RAY_TRACING_ENTRY_RAYGEN(LumenShortRangeAOHardwareRayTracing)
+{
+	const uint2 DispatchThreadId = DispatchRaysIndex().xy;
+	const uint2 GroupId = DispatchThreadId / 8;
+	const uint2 GroupThreadId = DispatchThreadId % 8;
+
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoordDownsampled(DispatchThreadId, GroupId, GroupThreadId, DOWNSAMPLE_FACTOR, ShortRangeAOViewMin, ShortRangeAOViewSize);
+	const uint3 ShortRangeAOCoord = Coord.DownsampledCoord;
+
+	if (Coord.bIsValid)
+	{
+		const float2 ScreenUV = (Coord.SvPosition + .5f) * View.BufferSizeAndInvSize.zw;
+
+		float SceneDepth = -1.0f;
+		float3 WorldNormal = float3(0, 0, 1);
+
+		#if DOWNSAMPLE_FACTOR == 2
+		{
+			SceneDepth = DownsampledSceneDepth[Coord.DownsampledCoord.xy];
+			WorldNormal = normalize(DecodeNormal(DownsampledWorldNormal[Coord.DownsampledCoord.xy]));
+		}
+		#else
+		{
+			const float DummyMaxRoughnessToTrace = 0.5f;
+			const FLumenMaterialData Material = ReadMaterialData(Coord, DummyMaxRoughnessToTrace);
+			if (IsValid(Material))
+			{
+				SceneDepth = Material.SceneDepth;
+				WorldNormal = Material.WorldNormal;
+			}
+		}
+		#endif
+
+		float3 BentNormal = WorldNormal;
+		float AmbientOcclusion = 1.0f;
+
+		if (SceneDepth >= 0.0f)
+		{
+			float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+			float3x3 TangentBasis = GetTangentBasis(WorldNormal);
+			float TraceDistance = MaxScreenTraceFraction * 2.0 * GetScreenRayLengthMultiplierForProjectionType(SceneDepth).x;
+
+			float3 UnoccludedSum = 0;
+			AmbientOcclusion = 0.0f;
+			BentNormal = 0;
+
+			for (uint PixelRayIndex = 0; PixelRayIndex < NumRays; PixelRayIndex++)
+			{
+				float2 UniformRandom = BlueNoiseVec2(Coord.SvPosition, ScreenProbeGatherStateFrameIndex * NumRays + PixelRayIndex);
+
+				float4 HemisphereSample = CosineSampleHemisphere(UniformRandom);
+				float3 RayDirection = mul(HemisphereSample.xyz, TangentBasis);
+				float DirectionVisible = 1;
+
+				{
+					FRayDesc Ray;
+
+					Ray.Origin = TranslatedWorldPosition;
+					Ray.TMin = 0;
+					Ray.Direction = RayDirection;
+					Ray.TMax = TraceDistance;
+
+					ApplyCameraRelativeDepthBias(Ray, Coord.SvPosition, ConvertToDeviceZ(SceneDepth), WorldNormal, NormalBias);
+
+					uint RayFlags = RAY_FLAG_SKIP_CLOSEST_HIT_SHADER | RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH;
+					const uint InstanceInclusionMask = RAY_TRACING_MASK_OPAQUE;
+
+					FMinimalPayload MinimalPayload = TraceVisibilityRay(
+						TLAS,
+						RayFlags,
+						InstanceInclusionMask,
+						Ray);
+
+					bool bHit = MinimalPayload.IsHit();
+
+	#if USE_HAIRSTRANDS_VOXEL
+					if (!bHit)
+					{
+						bool bHairHit;
+						float HairTransparency;
+						float HairHitT;
+
+						uint2 NoiseCoord = Coord.SvPosition * uint2(NumRays, 1) + uint2(PixelRayIndex, 0);
+
+						TraceHairVoxels(
+							NoiseCoord,
+							SceneDepth,
+							TranslatedWorldPosition,
+							RayDirection,
+							TraceDistance,
+							false,
+							bHairHit,
+							HairTransparency,
+							HairHitT);
+
+						bHit = bHairHit && HairHitT < TraceDistance;
+					}
+	#endif
+
+					DirectionVisible = bHit ? 0.0f : 1.0f;
+				}
+
+				UnoccludedSum += RayDirection;
+				BentNormal += RayDirection * DirectionVisible;
+				AmbientOcclusion += DirectionVisible;
+			}
+
+			float NormalizeFactor = length(UnoccludedSum);
+
+			if (NormalizeFactor > 0)
+			{
+				BentNormal /= NormalizeFactor;
+			}
+
+			AmbientOcclusion /= NumRays;
+
+			// Debug passthrough
+			//BentNormal = Material.WorldNormal;
+		}
+
+	#if OUTPUT_BENT_NORMAL
+		RWShortRangeAO[ShortRangeAOCoord] = PackScreenBentNormal(BentNormal);
+	#else
+		RWShortRangeAO[ShortRangeAOCoord] = AmbientOcclusion;
+	#endif
+	}
+}

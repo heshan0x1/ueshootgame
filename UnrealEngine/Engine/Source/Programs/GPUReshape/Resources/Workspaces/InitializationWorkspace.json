@@ -1,0 +1,11 @@
+{
+	"Config": {
+		"Coverage": true,
+		"Detail": true,
+		"RedirectOutput": true,
+		"SuspendDeferredInitialization": true
+	},
+	"Features": [
+		"Initialization"
+	]
+}

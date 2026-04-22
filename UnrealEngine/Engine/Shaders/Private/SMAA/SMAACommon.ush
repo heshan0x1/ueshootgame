@@ -1,0 +1,26 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ScreenPass.ush"
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+
+Texture2D Input_Texture;
+SamplerState Input_Sampler;
+
+float4 RTMetrics;
+
+#if SMAA_QUALITY == 0
+#define SMAA_PRESET_LOW
+#elif SMAA_QUALITY == 1
+#define SMAA_PRESET_MEDIUM
+#elif SMAA_QUALITY == 2
+#define SMAA_PRESET_HIGH
+#elif SMAA_QUALITY == 3
+#define SMAA_PRESET_ULTRA
+#endif
+
+#define SMAA_HLSL_4
+#define SMAA_RT_METRICS RTMetrics
+#include "SMAA.ush"
+

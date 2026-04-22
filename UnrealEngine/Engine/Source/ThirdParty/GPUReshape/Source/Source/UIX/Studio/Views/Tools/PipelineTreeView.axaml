@@ -1,0 +1,178 @@
+<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<UserControl x:Class="Studio.Views.Tools.PipelineTreeView"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:vm="using:Studio.ViewModels.Tools"
+             xmlns:controls="using:Studio.Views.Controls"
+             xmlns:r="using:Studio.Resources"
+             xmlns:valueConverters="clr-namespace:Studio.ValueConverters"
+             xmlns:objects="clr-namespace:Runtime.ViewModels.Objects;assembly=UIX.Studio.Runtime"
+             mc:Ignorable="d"
+             d:DesignWidth="300" d:DesignHeight="400"
+             x:DataType="vm:PipelineTreeViewModel" x:CompileBindings="True">
+    <UserControl.Resources>
+        <ResourceDictionary>
+            <valueConverters:PipelineStageConverter x:Key="PipelineStageConverter"/>
+        </ResourceDictionary>
+    </UserControl.Resources>
+    
+    <Grid Focusable="True" RowDefinitions="Auto,*">
+        <Grid>
+            <Grid Margin="5,0,5,2">
+                <Button 
+                HorizontalAlignment="Left"
+                Classes="Icon" 
+                ToolTip.Tip="{x:Static r:Resources.PipelineTree_Refresh_Tooltip}" 
+                Command="{Binding Refresh}">
+                <PathIcon Data="{StaticResource Refresh}" Width="13" />
+            </Button>
+            
+            <AutoCompleteBox 
+                x:Name="QueryBox"
+                HorizontalAlignment="Stretch"
+                VerticalAlignment="Top"
+                Height="25"
+                Watermark="{Binding PipelineIdentifiers.Count, FallbackValue=0, StringFormat='Search {0} pipelines'}"
+                Margin="25,0 25,0"
+                BorderThickness="0 0 0 1"
+                Text="{Binding FilterString}" />
+                <Button 
+                    Classes="Icon"
+                    HorizontalAlignment="Right"
+                    Width="25"
+                    Height="25"
+                    Margin="0 0 1 0">
+                    <PathIcon ToolTip.Tip="{x:Static r:Resources.Help_Tooltip}" Data="{StaticResource Question}" Width="13" />
+                    
+                    <Button.Flyout>
+                        <Flyout Placement="BottomEdgeAlignedRight">
+                            <StackPanel Orientation="Vertical" Width="350">
+                                <TextBlock TextWrapping="Wrap">
+Search string, case insensitive. Additional attributes:
+                                </TextBlock>
+                                <Grid Margin="25 0 0 0" ColumnDefinitions="35,*">
+                                    <TextBlock TextWrapping="Wrap" Grid.Column="0">
+type <LineBreak />
+                                    </TextBlock>
+                                    <TextBlock TextWrapping="Wrap" Grid.Column="1">
+- Pipeline type (graphics, compute, stateobject) <LineBreak />
+                                    </TextBlock>
+                                </Grid>
+                            </StackPanel>
+                        </Flyout>
+                    </Button.Flyout>
+                </Button>
+
+                <controls:QueryAttributeSegments x:Name="AttributeSegments" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0 26 0 0"/>
+            </Grid>
+        </Grid>
+
+        <ListBox 
+            Grid.Row="1"
+            x:Name="PipelineList" 
+            ContextMenu="{StaticResource ReactiveContextMenu}" 
+            BorderThickness="0"
+            Tag="{Binding}"
+            ItemsSource="{Binding FilteredIdentifiers}"
+            ScrollViewer.HorizontalScrollBarVisibility="Disabled"
+            SelectionMode="Multiple"
+            LayoutUpdated="OnListboxLayoutUpdated">
+            <ListBox.Styles>
+                <Style Selector="ListBoxItem">
+                    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+                </Style>
+            </ListBox.Styles>
+            <ListBox.ItemTemplate>
+                <DataTemplate DataType="objects:PipelineIdentifierViewModel">
+                    <DockPanel
+                        LastChildFill="True"
+                        HorizontalAlignment="Stretch">
+                        <Border
+                            DockPanel.Dock="Left"
+                            IsVisible="{Binding Stage, Converter={StaticResource PipelineStageConverter}}"
+                            Background="{Binding Stage, Converter={StaticResource PipelineStageConverter}}"
+                            CornerRadius="5"
+                            Padding="5 2 5 2"
+                            Margin="0 0 5 0">
+                            <TextBlock Text="{Binding Stage}"/>
+                        </Border>
+                            
+                        <StackPanel 
+                            DockPanel.Dock="Right"
+                            Orientation="Horizontal"
+                            HorizontalAlignment="Right">
+                            <Ellipse 
+                                Width="3" Height="3" 
+                                Margin="0 0 3 0"
+                                Fill="{StaticResource StatusActive}" 
+                                ToolTip.Tip="{x:Static r:Resources.Status_Active}"
+                                IsVisible="{Binding Active}"/>
+                            
+                            <Ellipse 
+                                Width="3" Height="3" 
+                                Margin="0 0 3 0"
+                                Fill="{StaticResource StatusInstrumented}"
+                                ToolTip.Tip="{x:Static r:Resources.Status_Instrumented}"
+                                IsVisible="{Binding Instrumented}"/>
+                        </StackPanel>
+                        
+                        <TextBlock 
+                            DockPanel.Dock="Left"
+                            Height="20" 
+                            HorizontalAlignment="Stretch"
+                            TextTrimming="CharacterEllipsis"
+                            Margin="0 0 5 0"
+                            Text="{Binding Descriptor}"/>
+                    </DockPanel>
+                </DataTemplate>
+            </ListBox.ItemTemplate>
+        </ListBox>
+        
+        <Grid 
+            Grid.Row="1" 
+            IsVisible="{Binding IsHelpVisible}">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Center" VerticalAlignment="Center">
+                <PathIcon 
+                    Data="{StaticResource InfoHollow}"
+                    VerticalAlignment="Center"
+                    Margin="0 0 0 0"
+                    Width="10" />
+                <TextBlock
+                    Margin="5 0 0 0"
+                    Foreground="{StaticResource InfoMediumForeground}"
+                    VerticalAlignment="Center"
+                    Text=" No pipeline objects"/>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</UserControl>

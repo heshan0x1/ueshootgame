@@ -1,0 +1,116 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../Schema.xsd" >
+
+	<!-- Project Options -->
+	<Option Name="ProjectFile" DefaultValue="_Unknown_" Restrict=".+" Description="The projects to cook"/>
+	<Option Name="ProjectName" DefaultValue="_Unknown_" Restrict=".+" Description="The projects to cook"/>
+	<Option Name="EditorTarget" DefaultValue="$(ProjectName)Editor" Description="Compile name of the editor target"/>
+
+	<!-- Note we can not make the default='', because the default is used for some validation. -->
+	<Error Message="No project file specified" If="'$(ProjectFile)' == '_Unknown_'"/>
+	<Error Message="No project name specified" If="'$(ProjectName)' == '_Unknown_'"/>
+
+	<!-- Platform Options -->
+	<Option Name="TargetPlatform" DefaultValue="Windows" Restrict=".+" Description="The platform to cook"/>
+
+	<!-- Agent Options -->
+	<Option Name="AgentType" DefaultValue="" Description="The platform to cook"/>
+	<Property Name="AgentType" Value="IterativeValidateAgent_$(ProjectName)_$(TargetPlatform)" If="'$(AgentType)' == ''"/>
+
+	<Option Name="WithUBA" Restrict="true|false" DefaultValue="true" Description="Whether to use UBA compile or not"/>
+	<Property Name="UBACompileArgs" Value=""/>
+	<Property Name="UBACompileArgs" Value="-UBA -ActionStallReportTime=300 -UBALinkRemote" If="$(WithUBA)"/>
+	
+	<!-- IncrementalValidate Options -->
+	<Option Name="IncrementalMode" DefaultValue="incremental" Restrict="legacyiterative|incremental" Description="Whether to cook using Incremental or LegacyIterative"/>
+	<Option Name="ValidateMode" DefaultValue="onephase" Restrict="onephase|twophase" Description="Whether to validate results in onephase (which reports indeterminism as a FalsePositiveIncrementalSkip error) or two phase (which detects indeterminism and downgrades it to a display message)"/>
+	<Property Name="IncrementalArgs" Value="-zenstore -cookincremental" If="'$(IncrementalMode)' == 'incremental'"/>
+	<Property Name="IncrementalArgs" Value="-LegacyIterative -ini:Editor:[CookSettings]:CookIncremental=false -ini:Editor:[CookSettings]:LegacyIterativeUseClassFilters=true" If="'$(IncrementalMode)' == 'legacyiterative'"/>
+
+	<!-- Profiling Options -->
+	<Option Name="ProfilingFilesPublishRootPath" DefaultValue="" Description="Where to publish profiling data files."/>
+	<Option Name="WithCookUTRACECapture" DefaultValue="false" Restrict="true|false" Description="Whether to capture UTRACE data during cooks. Only true or false"/>
+	<Option Name="StoreHordeArtifacts" DefaultValue="true" Restrict="true|false" Description="Whether to copy diagnostic output files into Engine\Programs\AutomationTool\Saved\Logs for storage as Horde Artifacts"/>
+
+	<!-- Config Options -->
+	<Option Name="CustomConfig" DefaultValue="" Description="What custom configuration to apply (see -CustomConfig commandline argument)"/>
+
+	<!-- Agent=IncrementalValidate variables -->
+	<!--
+	     Find the Directory name of the .uproject file, since this is the name used in the Cooked output as the parent of the MetaData directory
+	     TODO: Parse this from the leafname of $(ProjectDir) instead of guessing that it is $(ProjectName) or $(ProjectName)Game.
+	     We need a path function API to be able to do that parsing, and BuildGraph doesn't have an API for that yet.
+	 -->
+	<Property Name="ProjectDirLeafName"/>
+	<Property Name="ProjectDirLeafName" Value="$(ProjectName)" If="Exists('$(ProjectDir)\$(ProjectName).uproject')"/>
+	<Property Name="ProjectDirLeafName" Value="$(ProjectName)Game" If="Exists('$(ProjectDir)\$(ProjectName)Game.uproject')"/>
+	<Do If="'$(StoreHordeArtifacts)' == 'true'">
+		<Warning Message="Could not find ProjectDirLeafName for project $(ProjectName). ModifiedCookedPackages.txt file will not be copied to HordeArtifactDir."
+		 If="'$(ProjectDirLeafName)'==''"/>
+		<Warning Message="ProjectDir not specified. ModifiedCookedPackages.txt file will not be copied to HordeArtifactDir."
+		 If="'$(ProjectDir)'==''"/>
+	</Do>
+	<Property Name="EditorPlatform" Value="Win64"/>
+	<Property Name="TraceArgs" Value=""/>
+	<Property Name="TraceArgs" Value="-trace=cpu,loadtime,savetime,cook,contextswitch" If="$(WithCookUTRACECapture) and '$(ProfilingFilesPublishRootPath)' != ''"/>
+	<Property Name="ProfilingFilesLocalRootPath" Value="$(RootDir)/Engine/Intermediate/Profiling"/>
+	<Property Name="CookedMetaDataDir"/>
+	<Property Name="CookedMetaDataDir" Value="$(ProjectDir)/Saved/Cooked/$(TargetPlatform)/$(ProjectDirLeafName)/Metadata" If="'$(ProjectDir)' != '' and '$(ProjectDirLeafName)' != ''"/>
+	<Property Name="HordeArtifactDir" Value="$(RootDir)/Engine/Programs/AutomationTool/Saved/Logs"/>
+
+	<Property Name="CommonCookArgs" Value="-targetplatform=$(TargetPlatform) $(IncrementalArgs)"/>
+	<Property Name="CommonCookArgs" Value="$(CommonCookArgs) -CustomConfig=$(CustomConfig)" If="'$(CustomConfig)' != ''"/>
+
+	<Property Name="CompileNodeName" Value="Compile $(EditorPlatform) $(ProjectName)"/>
+	<Property Name="IncrementalValidateSinglePhaseName" Value="Cook IncrementalValidateSinglePhase $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="IncrementalValidatePhase1Name" Value="Cook IncrementalValidatePhase1 $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="IncrementalValidatePhase2Name" Value="Cook IncrementalValidatePhase2 $(ProjectName) $(TargetPlatform)"/>
+
+	<Agent Name="IncrementalValidateAgent" Type="$(AgentType)">
+		<Node Name="$(CompileNodeName)">
+			<Compile Target="ShaderCompileWorker" Platform="$(EditorPlatform)" Project="$(ProjectFile)" Configuration="Development" Arguments="$(UBACompileArgs)"/>
+			<Compile Target="$(EditorTarget)" Platform="$(EditorPlatform)" Project="$(ProjectFile)" Configuration="Development" Arguments="$(UBACompileArgs)"/>
+		</Node>
+		<Node Name="$(IncrementalValidateSinglePhaseName)" Requires="$(CompileNodeName)">
+			<Property Name="TraceArgsFinal" Value=""/>
+			<Property Name="TraceArgsFinal" Value="$(TraceArgs) -tracefile=&quot;$(ProfilingFilesLocalRootPath)/$(ProjectName)_IncrementalValidate.utrace&quot;" If="$(WithCookUTRACECapture) and '$(ProfilingFilesPublishRootPath)' != ''"/>
+			<Do If="'$(TraceArgsFinal)' != '' and Exists('$(ProfilingFilesLocalRootPath)')">
+				<Delete Files="$(ProfilingFilesLocalRootPath)/..."/>
+			</Do>
+			<Commandlet Name="Cook" Project="$(ProjectFile)" Arguments="$(CommonCookArgs) $(TraceArgsFinal) -IncrementalValidate -IncrementalValidateAllowWrite" ErrorLevel="999"/>
+			<Do If="'$(TraceArgsFinal)' != ''">
+				<Zip FromDir="$(ProfilingFilesLocalRootPath)" Files="*.utrace" ZipFile="$(ProfilingFilesLocalRootPath)/$(ProjectName)_IncrementalValidate.zip"/>
+				<Copy Files="$(ProjectName)_IncrementalValidate.zip" From="$(ProfilingFilesLocalRootPath)" To="$(ProfilingFilesPublishRootPath)\$(EscapedBranch)-CL-$(Change)"/>
+			</Do>
+			<Do If="'$(StoreHordeArtifacts)' == 'true' and '$(CookedMetaDataDir)' != ''">
+				<Copy Files="ModifiedEditorPackages.txt" From="$(CookedMetaDataDir)" To="$(HordeArtifactDir)"/>
+				<Copy Files="ModifiedCookedPackages.txt" From="$(CookedMetaDataDir)" To="$(HordeArtifactDir)"/>
+			</Do>
+		</Node>
+		<Node Name="$(IncrementalValidatePhase1Name)" Requires="$(CompileNodeName)">
+			<Property Name="TraceArgsFinal" Value=""/>
+			<Property Name="TraceArgsFinal" Value="$(TraceArgs) -tracefile=&quot;$(ProfilingFilesLocalRootPath)/$(ProjectName)_IncrementalValidatePhase1.utrace&quot;" If="$(WithCookUTRACECapture) and '$(ProfilingFilesPublishRootPath)' != ''"/>
+			<Do If="'$(TraceArgsFinal)' != '' and Exists('$(ProfilingFilesLocalRootPath)')">
+				<Delete Files="$(ProfilingFilesLocalRootPath)/..."/>
+			</Do>
+			<Commandlet Name="Cook" Project="$(ProjectFile)" Arguments="$(CommonCookArgs) $(TraceArgsFinal) -IncrementalValidatePhase1 -IncrementalValidateAllowWrite" ErrorLevel="999"/>
+		</Node>
+		<Node Name="$(IncrementalValidatePhase2Name)" Requires="$(IncrementalValidatePhase1Name)">
+			<Property Name="TraceArgsFinal" Value=""/>
+			<Property Name="TraceArgsFinal" Value="$(TraceArgs) -tracefile=&quot;$(ProfilingFilesLocalRootPath)/$(ProjectName)_IncrementalValidatePhase2.utrace&quot;" If="$(WithCookUTRACECapture) and '$(ProfilingFilesPublishRootPath)' != ''"/>
+			<Commandlet Name="Cook" Project="$(ProjectFile)" Arguments="$(CommonCookArgs) $(TraceArgsFinal) -IncrementalValidatePhase2 -IncrementalValidateAllowWrite" ErrorLevel="999"/>
+			<Do If="'$(TraceArgsFinal)' != ''">
+				<Zip FromDir="$(ProfilingFilesLocalRootPath)" Files="*.utrace" ZipFile="$(ProfilingFilesLocalRootPath)/$(ProjectName)_IncrementalValidate.zip"/>
+				<Copy Files="$(ProjectName)_IncrementalValidate.zip" From="$(ProfilingFilesLocalRootPath)" To="$(ProfilingFilesPublishRootPath)\$(EscapedBranch)-CL-$(Change)"/>
+			</Do>
+			<Do If="'$(StoreHordeArtifacts)' == 'true' and '$(CookedMetaDataDir)' != ''">
+				<Copy Files="ModifiedEditorPackages.txt" From="$(CookedMetaDataDir)" To="$(HordeArtifactDir)"/>
+				<Copy Files="ModifiedCookedPackages.txt" From="$(CookedMetaDataDir)" To="$(HordeArtifactDir)"/>
+			</Do>
+		</Node>
+	</Agent>
+
+	<Aggregate Name="IncrementalValidate" Requires="$(IncrementalValidateSinglePhaseName)" If="'$(ValidateMode)' == 'onephase'"/>
+	<Aggregate Name="IncrementalValidate" Requires="$(IncrementalValidatePhase2Name)" If="'$(ValidateMode)' == 'twophase'"/>
+
+</BuildGraph>

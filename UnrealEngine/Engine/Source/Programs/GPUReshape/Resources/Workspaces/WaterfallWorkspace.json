@@ -1,0 +1,10 @@
+{
+	"Config": {
+		"Detail": true,
+		"RedirectOutput": true,
+		"SuspendDeferredInitialization": true
+	},
+	"Features": [
+		"Waterfall"
+	]
+}

@@ -1,0 +1,573 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "../ViewData.ush"
+#include "../SplineMeshCommon.ush"
+#include "NaniteSceneCommon.ush"
+#include "NaniteAttributeDecode.ush"
+#include "NaniteSceneCommon.ush"
+#include "NaniteVertexFetch.ush"
+#include "../Matrices.ush"
+
+#define NANITE_VOXEL_FAST_INVERSE	0	// TODO: Assumes orthonormal. Not generally safe
+
+float3x3 VoxelInverse(float3x3 M)
+{
+#if NANITE_VOXEL_FAST_INVERSE
+	return transpose(M);
+#else
+	return Inverse(M);
+#endif
+}
+
+
+// Represents vertex data for a Nanite mesh in local space, post-deformation (when applicable)
+// This includes fixed function deformation from splines and skinning, but no material specific deformation like WPO or displacement.
+struct FNanitePostDeformVertex
+{
+	// Index of the vertex in the cluster
+	uint VertIndex;
+
+	// Post-deformed position of the vertex
+	float3 Position;
+	float3 PrevPosition;
+
+	// Decoded vertex position (BEFORE deformation)
+	float3 PointLocal;
+
+	// Vertex normal (BEFORE deformation)
+	float3 PreSkinnedNormal;
+
+	// Post-deformed tangent basis of the vertex
+	FNaniteTangentBasis TangentBasis;
+
+	// Normalized distance along the spline (spline meshes only)
+	half SplineDist;
+
+	// Vertex color
+	float4 Color;
+
+	// Texture coordinates
+	float2 TexCoords[NANITE_MAX_UVS];
+};
+
+struct FReconstructedVoxelData
+{
+	float3 LocalPosition;
+	float3 PostDeformPosition;
+	float3 PrevPostDeformPosition;
+	uint VertIndex;
+	
+	float4x3 SkinningTransform;
+	bool bActiveSkinning;
+};
+
+FNanitePostDeformVertex DeformLocalNaniteVoxelVertex(FReconstructedVoxelData VoxelData, FNaniteLocalVertex Input)
+{
+	FNanitePostDeformVertex Output;
+	Output.VertIndex						= Input.VertIndex;
+	Output.TangentBasis						= MakeTangentBasis(Input.RawAttributeData);
+	Output.SplineDist						= 0.0f;
+	Output.PointLocal						= VoxelData.LocalPosition;
+	Output.Position							= VoxelData.PostDeformPosition;
+	Output.PrevPosition						= VoxelData.PrevPostDeformPosition;
+	Output.PreSkinnedNormal					= Output.TangentBasis.TangentZ;
+	Output.Color							= Input.RawAttributeData.Color;
+	Output.TexCoords						= Input.RawAttributeData.TexCoords;
+	
+#if USE_SKINNING
+	BRANCH
+	if(VoxelData.bActiveSkinning)
+	{
+		Output.TangentBasis.TangentZ			= mul(Output.TangentBasis.TangentZ,				(float3x3)VoxelData.SkinningTransform);
+		Output.TangentBasis.TangentXAndSign.xyz = mul(Output.TangentBasis.TangentXAndSign.xyz,	(float3x3)VoxelData.SkinningTransform);
+	}
+#endif
+
+	return Output;
+}
+
+FNanitePostDeformVertex DeformLocalNaniteVertex(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FInstanceViewData InstanceViewData, FCluster Cluster, FNaniteLocalVertex Input)
+{
+	FNanitePostDeformVertex Output;
+	Output.VertIndex			= Input.VertIndex;
+	Output.TangentBasis			= MakeTangentBasis(Input.RawAttributeData);
+	Output.SplineDist			= 0.0f;
+	Output.PointLocal			= Input.Position;
+	Output.Position				= Input.Position;
+	Output.PrevPosition			= Input.PrevPosition;
+	Output.PreSkinnedNormal		= Output.TangentBasis.TangentZ;
+	Output.Color				= Input.RawAttributeData.Color;
+	Output.TexCoords			= Input.RawAttributeData.TexCoords;
+
+#if USE_SKINNING
+	bool bActiveSkinning = Cluster.bSkinning && InstanceViewData.bIsDeforming && Input.bEnableSkinning;
+
+	BRANCH
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0 && bActiveSkinning)
+	{
+		FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+		FBoneInfluenceHeader BoneInfluenceHeader = GetBoneInfluenceHeader(Cluster);
+
+		float3 SkinnedPosition = float3(0.0f, 0.0f, 0.0f);
+		float3 PrevSkinnedPosition = float3(0.0f, 0.0f, 0.0f);
+		float3 SkinnedNormal = float3(0.0f, 0.0f, 0.0f);
+		float3 SkinnedTangent = float3(0.0f, 0.0f, 0.0f);
+
+		LOOP
+		for (uint InfluenceIndex = 0; InfluenceIndex < BoneInfluenceHeader.NumVertexBoneInfluences; ++InfluenceIndex)
+		{
+			uint BoneIndex = 0;
+			float BoneWeight = 0.0f;
+			DecodeVertexBoneInfluence(BoneInfluenceHeader, Input.VertIndex, InfluenceIndex, BoneIndex, BoneWeight);
+
+			const uint BoneTransformIndex = SkinningHeader.TransformBufferOffset + InstanceData.SkinningData * SkinningHeader.MaxTransformCount + BoneIndex;
+			const float4x3 BoneTransform = LoadSkinningBoneTransform(BoneTransformIndex);
+			SkinnedPosition	+= mul(float4(Input.Position, 1.0f), BoneTransform) * BoneWeight;
+			SkinnedNormal	+= mul(Output.TangentBasis.TangentZ, (float3x3)BoneTransform) * BoneWeight;
+			SkinnedTangent	+= mul(Output.TangentBasis.TangentXAndSign.xyz, (float3x3)BoneTransform) * BoneWeight;
+
+			// Skin the prev position, too (NOTE: this should DCE unless base pass velocity is enabled)
+			const uint PrevBoneTransformIndex = BoneTransformIndex + SkinningHeader.MaxTransformCount;
+			const float4x3 PrevBoneTransform = LoadSkinningBoneTransform(PrevBoneTransformIndex);
+			PrevSkinnedPosition	+= mul(float4(Input.PrevPosition, 1.0f), PrevBoneTransform) * BoneWeight;
+		}
+
+		Output.TangentBasis.TangentZ = SkinnedNormal;
+		Output.TangentBasis.TangentXAndSign.xyz = SkinnedTangent;
+
+	#if 0
+		Output.TangentBasis.RecalculateTangentX();
+	#endif
+
+		Output.Position = SkinnedPosition;
+		Output.PrevPosition = PrevSkinnedPosition;
+	}
+#endif
+
+#if USE_SPLINEDEFORM
+	BRANCH
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SPLINE_MESH) != 0 &&
+		(InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_PAYLOAD_EXTENSION) != 0)
+	{
+		// Deform the local position and tangent basis along the spline
+		// NOTE: Storing off the spline distance for use later when calculating tangent frame.
+		FSplineMeshShaderParams SplineMeshParams = SplineMeshLoadParamsFromInstancePayload(InstanceData);
+		Output.SplineDist = SplineMeshDeformLocalPosNormalTangent(
+			SplineMeshParams,
+			Output.Position,
+			Output.TangentBasis.TangentZ,
+			Output.TangentBasis.TangentXAndSign.xyz
+		);
+
+		// We don't currently support proper velocity with moving splines. Would require previous frame's spline mesh params here.
+		Output.PrevPosition = Output.Position; 
+	}
+#endif
+
+	return Output;
+}
+
+FNanitePostDeformVertex FetchAndDeformLocalNaniteVertex(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FInstanceViewData InstanceViewData, FCluster Cluster, FVisibleCluster VisibleCluster, uint VertIndex, uint CompileTimeMaxTexCoords)
+{
+	return DeformLocalNaniteVertex(
+		PrimitiveData,
+		InstanceData,
+		InstanceViewData,
+		Cluster,
+		FetchLocalNaniteVertex(PrimitiveData, InstanceData, InstanceViewData, Cluster, VisibleCluster, VertIndex, CompileTimeMaxTexCoords));
+}
+
+template<uint N>
+void FetchAndDeformLocalNaniteVerts(
+	FPrimitiveSceneData PrimitiveData,
+	FInstanceSceneData InstanceData,
+	FInstanceViewData InstanceViewData,
+	FCluster Cluster,
+	FVisibleCluster VisibleCluster,
+	uint3 VertIndexes,
+	uint CompileTimeMaxTexCoords,
+	inout FNanitePostDeformVertex OutVerts[N])
+{
+	FNaniteLocalVertex InVerts[N];
+	FetchLocalNaniteVerts<N>(PrimitiveData, InstanceData, InstanceViewData, Cluster, VisibleCluster, VertIndexes, CompileTimeMaxTexCoords, InVerts);
+
+	UNROLL
+	for(uint i = 0; i < N; ++i)
+	{
+		OutVerts[i] = DeformLocalNaniteVertex(PrimitiveData, InstanceData, InstanceViewData, Cluster, InVerts[i]);
+	}
+}
+
+void SampleVoxelPerBrickSkinningTransforms(FInstanceSceneData InstanceData, FSkinningHeader SkinningHeader, FBrick Brick,
+	inout float4x3 OutSkinningTransform, inout float4x3 OutPrevSkinningTransform)
+{
+	// TODO: Implement support for multiple influences per brick?
+	OutSkinningTransform		= LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + Brick.BoneIndex);
+	OutPrevSkinningTransform	= LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + SkinningHeader.MaxTransformCount + Brick.BoneIndex);
+}
+
+
+float4x3 SampleVoxelPerBrickSkinningTransform(FInstanceSceneData InstanceData, FSkinningHeader SkinningHeader, FBrick Brick)
+{
+	float4x3 SkinningTransform, PrevSkinningTransform;
+	SampleVoxelPerBrickSkinningTransforms(InstanceData, SkinningHeader, Brick, SkinningTransform, PrevSkinningTransform);
+	return SkinningTransform;
+}
+
+void SampleVoxelPerClusterSkinningTransforms(FInstanceSceneData InstanceData, FCluster Cluster, FSkinningHeader SkinningHeader,
+	inout float4x3 OutSkinningTransform, inout float4x3 OutPrevSkinningTransform)
+{
+#if NANITE_MAX_VOXEL_ANIMATION_BONE_INFLUENCES > 1
+	OutSkinningTransform = (float4x3)0;
+	OutPrevSkinningTransform = (float4x3)0;
+	LOOP
+	for (uint InfluenceIndex = 0; InfluenceIndex < Cluster.NumClusterBoneInfluences; ++InfluenceIndex)
+	{
+		FBoneInfluence Influence = DecodeVoxelBoneInfluence(Cluster, InfluenceIndex);
+
+		const uint BoneTransformIndex = SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + Influence.BoneIndex;
+		const float4x3 BoneTransform = LoadSkinningBoneTransform(BoneTransformIndex);
+		OutSkinningTransform += BoneTransform * Influence.Weight;
+
+		const uint PrevBoneTransformIndex = BoneTransformIndex + SkinningHeader.MaxTransformCount;
+		const float4x3 PrevBoneTransform = LoadSkinningBoneTransform(PrevBoneTransformIndex);
+		OutPrevSkinningTransform += PrevBoneTransform * Influence.Weight;
+	}
+#else
+	FBoneInfluence Influence = DecodeVoxelBoneInfluence(Cluster, 0);
+	const uint BoneTransformIndex = SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + Influence.BoneIndex;
+	OutSkinningTransform = LoadSkinningBoneTransform(BoneTransformIndex);
+	
+	const uint PrevBoneTransformIndex = BoneTransformIndex + SkinningHeader.MaxTransformCount;
+	OutPrevSkinningTransform = LoadSkinningBoneTransform(PrevBoneTransformIndex);
+#endif
+}
+
+float4x3 SampleVoxelPerClusterSkinningTransform(FInstanceSceneData InstanceData, FCluster Cluster, FSkinningHeader SkinningHeader)
+{
+	float4x3 SkinningTransform, PrevSkinningTransform;
+	SampleVoxelPerClusterSkinningTransforms(InstanceData, Cluster, SkinningHeader, SkinningTransform, PrevSkinningTransform);
+	return SkinningTransform;
+}
+
+void SkinClusterBounds(FCluster Cluster, FInstanceSceneData InstanceData, FSkinningHeader SkinningHeader, inout float3 BoxCenter, inout float3 BoxExtent)
+{
+	float3 BoundsMin =  1e20f;
+	float3 BoundsMax = -1e20f;
+
+	for (uint i = 0; i < Cluster.NumClusterBoneInfluences; ++i)
+	{
+		const FClusterBoneInfluence BoneInfluence = DecodeClusterBoneInfluence(Cluster, i);
+		
+		const float4x3 BoneTransform = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneInfluence.BoneIndex);
+
+		const float3 Center	= mul(float4(BoxCenter, 1.0f), BoneTransform);
+		const float3 Delta	= mul(BoxExtent, abs((float3x3)BoneTransform));
+
+		BoundsMin = min(BoundsMin, Center - Delta);
+		BoundsMax = max(BoundsMax, Center + Delta);
+	}
+
+	BoxCenter = (BoundsMax + BoundsMin) * 0.5f;
+	BoxExtent = (BoundsMax - BoundsMin) * 0.5f;
+}
+
+float4x4 Orthogonalize(float4x4 Input)
+{
+	float4 X = Input[0];
+	float4 Y = Input[1];
+	float4 Z = Input[2];
+
+	// Modified Gram-Schmidt orthogonalization
+	Y.xyz -= dot(Y.xyz, X.xyz) / dot(X.xyz, X.xyz) * X.xyz;
+	Z.xyz -= dot(Z.xyz, X.xyz) / dot(X.xyz, X.xyz) * X.xyz;
+	Z.xyz -= dot(Z.xyz, Y.xyz) / dot(Y.xyz, Y.xyz) * Y.xyz;
+
+	return float4x4(X, Y, Z, Input[3]);
+}
+
+float4x4 SkinNaniteHierarchyAssemblyTransform(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, uint AssemblyTransformIndex, float4x4 AssemblyTransform, bool bPrevTransform)
+{
+#if NANITE_ASSEMBLY_DATA
+	const uint AssemblyTransformOffset = PrimitiveData.NaniteAssemblyTransformOffset;
+	const uint NumTransforms = PrimitiveData.NaniteAssemblyTransformCount;
+	const FNaniteAssemblyBoneInfluenceHeader Header = DecodeHierarchyAssemblyTransformBoneInfluenceHeader(AssemblyTransformOffset, NumTransforms, AssemblyTransformIndex);
+	if (Header.NumInfluences > 0)
+	{
+		const FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+		const uint SkinningBufferOffset = SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData + (bPrevTransform ? 1u : 0u)) * SkinningHeader.MaxTransformCount;
+			
+		float4x3 SkinningTransform;
+		if (Header.NumInfluences == 1)
+		{
+			// Fast path: single bone influence
+			SkinningTransform = LoadSkinningBoneTransform(SkinningBufferOffset + Header.SingleBoneIndex);
+		}
+		else
+		{
+			// Multiple influences
+			SkinningTransform = (float4x3)0;
+			for (uint InfluenceIndex = 0; InfluenceIndex < Header.NumInfluences; ++InfluenceIndex)
+			{
+				const FBoneInfluence Influence = DecodeHierarchyAssemblyTransformBoneInfluence(Header.InfluenceBufferOffset, InfluenceIndex);
+				SkinningTransform += LoadSkinningBoneTransform(SkinningBufferOffset + Influence.BoneIndex) * Influence.Weight;
+			}
+		}
+
+		// multiply and remove shear
+		AssemblyTransform = Orthogonalize(mul(AssemblyTransform, float4x4(
+			float4(SkinningTransform[0], 0.f),
+			float4(SkinningTransform[1], 0.f),
+			float4(SkinningTransform[2], 0.f),
+			float4(SkinningTransform[3], 1.f)
+		)));
+	}
+#endif
+	return AssemblyTransform;
+}
+
+ENCODED_VELOCITY_TYPE CalculateNaniteVelocity(FNaniteView NaniteView, FInstanceSceneData InstanceData, FCluster Cluster, FVisibleCluster VisibleCluster, float4 SvPosition, uint TriIndex, uint PrimitiveFlags, bool bWPOEnabled)
+{
+#if VELOCITY_EXPORT
+	const bool bOutputVelocity = !bWPOEnabled && (PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_OUTPUT_VELOCITY) != 0;
+	if (!bOutputVelocity)
+	{
+		return (ENCODED_VELOCITY_TYPE)0;
+	}
+
+	FInstanceDynamicData InstanceDynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData);	
+
+	// TODO: Skipping this means the AA smears the foliage such that it looks like there's movement, is this a good idea or a bug?
+	const bool bActiveSkinning = Cluster.bSkinning && GetInstanceViewData(InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId).bIsDeforming;
+
+	const FDFVector3 WorldPos = SvPositionToWorld(SvPosition);
+	const float3 PostDeformPos = DFMultiplyDemote(WorldPos, InstanceData.WorldToLocal);
+	float3 PrevPostDeformPos = PostDeformPos;
+
+#if USE_SKINNING
+	BRANCH
+	if ((PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0 && bActiveSkinning)
+	{
+		const bool bIsAssemblyPart = IsAssemblyPartCluster(VisibleCluster);
+
+		BRANCH
+		if (bIsAssemblyPart)
+		{
+			const float4x4 InvAssemblyTransform = InverseNaniteAssemblyTransform(LoadNaniteAssemblyTransform(VisibleCluster.AssemblyTransformIndex));
+			const float4x4 PrevAssemblyTransform = LoadNaniteAssemblyTransform(VisibleCluster.AssemblyTransformIndex + 1);
+
+			const float3 LocalPos = mul(float4(PostDeformPos, 1.0f), InvAssemblyTransform).xyz;
+			PrevPostDeformPos = mul(float4(LocalPos, 1.0f), PrevAssemblyTransform).xyz;
+		}
+		else
+		{
+			const FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+			const FBoneInfluenceHeader BoneInfluenceHeader = GetBoneInfluenceHeader(Cluster);
+
+			BRANCH
+			if (Cluster.bVoxel)
+			{
+				const FBrick Brick = DecodeBrick(Cluster, TriIndex);
+				
+				float4x3 LocalToSkinned, PrevLocalToSkinned;
+				SampleVoxelPerBrickSkinningTransforms(InstanceData, SkinningHeader, Brick, LocalToSkinned, PrevLocalToSkinned);
+			
+				const float3x3 SkinnedToLocal3x3 = VoxelInverse(float3x3(LocalToSkinned[0], LocalToSkinned[1], LocalToSkinned[2]));
+
+				const float3 LocalPos = mul(PostDeformPos - LocalToSkinned[3], SkinnedToLocal3x3);
+				PrevPostDeformPos = mul(float4(LocalPos, 1.0f), PrevLocalToSkinned).xyz;
+			}
+			else
+			{
+				const uint3 TriIndices = DecodeTriangleIndices(Cluster, TriIndex);
+
+				float3 PointLocal[3];
+				PointLocal[0] = DecodePosition(TriIndices[0], Cluster);
+				PointLocal[1] = DecodePosition(TriIndices[1], Cluster);
+				PointLocal[2] = DecodePosition(TriIndices[2], Cluster);
+
+				float3 CurrentPosition[3];
+				CurrentPosition[0] = float3(0.0f, 0.0f, 0.0f);
+				CurrentPosition[1] = float3(0.0f, 0.0f, 0.0f);
+				CurrentPosition[2] = float3(0.0f, 0.0f, 0.0f);
+					
+				LOOP
+				for (uint InfluenceIndex = 0; InfluenceIndex < BoneInfluenceHeader.NumVertexBoneInfluences; ++InfluenceIndex)
+				{
+					uint BoneIndex0 = 0;
+					float BoneWeight0 = 0.0f;
+					DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.x, InfluenceIndex, BoneIndex0, BoneWeight0);
+
+					uint BoneIndex1 = 0;
+					float BoneWeight1 = 0.0f;
+					DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.y, InfluenceIndex, BoneIndex1, BoneWeight1);
+
+					uint BoneIndex2 = 0;
+					float BoneWeight2 = 0.0f;
+					DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.z, InfluenceIndex, BoneIndex2, BoneWeight2);
+
+					float4x3 CurrentBoneTransform[3];
+					CurrentBoneTransform[0] = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneIndex0);
+					CurrentBoneTransform[1] = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneIndex1);
+					CurrentBoneTransform[2] = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneIndex2);
+
+					CurrentPosition[0] += mul(float4(PointLocal[0], 1.0f), CurrentBoneTransform[0]) * BoneWeight0;
+					CurrentPosition[1] += mul(float4(PointLocal[1], 1.0f), CurrentBoneTransform[1]) * BoneWeight1;
+					CurrentPosition[2] += mul(float4(PointLocal[2], 1.0f), CurrentBoneTransform[2]) * BoneWeight2;
+				}
+				
+				float3 PointWorld0 = mul(float4(CurrentPosition[0], 1), InstanceDynamicData.LocalToTranslatedWorld).xyz;
+				float3 PointWorld1 = mul(float4(CurrentPosition[1], 1), InstanceDynamicData.LocalToTranslatedWorld).xyz;
+				float3 PointWorld2 = mul(float4(CurrentPosition[2], 1), InstanceDynamicData.LocalToTranslatedWorld).xyz;
+				if ((PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_IS_FIRST_PERSON) != 0)
+				{
+					PointWorld0 = mul(PointWorld0, NaniteView.FirstPersonTransform);
+					PointWorld1 = mul(PointWorld1, NaniteView.FirstPersonTransform);
+					PointWorld2 = mul(PointWorld2, NaniteView.FirstPersonTransform);
+				}
+
+				const float4 PointClip0 = mul(float4(PointWorld0, 1), NaniteView.TranslatedWorldToClip);
+				const float4 PointClip1 = mul(float4(PointWorld1, 1), NaniteView.TranslatedWorldToClip);
+				const float4 PointClip2 = mul(float4(PointWorld2, 1), NaniteView.TranslatedWorldToClip);
+
+				// Calculate perspective correct barycentric coordinates with screen derivatives
+				const float2 PixelClip = (SvPosition.xy - NaniteView.ViewRect.xy) * NaniteView.ViewSizeAndInvSize.zw * float2(2, -2) + float2(-1, 1);
+				const FBarycentrics Barycentrics = CalculateTriangleBarycentrics(PixelClip, PointClip0, PointClip1, PointClip2, NaniteView.ViewSizeAndInvSize.zw);
+
+				PrevPostDeformPos = 0.0f;
+					
+				// Intentionally split prev transforms into separate loop to increase occupancy.
+				// This does mean we have to fetch the bone influences again, but it seems to be well worth it in practice.
+				
+				// TODO: Reevaluate on more triangle-heavy content.
+				LOOP
+				for (uint InfluenceIndex = 0; InfluenceIndex < BoneInfluenceHeader.NumVertexBoneInfluences; ++InfluenceIndex)
+				{
+					uint BoneIndex0 = 0;
+					float BoneWeight0 = 0.0f;
+					DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.x, InfluenceIndex, BoneIndex0, BoneWeight0);
+
+					uint BoneIndex1 = 0;
+					float BoneWeight1 = 0.0f;
+					DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.y, InfluenceIndex, BoneIndex1, BoneWeight1);
+
+					uint BoneIndex2 = 0;
+					float BoneWeight2 = 0.0f;
+					DecodeVertexBoneInfluence(BoneInfluenceHeader, TriIndices.z, InfluenceIndex, BoneIndex2, BoneWeight2);
+
+					float4x3 PreviousBoneTransform[3];
+					PreviousBoneTransform[0] = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + SkinningHeader.MaxTransformCount + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneIndex0);
+					PreviousBoneTransform[1] = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + SkinningHeader.MaxTransformCount + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneIndex1);
+					PreviousBoneTransform[2] = LoadSkinningBoneTransform(SkinningHeader.TransformBufferOffset + SkinningHeader.MaxTransformCount + (InstanceData.SkinningData * SkinningHeader.MaxTransformCount) + BoneIndex2);
+
+					PrevPostDeformPos += mul(float4(PointLocal[0], 1.0f), PreviousBoneTransform[0]) * (BoneWeight0 * Barycentrics.Value.x);
+					PrevPostDeformPos += mul(float4(PointLocal[1], 1.0f), PreviousBoneTransform[1]) * (BoneWeight1 * Barycentrics.Value.y);
+					PrevPostDeformPos += mul(float4(PointLocal[2], 1.0f), PreviousBoneTransform[2]) * (BoneWeight2 * Barycentrics.Value.z);
+				}
+			}
+		}
+	}
+#endif
+	
+	float3 WorldPosPrev = mul(float4(PrevPostDeformPos, 1), InstanceDynamicData.PrevLocalToTranslatedWorld).xyz;
+	if ((PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_IS_FIRST_PERSON) != 0)
+	{
+		WorldPosPrev = mul(WorldPosPrev, NaniteView.PrevFirstPersonTransform);
+	}
+	const float4 ScreenPosPrev = mul(float4(WorldPosPrev, 1), NaniteView.PrevTranslatedWorldToClip);
+	
+	const float4 ScreenPos = SvPositionToScreenPosition(SvPosition);
+	const float3 Velocity = Calculate3DVelocity(ScreenPos, ScreenPosPrev);
+	return EncodeVelocityToTexture(Velocity, (PrimitiveFlags & PRIMITIVE_SCENE_DATA_FLAG_HAS_PIXEL_ANIMATION) != 0);
+#else
+	return (ENCODED_VELOCITY_TYPE)0;
+#endif
+}
+
+// TODO: Find a better place for this?
+FReconstructedVoxelData ReconstructVoxel(FNaniteView NaniteView, FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FInstanceViewData InstanceViewData, FVisibleCluster VisibleCluster, FCluster Cluster, float4 SvPosition, uint BrickIndex)
+{
+	// TODO Share with USES_DISPLACEMENT
+	float4x4 TranslatedWorldToLocal = DFFastToTranslatedWorld( InstanceData.WorldToLocal, NaniteView.PreViewTranslation );
+
+	float4 PixelTranslatedWorld = mul( float4( SvPosition.xyz, 1.0f ), NaniteView.SVPositionToTranslatedWorld );
+	float4 PixelLocal			= mul( PixelTranslatedWorld, TranslatedWorldToLocal );
+	float3 LocalPos				= PixelLocal.xyz / PixelLocal.w;
+	FBrick Brick				= DecodeBrick(Cluster, BrickIndex);
+	const bool bActiveSkinning = Cluster.bSkinning && InstanceViewData.bIsDeforming && ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH)) != 0;
+	const bool bIsAssemblyPart = IsAssemblyPartCluster(VisibleCluster);
+
+	FReconstructedVoxelData VoxelData;
+	VoxelData.PostDeformPosition		= LocalPos;
+	VoxelData.PrevPostDeformPosition	= LocalPos;
+
+#if USE_SKINNING
+	VoxelData.bActiveSkinning			= bActiveSkinning && !bIsAssemblyPart; // TODO: Nanite-Assemblies: Assembly part skinning
+
+	float4x3 PrevSkinningTransform;
+	BRANCH
+	if (VoxelData.bActiveSkinning)
+	{
+		const FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+		SampleVoxelPerBrickSkinningTransforms(InstanceData, SkinningHeader, Brick, VoxelData.SkinningTransform, PrevSkinningTransform);
+
+		const float3x3 InvSkinningTransform3x3 = VoxelInverse(float3x3(VoxelData.SkinningTransform[0], VoxelData.SkinningTransform[1], VoxelData.SkinningTransform[2]));
+		LocalPos = mul(LocalPos - VoxelData.SkinningTransform[3], InvSkinningTransform3x3);
+
+		VoxelData.PrevPostDeformPosition = mul(float4(LocalPos, 1), PrevSkinningTransform);
+	}
+
+	BRANCH
+	if (bIsAssemblyPart && bActiveSkinning)
+	{
+		const float4x4 AssemblyTransform = LoadNaniteAssemblyTransform(VisibleCluster.AssemblyTransformIndex);
+		const float4x4 PrevAssemblyTransform = LoadNaniteAssemblyTransform(VisibleCluster.AssemblyTransformIndex + 1);
+		const float3 PartLocalPos = mul(LocalPos - AssemblyTransform[3].xyz, (float3x3)InverseNaniteAssemblyTransform(AssemblyTransform));
+
+		// TODO: Nanite-Assemblies: Assembly part skinning
+		//PrevAssemblyTransform = mul(PrevSkinningTransform, PrevAssemblyTransform);
+
+		VoxelData.PrevPostDeformPosition = mul(float4(PartLocalPos, 1), PrevAssemblyTransform).xyz;
+	}
+#else
+	VoxelData.bActiveSkinning 		= false;
+#endif
+	
+	const float3 LocalVoxelPos = LocalPos.xyz / ( Cluster.LODError );
+	const int3 FlooredVoxelPos = floor( LocalVoxelPos );
+
+	const uint3 Voxel		= uint3( FlooredVoxelPos - Brick.StartPos );
+
+	const uint VoxelIndex	= Voxel.x + Voxel.y * 4 + Voxel.z * 16;
+	const uint Mask			= (1u << ( VoxelIndex & 31 )) - 1u;
+
+	const uint2 BrickBits = reversebits( Brick.ReverseBrickBits.yx );	//TODO: Fix up logic to work on reversed bits directly
+
+	uint VertIndex = Brick.VertOffset;
+	VertIndex += countbits( BrickBits.x & ( VoxelIndex < 32 ? Mask : ~0u ) );
+	VertIndex += countbits( BrickBits.y & ( VoxelIndex < 32 ? 0 : Mask ) );
+				
+	VoxelData.VertIndex = VertIndex;
+
+#if 1
+	// Just return ray intersection (faster)
+	VoxelData.LocalPosition = LocalPos;
+#else
+	// Return center of voxel (stable, but slower)
+	VoxelData.LocalPosition = (FlooredVoxelPos + 0.5f) * Cluster.LODError;
+	if (VoxelData.bActiveSkinning)
+	{
+		VoxelData.PostDeformPosition =  mul(float4(VoxelData.LocalPosition, 1.0f), VoxelData.SkinningTransform);
+		VoxelData.PrevPostDeformPosition = mul(float4(VoxelData.LocalPosition, 1.0f), PrevSkinningTransform);
+	}
+	else
+	{
+		VoxelData.PostDeformPosition = VoxelData.PrevPostDeformPosition = VoxelData.LocalPosition;
+	}
+#endif
+
+	return VoxelData;
+}

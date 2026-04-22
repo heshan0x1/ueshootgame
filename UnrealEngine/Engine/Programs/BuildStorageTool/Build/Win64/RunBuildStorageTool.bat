@@ -1,0 +1,1 @@
+START "" "%~dp0Windows\Engine\Binaries\Win64\BuildStorageTool.exe" %*

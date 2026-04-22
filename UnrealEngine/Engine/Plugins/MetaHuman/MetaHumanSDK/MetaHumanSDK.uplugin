@@ -1,0 +1,82 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "MetaHuman SDK",
+	"Description": "Utilities and tools for working with MetaHumans in Unreal Engine.",
+	"Category": "MetaHuman",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"MarketplaceURL": "",
+	"SupportURL": "",
+	"CanContainContent": true,
+	"IsExperimentalVersion": false,
+	"EnabledByDefault": true,
+	"Modules": [
+		{
+			"Name": "MetaHumanSDKEditor",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "MetaHumanSDKRuntime",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		},
+		{
+			"Name": "InterchangeDNA",
+			"Type": "Editor",
+			"LoadingPhase": "Default"
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "EditorScriptingUtilities",
+			"Enabled": true
+		},
+		{
+			"Name": "ControlRig",
+			"Enabled": true
+		},
+		{
+			"Name": "HairStrands",
+			"Enabled": true
+		},
+		{
+			"Name": "RigLogic",
+			"Enabled": true
+		},
+		{
+			"Name": "Interchange",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		},
+		{
+			"Name": "EOSShared",
+			"Enabled": true,
+			"TargetAllowList": [
+				"Editor"
+			]
+		}
+	],
+	"LocalizationTargets": [
+		{
+			"Name": "MetaHumanSDK",
+			"LoadingPolicy": "Editor",
+			"ConfigGenerationPolicy": "Auto"
+		},
+		{
+			"Name": "MetaHumanSDK_Properties",
+			"LoadingPolicy": "PropertyNames",
+			"ConfigGenerationPolicy": "Auto"
+		},
+		{
+			"Name": "MetaHumanSDK_Tooltips",
+			"LoadingPolicy": "ToolTips",
+			"ConfigGenerationPolicy": "Auto"
+		}
+	]
+}

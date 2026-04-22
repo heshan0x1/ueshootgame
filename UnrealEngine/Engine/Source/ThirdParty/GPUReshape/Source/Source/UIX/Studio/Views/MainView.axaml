@@ -1,0 +1,147 @@
+<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<UserControl x:Class="Studio.Views.MainView"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:id="clr-namespace:Dock.Avalonia;assembly=Dock.Avalonia"
+             xmlns:dm="using:Dock.Model.Core"
+             xmlns:dmc="using:Dock.Model.Controls"
+             xmlns:vm="using:Studio.ViewModels"
+             xmlns:r="using:Studio.Resources"
+             xmlns:collections="clr-namespace:System.Collections;assembly=System.Runtime"
+             xmlns:status="clr-namespace:Studio.ViewModels.Status;assembly=UIX.Studio.Runtime"
+             xmlns:controls="clr-namespace:Studio.Views.Controls"
+             xmlns:m="clr-namespace:Studio.ViewModels.Menu;assembly=UIX.Studio.Runtime"
+             mc:Ignorable="d"
+             d:DesignWidth="1400" d:DesignHeight="845"
+             x:DataType="vm:MainWindowViewModel" x:CompileBindings="True">
+    <Design.DataContext>
+        <vm:MainWindowViewModel />
+    </Design.DataContext>
+    
+    <Grid RowDefinitions="30,*,25" ColumnDefinitions="*" Name="MainGrid">
+        <!-- Toolbox left hand side -->
+        <StackPanel Orientation="Horizontal" Grid.Row="0" Grid.Column="0">
+            <Image Source="/Resources/Icons/Icon_NoFrame16.png" Width="16" Margin="8,0,0,0" HorizontalAlignment="Left" />
+
+            <Menu 
+                Grid.Row="0" 
+                Grid.Column="0" 
+                VerticalAlignment="Center" 
+                Height="30" 
+                Margin="8,0,0,0"
+                ItemsSource="{Binding Menu}">
+                <Menu.Styles>
+                    <Style Selector="MenuItem">
+                        <Setter Property="Header" Value="{Binding (m:IMenuItemViewModel).Header}"/>
+                        <Setter Property="ItemsSource" Value="{Binding (m:IMenuItemViewModel).Items}"/>
+                        <Setter Property="Command" Value="{Binding (m:IMenuItemViewModel).Command}"/>
+                        <Setter Property="IsEnabled" Value="{Binding Path=(m:IMenuItemViewModel).IsEnabled}"/>
+                        <Setter Property="Icon">
+                            <Template>
+                                <PathIcon 
+                                    Width="12"
+                                    Data="{Binding Path=(m:IMenuItemViewModel).Icon}"/>
+                            </Template>
+                        </Setter>
+                    </Style>
+                </Menu.Styles>
+            </Menu>
+            
+            <TextBlock 
+                Margin="25 0 0 0"
+                VerticalAlignment="Center"
+                Foreground="{StaticResource InfoMediumForeground}"
+                Text="{Binding WorkspaceLabel}"/>
+        </StackPanel>
+
+        <!-- Toolbox right hand side -->
+        <Border 
+            Margin="0 2 140 2" 
+            Grid.Row="0" Grid.Column="0"
+            BorderBrush="{StaticResource DockThemeBorderLowBrush}" 
+            BorderThickness="1"
+            CornerRadius="5"
+            HorizontalAlignment="Right"
+            Padding="3 0 3 0">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
+                <controls:BusModeButton Margin="0 0 5 0"/>
+                <controls:DiscoveryDropdown/>
+            </StackPanel>
+        </Border>
+        
+        <DockControl 
+            x:Name="DockControl" 
+            Layout="{Binding Layout}" 
+            Margin="0"
+            Grid.Row="1" 
+            Grid.Column="0" 
+            Grid.ColumnSpan="2"/>
+
+        <Panel
+            Grid.Row="2"
+            Grid.Column="0"
+            Grid.ColumnSpan="2">
+            <ItemsControl
+                VerticalAlignment="Stretch"
+                HorizontalAlignment="Left"
+                ItemsSource="{Binding StatusLeft}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="status:IStatusViewModel">
+                        <controls:UniformViewHost VerticalAlignment="Stretch" DataContext="{Binding}" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+            </ItemsControl>
+
+            <ItemsControl
+                VerticalAlignment="Stretch"
+                HorizontalAlignment="Right"
+                ItemsSource="{Binding StatusRight}">
+                <ItemsControl.ItemTemplate>
+                    <DataTemplate x:DataType="status:IStatusViewModel">
+                        <controls:UniformViewHost VerticalAlignment="Stretch" DataContext="{Binding}" />
+                    </DataTemplate>
+                </ItemsControl.ItemTemplate>
+                <ItemsControl.ItemsPanel>
+                    <ItemsPanelTemplate>
+                        <StackPanel Orientation="Horizontal" />
+                    </ItemsPanelTemplate>
+                </ItemsControl.ItemsPanel>
+            </ItemsControl>
+        </Panel>
+    </Grid>
+</UserControl>

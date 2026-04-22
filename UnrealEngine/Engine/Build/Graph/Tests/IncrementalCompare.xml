@@ -1,0 +1,196 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../Schema.xsd" >
+
+	<EnvVar Name="UE_HORDE_JOBID"/>
+	<EnvVar Name="UE_HORDE_STEPID"/>
+	<EnvVar Name="UE_HORDE_TEMPLATEID"/>
+	
+	<EnvVar Name="UE-CloudPublishHost"/>
+	<EnvVar Name="UE-CloudPublishHttpVersion"/>
+	<EnvVar Name="UE-CloudPublishNamespace"/>
+	<EnvVar Name="UE-CloudPublishBaselineBranch"/>
+
+	<!-- Project Options -->
+	<Option Name="ProjectName" DefaultValue="_Unknown_" Restrict=".+" Description="The projects to cook"/>
+	<Option Name="RelativeProjectDir" DefaultValue="_Unknown_" Restrict=".+" Description="The relative path for the project directory"/>
+	<Option Name="RelativeProjectFile" DefaultValue="_Unknown_" Restrict=".+" Description="The relative path for the project file"/>
+	<Option Name="EditorTarget" DefaultValue="$(ProjectName)Editor" Description="Compile name of the editor target"/>
+
+	<!-- Note we can not make the default='', because the default is used for some validation. -->
+	<Error Message="No project name specified" If="'$(ProjectName)' == '_Unknown_'"/>
+	<Error Message="No relative project dir specified" If="'$(RelativeProjectDir)' == '_Unknown_'"/>
+	<Error Message="No relative project file specified" If="'$(RelativeProjectFile)' == '_Unknown_'"/>
+
+	<!-- Platform Options -->
+	<Option Name="TargetPlatform" DefaultValue="Windows" Restrict=".+" Description="The platform to cook"/>
+
+	<!-- Agent Options -->
+	<Option Name="AgentType" DefaultValue="" Description="The platform to cook"/>
+	<Property Name="AgentType" Value="IncrementalCompareAgent_$(ProjectName)_$(TargetPlatform)" If="'$(AgentType)' == ''"/>
+
+	<Option Name="WithUBA" Restrict="true|false" DefaultValue="true" Description="Whether to use UBA compile or not"/>
+	<Property Name="UBACompileArgs" Value=""/>
+	<Property Name="UBACompileArgs" Value="-UBA -ActionStallReportTime=300 -UBALinkRemote" If="$(WithUBA)"/>
+	
+	<!-- Agent=IncrementalCompareAgent variables -->
+	<Option Name="ExtraCookArgs" DefaultValue="" Description="Extra arguments to pass to all cook steps."/>
+	<Option Name="CookProcessCount" DefaultValue="" Description="Number of processes to use during cooking, default is ini-driven."/>
+	<Option Name="MPCookCoreSubscription" DefaultValue="" Description="Over or Under subscription factor for CPU cores to use during cooking, default is ini-driven."/>
+	<Option Name="WithNullCook" Restrict="true|false" DefaultValue="false" Description="Whether to do a null cook or not"/>
+	<Option Name="NullCookCustomConfig" DefaultValue="" Description="What custom configuration to apply if doing a null cook (see -CustomConfig commandline argument)"/>
+	<Option Name="PublishCloudSnapshot" DefaultValue="false" Restrict="true|false" Description="Publish build to cloud host" />
+
+	<Property Name="FullPathProjectDir" Value="$(RootDir)/$(RelativeProjectDir)"/>
+	<Property Name="EditorPlatform" Value="Win64"/>
+	<Property Name="CommonCookArgs" Value="-targetplatform=$(TargetPlatform) -cookcultures=en -unversioned -zenstore -cookincremental"/>
+	<Property Name="CommonCookArgs" Value="$(CommonCookArgs) -CookProcessCount=$(CookProcessCount)" If="'$(CookProcessCount)' != ''"/>
+	<Property Name="CommonCookArgs" Value="$(CommonCookArgs) -MPCookCoreSubscription=$(MPCookCoreSubscription)" If="'$(MPCookCoreSubscription)' != ''"/>
+	<Property Name="CommonCookArgs" Value="$(CommonCookArgs) -CustomConfig=$(NullCookCustomConfig)" If="'$(WithNullCook) and $(NullCookCustomConfig)' != ''"/>
+	<Property Name="CommonCookArgs" Value="$(CommonCookArgs) $(ExtraCookArgs)" If="'$(ExtraCookArgs)' != ''"/>
+	<Property Name="PlatformCookedDir" Value="$(FullPathProjectDir)/Saved/Cooked/$(TargetPlatform)"/>
+	<Property Name="CompareDirIncremental" Value="$(FullPathProjectDir)/Intermediate/IncrementalCompare/Iter/$(TargetPlatform)"/>
+	<Property Name="CompareDirRecook" Value="$(FullPathProjectDir)/Intermediate/IncrementalCompare/Recook/$(TargetPlatform)"/>
+	<Property Name="NewLine" Value="&#10;"/>
+
+	<Property Name="CompileNodeName" Value="Compile $(EditorPlatform) $(ProjectName)"/>
+	<Property Name="NaturalIncrementalCookNodeName" Value="Natural Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="StoreIncrementalCookNodeName" Value="Store Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="PrimingNullIncrementalCookNodeName" Value="Priming Null Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="PublishingPrimingNullIncrementalCookNodeName" Value="Publishing Priming Null Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="NullIncrementalCookNodeName" Value="Null Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="PublishingNullIncrementalCookNodeName" Value="Publishing Null Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="CleanNullIncrementalCookNodeName" Value="Clean Null Incremental Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="FullCookNodeName" Value="Full Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="StoreFullCookNodeName" Value="Store Full Cook $(ProjectName) $(TargetPlatform)"/>
+	<Property Name="DiffCooksNodeName" Value="Diff Cooks $(ProjectName) $(TargetPlatform)"/>
+
+	<Macro Name="Snapshot Publish" OptionalArguments="NameSuffix">
+		<Property Name="ShouldSnapshotPublishCloud" Value="false"/>
+		<Property Name="ShouldSnapshotPublishCloud" Value="true" If="$(PublishCloudSnapshot) and '$(UE-CloudPublishHost)' != ''"/>
+
+		<Do If="$(ShouldSnapshotPublishCloud)">
+			<Property Name="IsPreflight" Value="false"/>
+			<Property Name="PreflightChange" Value=""/>
+			<Property Name="SnapshotBranch" Value="$(EscapedBranch)"/>
+			<StringOp Input="$(EscapedBranch)" Method="Replace" Arguments=".;-" Output="SnapshotBranch"/>
+			<Property Name="StepId" Value="$(UE_HORDE_STEPID)"/>
+			<Property Name="BuildVersion" Value="$(EscapedBranch)-CL-$(Change)"/>
+			<Property Name="BuildVersion" Value="$(BuildVersion)-$(NameSuffix)" If="'$(NameSuffix)' !=''" />
+			<Property Name="SnapshotIdentifier" Value="$(UE_HORDE_TEMPLATEID).$(BuildVersion).$(UE_HORDE_JOBID:-6).$(StepId)"/>
+			<Property Name="SnapshotBuildBaselineBranch" Value="$(Branch)"/>
+			<Property Name="SnapshotBuildBaselineBranch" Value="$(UE-CloudPublishBaselineBranch)" If="'$(UE-CloudPublishBaselineBranch)' != ''"/>
+			<Property Name="IsHordeEnv" Value="false"/>
+			<Property Name="IsHordeEnv" Value="true" If="'$(UE_HORDE_JOBID)' != ''"/>
+			<Property Name="TargetType" Value="Server"/>
+			<Property Name="ClientPrefix" Value=""/>
+			<StringOp Input="$(TargetPlatform)" Method="SplitFirst" Arguments="Client" Output="ClientPrefix"/>
+			<Property Name="TargetType" Value="Client" If="'$(ClientPrefix)' != ''"/>
+
+			<Property Name="SnapshotBuildMetaData" Value="name=$(SnapshotIdentifier).$(TargetPlatform);depot=$(Depot);branch=$(Branch);baselineBranch=$(SnapshotBuildBaselineBranch);project=$(RelativeProjectDir);runtime=$(TargetType);platform=Win64;cookPlatform=$(TargetPlatform);changelist=$(Change);commit=$(Change);codeChangelist=$(CodeChange);codeCommit=$(CodeChange);isPreflight=$(IsPreflight);isBuildMachine=$(IsBuildMachine);isHordeEnv=$(IsHordeEnv)"/>
+			<Property Name="SnapshotBuildMetaData" Value="$(SnapshotBuildMetaData);preflightChangelist=$(PreflightChange)" If="'$(PreflightChange)' != ''" />
+			<Property Name="SnapshotBuildMetaData" Value="$(SnapshotBuildMetaData);hordeTemplateId=$(UE_HORDE_TEMPLATEID)" If="'$(UE_HORDE_TEMPLATEID)' != ''" />
+			<Log Message="Exporting cook state with metadata '$(SnapshotBuildMetaData)'"/>
+			<ZenExportSnapshot Project="$(RelativeProjectFile)" Platform="$(TargetPlatform)" DestinationStorageType="Builds" DestinationCloudHost="$(UE-CloudPublishHost)" DestinationCloudHttpVersion="$(UE-CloudPublishHttpVersion)" DestinationCloudNamespace="$(UE-CloudPublishNamespace)" DestinationCloudBucket="$(RelativeProjectDir).oplog-incrementalcompare.$(SnapshotBranch).$(TargetPlatform)" DestinationIdentifier="$(SnapshotIdentifier).$(TargetPlatform)" Metadata="$(SnapshotBuildMetaData)"/>
+		</Do>
+	</Macro>
+
+	<Agent Name="IncrementalCompareAgent" Type="$(AgentType)">
+		<Node Name="$(CompileNodeName)">
+			<!-- Compile. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: Compile =========="/>
+			<Compile Target="ShaderCompileWorker" Platform="$(EditorPlatform)" Project="$(RelativeProjectFile)" Configuration="Development" Arguments="$(UBACompileArgs)"/>
+			<Compile Target="ZenLaunch" Platform="$(EditorPlatform)" Configuration="Development" Arguments="$(UBACompileArgs)"/>
+			<Compile Target="$(EditorTarget)" Platform="$(EditorPlatform)" Project="$(RelativeProjectFile)" Configuration="Development" Arguments="$(UBACompileArgs)"/>
+		</Node>
+		<Node Name="$(NaturalIncrementalCookNodeName)" Requires="$(CompileNodeName)">
+			<!-- Execute the incremental cook (we don't pass -forcerecook). -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: Incremental Cook =========="/>
+			<Commandlet Name="Cook" Project="$(RelativeProjectFile)" Arguments="$(CommonCookArgs) -DumpBPNativeClassSerialization=NavAreaMeta_SwitchByAgent"/>
+		</Node>
+		<Node Name="$(StoreIncrementalCookNodeName)" Requires="$(NaturalIncrementalCookNodeName)">
+			<!-- Move all cook artifacts to the compare_incremental dir. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: Move =========="/>
+			<Log Message="Delete Directories=$(CompareDirIncremental)"/>
+			<Delete Directories="$(CompareDirIncremental)"/>
+			<Do If="$(WithNullCook)">
+				<Log Message="Copy From=$(PlatformCookedDir)/*.* To=$(CompareDirIncremental)"/>
+				<Copy From="$(PlatformCookedDir)/*.*" To="$(CompareDirIncremental)" ErrorIfNotFound="true"/>
+			</Do>
+			<Do If="!$(WithNullCook)">
+				<Log Message="Move From=$(PlatformCookedDir)/*.* To=$(CompareDirIncremental)"/>
+				<Move From="$(PlatformCookedDir)/*.*" To="$(CompareDirIncremental)" ErrorIfNotFound="true"/>
+				<Log Message="Delete Directories=$(PlatformCookedDir)"/>
+				<Delete Directories="$(PlatformCookedDir)"/>
+			</Do>
+
+			<!-- Write the files from incremental cook's zenstore out into CompareDirIncremental. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: ZenMirror Incremental Cook =========="/>
+			<Log Message="ZenMirror Project=$(RelativeProjectFile) Platform=$(TargetPlatform) DestinationFileDir=$(CompareDirIncremental)"/>
+			<ZenMirror Project="$(RelativeProjectFile)" Platform="$(TargetPlatform)" DestinationFileDir="$(CompareDirIncremental)"/>
+			
+			<!-- Exporting snapshot for developer debugging needs -->
+			<Expand Name="Snapshot Publish" NameSuffix="AfterNaturalCook"/>
+		</Node>
+		<Property Name="FullCookPrequisiteNodeName" Value="$(StoreIncrementalCookNodeName)"/>
+		<Do If="$(WithNullCook)">
+			<Node Name="$(PrimingNullIncrementalCookNodeName)" Requires="$(StoreIncrementalCookNodeName)">
+				<!-- Execute the null incremental cook. -->
+				<Log Message="$(NewLine)========== IncrementalCompare.xml: Priming Null Incremental Cook =========="/>
+				<Property Name="NullCookArgs" Value="$(CommonCookArgs) -dpcvars=cook.displaymode=4 -CookIncrementallyModifiedDiagnostics -WriteCookIncrementallyModifiedDiagnosticsToLogs -DumpBPNativeClassSerialization=NavAreaMeta_SwitchByAgent"/>
+				<Commandlet Name="Cook" Project="$(RelativeProjectFile)" Arguments="$(NullCookArgs)"/>
+			</Node>
+			<Node Name="$(PublishingPrimingNullIncrementalCookNodeName)" Requires="$(PrimingNullIncrementalCookNodeName)">
+				<!-- Publish the null incremental cook. -->
+				<Log Message="$(NewLine)========== IncrementalCompare.xml: Publishing primed Incremental Cook =========="/>
+				<!-- Exporting snapshot for developer debugging needs -->
+				<Expand Name="Snapshot Publish" NameSuffix="AfterPrimingNullCook"/>
+			</Node>
+			<Node Name="$(NullIncrementalCookNodeName)" Requires="$(PublishingPrimingNullIncrementalCookNodeName)">
+				<!-- Execute the null incremental cook. -->
+				<Log Message="$(NewLine)========== IncrementalCompare.xml: Null Incremental Cook =========="/>
+				<Property Name="NullCookArgs" Value="$(CommonCookArgs) -dpcvars=cook.displaymode=4 -CookIncrementallyModifiedDiagnostics -WriteCookIncrementallyModifiedDiagnosticsToLogs"/>
+				<Commandlet Name="Cook" Project="$(RelativeProjectFile)" Arguments="$(NullCookArgs)"/>
+			</Node>
+			<Node Name="$(PublishingNullIncrementalCookNodeName)" Requires="$(NullIncrementalCookNodeName)">
+				<!-- Publish the null incremental cook. -->
+				<Log Message="$(NewLine)========== IncrementalCompare.xml: Publishing primed Incremental Cook =========="/>
+				<!-- Exporting snapshot for developer debugging needs -->
+				<Expand Name="Snapshot Publish" NameSuffix="AfterNullCook"/>
+			</Node>
+			<Node Name="$(CleanNullIncrementalCookNodeName)" Requires="$(PublishingNullIncrementalCookNodeName)">
+				<!-- Move all cook artifacts to the compare_incremental dir. -->
+				<Log Message="$(NewLine)========== IncrementalCompare.xml: Clean Null =========="/>
+				<Log Message="Delete Directories=$(PlatformCookedDir)"/>
+				<Delete Directories="$(PlatformCookedDir)"/>
+			</Node>
+			<Property Name="FullCookPrequisiteNodeName" Value="$(CleanNullIncrementalCookNodeName)"/>
+		</Do>
+		<Node Name="$(FullCookNodeName)" Requires="$(FullCookPrequisiteNodeName)">
+			<!-- Execute the forcerecook cook. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: Non-Incremental Cook =========="/>
+			<Commandlet Name="Cook" Project="$(RelativeProjectFile)" Arguments="$(CommonCookArgs) -forcerecook"/>
+		</Node>
+		<Node Name="$(StoreFullCookNodeName)" Requires="$(FullCookNodeName)">
+			<!-- Copy all cook artifacts to the compare_incremental dir. Copy rather than move so they remain
+			     behind for the next instance of this job to use in an incremental cook. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: Copy =========="/>
+			<Log Message="Delete Directories=$(CompareDirRecook)"/>
+			<Delete Directories="$(CompareDirRecook)"/>
+			<Log Message="Copy From=$(PlatformCookedDir)/*.* To=$(CompareDirRecook)"/>
+			<Copy From="$(PlatformCookedDir)/*.*" To="$(CompareDirRecook)" ErrorIfNotFound="true"/>
+
+			<!-- Write the files from forcerecook's zenstore out into CompareDirRecook. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: ZenMirror ForceRecook Cook =========="/>
+			<Log Message="ZenMirror Project=$(RelativeProjectFile) Platform=$(TargetPlatform) DestinationFileDir=$(CompareDirRecook)"/>
+			<ZenMirror Project="$(RelativeProjectFile)" Platform="$(TargetPlatform)" DestinationFileDir="$(CompareDirRecook)"/>
+		</Node>
+		<Node Name="$(DiffCooksNodeName)" Requires="$(StoreFullCookNodeName)">
+			<!-- Compare the incremental cook with the non-incremental cook. -->
+			<Log Message="$(NewLine)========== IncrementalCompare.xml: DiffCook =========="/>
+			<Commandlet Name="DiffCook" Project="$(RelativeProjectFile)" Arguments="-base=$(CompareDirRecook) -comp=$(CompareDirIncremental) -targetplatform=$(TargetPlatform) -addedverbosity=error -removedverbosity=error -modifiedverbosity=warning -hide=modifiedpackages"/>
+		</Node>
+	</Agent>
+
+	<Aggregate Name="IncrementalCompare" Requires="$(DiffCooksNodeName)"/>
+
+</BuildGraph>

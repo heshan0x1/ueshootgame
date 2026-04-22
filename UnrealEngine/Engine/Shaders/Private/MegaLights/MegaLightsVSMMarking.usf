@@ -1,0 +1,64 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneTexturesCommon.ush"
+#include "../LightData.ush"
+#include "MegaLights.ush"
+#include "MegaLightsRayTracing.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapPageMarking.ush"
+
+RWTexture2D<uint> RWLightSamples;
+RWTexture2D<uint> RWLightSampleRays;
+
+Buffer<uint> CompactedTraceTexelAllocator;
+Buffer<uint> CompactedTraceTexelData;
+Texture2D<float> DownsampledSceneDepth;
+//Texture2D<UNORM float3> DownsampledSceneWorldNormal;
+
+[numthreads(THREADGROUP_SIZE, 1, 1)]
+void VirtualShadowMapMarkLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint TraceTexelIndex = DispatchThreadId.x;
+	if (TraceTexelIndex < CompactedTraceTexelAllocator[0])
+	{
+		const uint2 SampleCoord = UnpackTraceTexel(CompactedTraceTexelData[TraceTexelIndex]);
+		FLightSample LightSample = UnpackLightSample(RWLightSamples[SampleCoord]);
+
+		// Get VSM from LocalLightIndex
+		const FForwardLightData ForwardLightData = GetForwardLightData(LightSample.LocalLightIndex, 0);
+		const int VirtualShadowMapId = ForwardLightData.VirtualShadowMapId;
+		FVirtualShadowMapHandle VirtualShadowMapHandle = FVirtualShadowMapHandle::MakeFromId(VirtualShadowMapId);
+
+		if (VirtualShadowMapHandle.IsValid())
+		{
+			uint2 ScreenCoord = SampleCoordToScreenCoord(SampleCoord);
+			uint2 DownsampledScreenCoord = SampleCoordToDownsampledScreenCoord(SampleCoord);
+
+			float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+			float SceneDepth = DownsampledSceneDepth[DownsampledScreenCoord];
+			//float3 SceneWorldNormal = normalize(DecodeNormal(DownsampledSceneWorldNormal[DownsampledScreenCoord]));
+			float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+			
+			const FDeferredLightData LightData = ConvertToDeferredLight(ForwardLightData);
+			bool bDirectionalLight = !LightData.bRadialLight;
+
+			if (bDirectionalLight)
+			{
+				MarkPageDirectional(
+					VirtualShadowMapHandle,
+					TranslatedWorldPosition);
+			}
+			else
+			{
+				MarkPageLocal(
+					LightData,
+					VirtualShadowMapHandle,
+					TranslatedWorldPosition,
+					SceneDepth);
+			}
+		}
+	}
+}

@@ -1,0 +1,91 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--OpenXR plugin additions-->
+<root xmlns:android="http://schemas.android.com/apk/res/android">
+	<!-- init section is always evaluated once per architecture -->
+	<init>
+		<log text="OpenXRLoader"/>
+		<setBoolFromProperty result="bStartInVR" ini="Game" section="/Script/EngineSettings.GeneralProjectSettings" property="bStartInVR" default="false"/>
+		<setBool result="bCpuArchSupported" value="false"/>
+		<isArch arch="arm64-v8a">
+			<setBool result="bCpuArchSupported" value="true"/>
+		</isArch>
+		<isArch arch="armeabi-v7a">
+			<setBool result="bCpuArchSupported" value="true"/>
+		</isArch>
+		<isArch arch="x86">
+			<setBool result="bCpuArchSupported" value="true"/>
+		</isArch>
+		<isArch arch="x86_64">
+			<setBool result="bCpuArchSupported" value="true"/>
+		</isArch>
+	</init>
+
+	<!-- optional updates applied to AndroidManifest.xml -->
+	<androidManifestUpdates>
+		<if condition="bStartInVR">
+			<true>
+				<!-- Detect existence of intent-filter in GameActivity -->
+				<setString result="targetActivityName" value="com.epicgames.unreal.GameActivity"/>
+
+				<!-- Add Activity Specific Flags -->
+				<loopElements tag="activity">
+					<setStringFromAttribute result="activityName" tag="$" name="android:name"/>
+					<setBoolIsEqual result="bMatchTargetActivity" arg1="$S(activityName)" arg2="$S(targetActivityName)"/>
+					<if condition="bMatchTargetActivity">
+						<true>
+							<log text="OpenXR: manifest updates for $S(targetActivityName)"/>
+							
+							<setBool result="bHasIntentFilter" value="false"/>
+							<loopElements tag="intent-filter">
+								<setBool result="bHasIntentFilter" value="true"/>
+							</loopElements>
+
+							<if condition="bHasIntentFilter">
+							<false>
+								<setElement result="GameActivityIntentFilter" value="intent-filter" />
+								<addElement tag="activity" name="GameActivityIntentFilter" once="true"/>
+							</false>
+							</if>
+
+							<!-- Add VR Intent Filter -->
+							<setElement result="vrIntent" value="category"/>
+							<addAttribute tag="$vrIntent" name="android:name" value="org.khronos.openxr.intent.category.IMMERSIVE_HMD"/>
+							<addElement tag="intent-filter" name="vrIntent" once="true"/>
+						</true>
+					</if>
+				</loopElements>
+			</true>
+		</if>
+	</androidManifestUpdates>
+
+	<!-- optional additions to the GameActivity class in GameActivity.java
+	<gameActivityClassAdditions>
+	</gameActivityClassAdditions> -->
+
+	<!-- optional additions to GameActivity onCreate metadata reading in GameActivity.java
+	<gameActivityReadMetadataAdditions>
+	</gameActivityReadMetadataAdditions> -->
+
+
+	<!-- optional files or directories to copy to Intermediate/Android/APK -->
+	<resourceCopies>
+		<if condition="bCpuArchSupported">
+			<true>
+				<log text="Copying libopenxr_loader.so"/>
+				<copyFile src="$S(EngineDir)/Binaries/ThirdParty/OpenXR/Android/$S(Architecture)/libopenxr_loader.so"
+								dst="$S(BuildDir)/libs/$S(Architecture)/libopenxr_loader.so" />
+			</true>
+		</if>
+	</resourceCopies>
+
+
+	<!-- optional libraries to load in GameActivity.java before libUnreal.so -->
+	<soLoadLibrary>
+		<!-- need this if plugin enabled and supported architecture -->
+		<if condition="bCpuArchSupported">
+			<true>
+				<loadLibrary name="openxr_loader" failmsg="openxr_loader library not loaded and may be required for OpenXR." />
+			</true>
+		</if>
+	</soLoadLibrary>
+</root>

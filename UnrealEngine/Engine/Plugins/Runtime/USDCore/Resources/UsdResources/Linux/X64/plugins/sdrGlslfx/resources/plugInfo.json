@@ -1,0 +1,19 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "SdrGlslfxParserPlugin": {
+                        "bases": ["SdrParserPlugin"], 
+                        "displayName": "Glslfx-based shader definition parser plugin"
+                    }
+                }
+            },
+            "LibraryPath": "../../../../../../Source/ThirdParty/USD/Unix/x86_64-unknown-linux-gnu/lib/sdrGlslfx.so",
+            "Name": "sdrGlslfx",
+            "ResourcePath": "resources",
+            "Root": "..",
+            "Type": "library"
+        }
+    ]
+}

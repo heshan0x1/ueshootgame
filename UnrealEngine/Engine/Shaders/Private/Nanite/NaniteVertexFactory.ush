@@ -1,0 +1,1435 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../VertexFactoryCommon.ush"
+#include "../LightmapData.ush"
+#include "../SplineMeshCommon.ush"
+#include "../SGGX.ush"
+#if RAYHITGROUPSHADER
+#include "../RayTracing/RayTracingCommon.ush"
+#endif
+#if MATERIAL_CACHE
+#include "../MaterialCache/MaterialCacheCommon.ush"
+#endif // MATERIAL_CACHE
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+#include "NaniteSceneCommon.ush"
+#include "NaniteVertexDeformation.ush"
+
+// Some platforms may configure custom shader compiler options when compiling Nanite material shaders
+#ifdef OVERRIDE_NANITE_VERTEX_FACTORY_CONFIG_USH
+#include "/Platform/Private/NaniteVertexFactoryConfig.ush"
+#endif
+
+#ifndef VIRTUAL_TEXTURE_TARGET
+#define VIRTUAL_TEXTURE_TARGET 0
+#endif
+
+#ifndef NANITE_USE_HW_BARYCENTRICS
+#define NANITE_USE_HW_BARYCENTRICS 0
+#endif
+
+// Make sure we decode enough texture coordinates to satisfy programmable features
+#if NUM_MATERIAL_TEXCOORDS_VERTEX > NUM_MATERIAL_TEXCOORDS
+	#define NANITE_NUM_TEXCOORDS_TO_DECODE NUM_MATERIAL_TEXCOORDS_VERTEX
+#else
+	#define NANITE_NUM_TEXCOORDS_TO_DECODE NUM_MATERIAL_TEXCOORDS
+#endif
+
+#if NANITE_PIXEL_PROGRAMMABLE && NANITE_NUM_TEXCOORDS_TO_DECODE < 2
+	// Ensure we decode at least 2 texture coordinates in the MS/VS to properly populate the interpolator with valid data.
+	#define NANITE_NUM_TEXCOORDS_TO_DECODE_HW_VS 2
+#else
+	#define NANITE_NUM_TEXCOORDS_TO_DECODE_HW_VS NANITE_NUM_TEXCOORDS_TO_DECODE
+#endif
+
+// Nanite material evaluation is deferred to a screenspace pass sampling the visibility buffer,
+// so the 'interpolants' used in the GBuffer pass are almost all generated in the PixelShader, instead of exported from VS.
+// FNaniteFullscreenVSToPS is the struct containing what actually needs to be passed between VS and PS in the Nanite GBuffer pass.
+struct FVertexFactoryInterpolantsVSToPS
+{
+#if NEEDS_LIGHTMAP_COORDINATE
+	nointerpolation float4 LightMapCoordinate	: TEXCOORD3;
+	nointerpolation float4 LightMapCoordinateDDX: TEXCOORD4;
+	nointerpolation float4 LightMapCoordinateDDY: TEXCOORD5;
+#endif
+#if VF_USE_PRIMITIVE_SCENE_DATA && NEEDS_LIGHTMAP_COORDINATE
+	nointerpolation uint LightmapDataIndex		: LIGHTMAP_ID;
+#endif
+#if INSTANCED_STEREO
+	nointerpolation uint EyeIndex				: PACKED_EYE_INDEX;
+#endif
+	nointerpolation uint ViewIndex				: PACKED_VIEW_INDEX;
+	nointerpolation uint2 PixelPos				: PIXEL_POS;
+};
+
+void GetNaniteMaterialSceneData(FVisibleCluster VisibleCluster, inout FPrimitiveSceneData PrimitiveData, inout FInstanceSceneData InstanceData)
+{
+	InstanceData	= GetInstanceSceneDataUnchecked(VisibleCluster);
+	PrimitiveData	= GetPrimitiveData(InstanceData.PrimitiveId);
+
+#if USE_SPLINEDEFORM
+	BRANCH
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SPLINE_MESH) != 0 &&
+		(InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_PAYLOAD_EXTENSION) != 0)
+	{
+		// Flip the determinant sign if the spline mesh params cause the mesh to mirror
+		FSplineMeshShaderParams SplineMeshParams = SplineMeshLoadParamsFromInstancePayload(InstanceData);
+		if (SplineMeshParams.StartScale.x < 0.0f != SplineMeshParams.StartScale.y < 0.0f)
+		{
+			InstanceData.DeterminantSign = -InstanceData.DeterminantSign;
+		}
+	}
+#endif
+}
+
+#if IS_NANITE_RASTER_PASS
+
+struct FVertexFactoryInput
+{
+	VF_INSTANCED_STEREO_DECLARE_INPUT_BLOCK()
+	VF_MOBILE_MULTI_VIEW_DECLARE_INPUT_BLOCK()
+};
+
+struct FVertexFactoryIntermediates
+{
+	float3x3 TangentToLocal;
+};
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates = (FVertexFactoryIntermediates)0;
+	return Intermediates;
+};
+
+float3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToLocal;
+}
+
+FMaterialVertexParameters GetMaterialVertexParameters(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 WorldPosition, float3x3 TangentToLocal, bool bIsPreviousFrame = false)
+{
+	FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+
+	return Result;
+}
+
+#endif // IS_NANITE_RASTER_PASS
+
+#if NEEDS_LIGHTMAP_COORDINATE
+
+void GetLightMapCoordinates(FVertexFactoryInterpolantsVSToPS Interpolants, out float2 LightmapUV0, out float2 LightmapUV1, out uint LightmapDataIndex)
+{
+	LightmapUV0 = Interpolants.LightMapCoordinate.xy * float2(1.0, 0.5);
+	LightmapUV1 = LightmapUV0 + float2(0.0, 0.5);
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	LightmapDataIndex = Interpolants.LightmapDataIndex;
+#else
+	LightmapDataIndex = 0;
+#endif
+}
+
+void GetLightMapCoordinates(FVertexFactoryInterpolantsVSToPS Interpolants, out FloatDeriv2 LightmapUV0, out FloatDeriv2 LightmapUV1, out uint LightmapDataIndex)
+{
+	LightmapUV0 = ConstructFloatDeriv2(	Interpolants.LightMapCoordinate.xy * float2(1.0, 0.5),
+										Interpolants.LightMapCoordinateDDX.xy * float2(1.0, 0.5),
+										Interpolants.LightMapCoordinateDDY.xy * float2(1.0, 0.5));
+
+	LightmapUV1 = LightmapUV0;
+	LightmapUV1.Value += float2(0.0, 0.5);
+
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	LightmapDataIndex = Interpolants.LightmapDataIndex;
+#else
+	LightmapDataIndex = 0;
+#endif
+}
+
+void GetShadowMapCoordinate(FVertexFactoryInterpolantsVSToPS Interpolants, out float2 ShadowMapCoordinate, out uint LightmapDataIndex)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	LightmapDataIndex = Interpolants.LightmapDataIndex;
+#else
+	LightmapDataIndex = 0;
+#endif
+	ShadowMapCoordinate = Interpolants.LightMapCoordinate.zw;
+}
+
+void GetShadowMapCoordinate(FVertexFactoryInterpolantsVSToPS Interpolants, out FloatDeriv2 ShadowMapCoordinate, out uint LightmapDataIndex)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	LightmapDataIndex = Interpolants.LightmapDataIndex;
+#else
+	LightmapDataIndex = 0;
+#endif
+	ShadowMapCoordinate = ConstructFloatDeriv2(	Interpolants.LightMapCoordinate.zw,
+												Interpolants.LightMapCoordinateDDX.zw,
+												Interpolants.LightMapCoordinateDDY.zw);
+}
+
+void SetLightMapCoordinate(inout FVertexFactoryInterpolantsVSToPS Interpolants, float2 InLightMapCoordinate, float2 InShadowMapCoordinate)
+{
+	Interpolants.LightMapCoordinate.xy = InLightMapCoordinate;
+	Interpolants.LightMapCoordinate.zw = InShadowMapCoordinate;
+	Interpolants.LightMapCoordinateDDX = 0;
+	Interpolants.LightMapCoordinateDDY = 0;
+}
+
+void SetLightMapCoordinate(inout FVertexFactoryInterpolantsVSToPS Interpolants, TDual< float2 > InLightMapCoordinate, TDual< float2 > InShadowMapCoordinate)
+{
+	Interpolants.LightMapCoordinate		= float4(InLightMapCoordinate.Value,	InShadowMapCoordinate.Value);
+	Interpolants.LightMapCoordinateDDX	= float4(InLightMapCoordinate.Value_dx,	InShadowMapCoordinate.Value_dy);
+	Interpolants.LightMapCoordinateDDY	= float4(InLightMapCoordinate.Value_dy,	InShadowMapCoordinate.Value_dy);
+}
+
+void SetLightMapDataIndex(inout FVertexFactoryInterpolantsVSToPS Interpolants, uint LightmapDataIndex)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	Interpolants.LightmapDataIndex = LightmapDataIndex;
+#endif
+}
+
+#endif // NEEDS_LIGHTMAP_COORDINATE
+
+// Determines the tangent to local frame of the specified vertex
+half3x3 CalcVertexTangentToLocal(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FNanitePostDeformVertex Vert)
+{
+	half3x3 TangentToLocal;
+
+	BRANCH
+	if(Vert.TangentBasis.TangentXAndSign.w != 0.0f)
+	{
+		TangentToLocal = NaniteTangentToLocal(Vert.TangentBasis.TangentXAndSign, Vert.TangentBasis.TangentZ);
+	}
+	else
+	{
+		TangentToLocal = GetTangentBasis(Vert.TangentBasis.TangentZ);
+	}
+
+#if USE_SPLINEDEFORM
+	BRANCH
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SPLINE_MESH) != 0 &&
+		(InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_PAYLOAD_EXTENSION) != 0)
+	{
+		FSplineMeshShaderParams SplineMeshParams = SplineMeshLoadParamsFromInstancePayload(InstanceData);
+		TangentToLocal = mul(TangentToLocal, SplineMeshCalcSliceRot(SplineMeshParams, Vert.SplineDist));
+	}
+#endif
+
+	return TangentToLocal;
+}
+
+void SetVertexParameterInstanceData(inout FMaterialVertexParameters VertexParameters, FInstanceSceneData InstanceData, FPrimitiveSceneData PrimitiveData, bool bEvaluateWorldPositionOffset)
+{
+	VertexParameters.PrimitiveId			= InstanceData.PrimitiveId;
+	VertexParameters.InstanceLocalToWorld	= InstanceData.LocalToWorld;
+	VertexParameters.InstanceWorldToLocal	= InstanceData.WorldToLocal;
+	VertexParameters.PrevFrameLocalToWorld	= InstanceData.PrevLocalToWorld;
+#if USES_PER_INSTANCE_CUSTOM_DATA
+	VertexParameters.CustomDataOffset		= InstanceData.CustomDataOffset;
+	VertexParameters.CustomDataCount		= InstanceData.CustomDataCount;
+#endif
+	VertexParameters.PerInstanceRandom      = InstanceData.RandomID;
+
+	VertexParameters.SceneData.PrimitiveId 	= InstanceData.PrimitiveId;
+	VertexParameters.SceneData.InstanceId 	= InstanceData.RelativeId;
+	VertexParameters.SceneData.InstanceData	= InstanceData;
+	VertexParameters.SceneData.Primitive	= PrimitiveData;
+
+	VertexParameters.bEvaluateWorldPositionOffset = bEvaluateWorldPositionOffset;
+}
+
+void SetVertexParameterAttributeData(inout FMaterialVertexParameters VertexParameters, FNanitePostDeformVertex Vert, float4x4 LocalToTranslatedWorld, float3x3 LocalToWorldNoScale, bool bUsePrevPosition)
+{
+	half3x3 TangentToLocal = CalcVertexTangentToLocal(VertexParameters.SceneData.Primitive, VertexParameters.SceneData.InstanceData, Vert);
+	float4x4 TranslatedWorldToPrimitive = DFFastToTranslatedWorld(VertexParameters.SceneData.Primitive.WorldToLocal, ResolvedView.PreViewTranslation);
+
+	VertexParameters.WorldPosition			= mul(float4(bUsePrevPosition ? Vert.PrevPosition : Vert.Position, 1), LocalToTranslatedWorld).xyz;
+	VertexParameters.PositionInstanceSpace	= Vert.Position;
+	VertexParameters.PositionPrimitiveSpace	= mul(float4(VertexParameters.WorldPosition, 1), TranslatedWorldToPrimitive).xyz;
+	VertexParameters.TangentToWorld			= mul(TangentToLocal, LocalToWorldNoScale);
+	VertexParameters.VertexColor			= Vert.Color;
+	VertexParameters.PreSkinnedPosition		= Vert.PointLocal;
+	VertexParameters.PreSkinnedNormal		= Vert.PreSkinnedNormal;
+
+#if NUM_MATERIAL_TEXCOORDS_VERTEX
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < NUM_MATERIAL_TEXCOORDS_VERTEX; ++TexCoordIndex)
+	{
+		// Protect against case where Nanite max UV count is lower than what the material may define.
+		VertexParameters.TexCoords[TexCoordIndex] = Vert.TexCoords[min(TexCoordIndex, NANITE_MAX_UVS - 1)];
+	}
+#endif
+
+	VertexParameters.LWCData = MakeMaterialLWCData(VertexParameters);
+}
+
+// Group of transforms needed to transform a Nanite vertex
+struct FNaniteVertTransforms
+{
+	float4x4 LocalToTranslatedWorld;
+	float4x4 PrevLocalToTranslatedWorld;
+	float4x4 TranslatedWorldToClip;
+	float3x3 LocalToWorldNoScale;
+	float3x3 PrevLocalToWorldNoScale;
+	float3x3 WorldToLocalVector;
+	float3x3 PrevWorldToLocalVector;
+	float3x3 TranslatedWorldToFirstPerson;
+	float3x3 PrevTranslatedWorldToFirstPerson;
+};
+
+struct FNaniteTransformedVert
+{
+	uint VertIndex;
+	float3 PointLocal;
+	float3 PointPostDeform;
+	float3 PrevPointPostDeform;
+	float3 PointWorld;
+	float3 PointWorld_NoOffset;
+	float4 PointClip;
+	float4 NormalClip;
+	float4 Color;
+	FNaniteTangentBasis TangentBasis;
+	float SplineDist;
+#if NUM_TEX_COORD_INTERPOLATORS
+	float2 CustomizedUVs[NUM_TEX_COORD_INTERPOLATORS];
+#endif
+};
+
+FNaniteVertTransforms CalculateNaniteVertexTransforms(FInstanceSceneData InstanceData, FInstanceDynamicData InstanceDynamicData, FNaniteView NaniteView)
+{
+	const float4x4 LocalToTranslatedWorld = InstanceDynamicData.LocalToTranslatedWorld;
+	const float4x4 PrevLocalToTranslatedWorld = InstanceDynamicData.PrevLocalToTranslatedWorld;
+	const float3 InvNonUniformScale = InstanceData.InvNonUniformScale;
+
+	// Should be Pow2(InvScale) but that requires renormalization
+	float3x3 LocalToWorldNoScale = (float3x3)LocalToTranslatedWorld;
+	LocalToWorldNoScale[0] *= InvNonUniformScale.x;
+	LocalToWorldNoScale[1] *= InvNonUniformScale.y;
+	LocalToWorldNoScale[2] *= InvNonUniformScale.z;
+
+	float3x3 PrevLocalToWorldNoScale = (float3x3)PrevLocalToTranslatedWorld;
+	PrevLocalToWorldNoScale[0] *= InvNonUniformScale.x;
+	PrevLocalToWorldNoScale[1] *= InvNonUniformScale.y;
+	PrevLocalToWorldNoScale[2] *= InvNonUniformScale.z;
+
+	float3x3 WorldToLocalVector = DFToFloat3x3(InstanceData.WorldToLocal);
+	
+	// TODO: We need PrevWorldToLocal here, but we don't have it
+	const float3 SqInvNonUniformScale = Pow2(InvNonUniformScale);
+	float3x3 PrevWorldToLocalVector = DFToFloat3x3(InstanceData.PrevLocalToWorld);
+	PrevWorldToLocalVector[0] *= SqInvNonUniformScale.x;
+	PrevWorldToLocalVector[1] *= SqInvNonUniformScale.y;
+	PrevWorldToLocalVector[2] *= SqInvNonUniformScale.z;
+	PrevWorldToLocalVector = transpose(PrevWorldToLocalVector);
+
+	FNaniteVertTransforms Transforms;
+	Transforms.LocalToTranslatedWorld		= LocalToTranslatedWorld;
+	Transforms.PrevLocalToTranslatedWorld	= PrevLocalToTranslatedWorld;
+	Transforms.TranslatedWorldToClip		= NaniteView.TranslatedWorldToClip;
+	Transforms.LocalToWorldNoScale			= LocalToWorldNoScale;
+	Transforms.PrevLocalToWorldNoScale		= PrevLocalToWorldNoScale;
+	Transforms.WorldToLocalVector			= WorldToLocalVector;
+	Transforms.PrevWorldToLocalVector		= PrevWorldToLocalVector;
+	Transforms.TranslatedWorldToFirstPerson = NaniteView.FirstPersonTransform;
+	Transforms.PrevTranslatedWorldToFirstPerson = NaniteView.PrevFirstPersonTransform;
+
+	return Transforms;
+}
+
+HLSL_STATIC_ASSERT(sizeof(FNaniteVertTransforms) == 408, "Unexpected size of FNaniteVertTransforms. Update WaveReadLaneAt to reflect changes.");
+FNaniteVertTransforms WaveReadLaneAt(FNaniteVertTransforms In, uint SrcIndex)
+{
+	FNaniteVertTransforms Result;
+
+	Result.LocalToTranslatedWorld			= WaveReadLaneAtMatrix(In.LocalToTranslatedWorld,			SrcIndex);
+	Result.PrevLocalToTranslatedWorld		= WaveReadLaneAtMatrix(In.PrevLocalToTranslatedWorld,		SrcIndex);
+	Result.TranslatedWorldToClip			= WaveReadLaneAtMatrix(In.TranslatedWorldToClip,			SrcIndex);
+	Result.LocalToWorldNoScale				= WaveReadLaneAtMatrix(In.LocalToWorldNoScale,				SrcIndex);
+	Result.PrevLocalToWorldNoScale			= WaveReadLaneAtMatrix(In.PrevLocalToWorldNoScale,			SrcIndex);
+	Result.WorldToLocalVector				= WaveReadLaneAtMatrix(In.WorldToLocalVector,				SrcIndex);
+	Result.PrevWorldToLocalVector			= WaveReadLaneAtMatrix(In.PrevWorldToLocalVector,			SrcIndex);
+	Result.TranslatedWorldToFirstPerson		= WaveReadLaneAtMatrix(In.TranslatedWorldToFirstPerson,		SrcIndex);
+	Result.PrevTranslatedWorldToFirstPerson = WaveReadLaneAtMatrix(In.PrevTranslatedWorldToFirstPerson,	SrcIndex);
+
+	return Result;
+}
+
+float4 GetNaniteClipPosition(in FNaniteView NaniteView, in FMaterialVertexParameters MaterialParameters, FPrimitiveSceneData PrimitiveData, FNaniteVertTransforms Transforms, FNanitePostDeformVertex Vertex, float3 PointWorld)
+{
+#if MATERIAL_CACHE
+	const uint   TexCoordIndex   = min(NANITE_MAX_UVS - 1, GetMaterialCacheUVCoordinateIndex(PrimitiveData));
+	const float2 MaterialCacheUV = Vertex.TexCoords[TexCoordIndex].xy;
+	
+	return GetMaterialCacheUnwrapClipPosition(MaterialCacheUV, NaniteView.MaterialCacheUnwrapMinAndInvSize);
+#else // MATERIAL_CACHE
+	return mul(float4(PointWorld, 1), Transforms.TranslatedWorldToClip);
+#endif // MATERIAL_CACHE
+}
+
+struct FNaniteFirstPersonOffsets
+{
+	float3 WorldOffset;
+	float3 PrevWorldOffset;
+	float3 LocalOffset;
+	float3 PrevLocalOffset;
+};
+
+FNaniteFirstPersonOffsets GetNaniteFirstPersonOffsets(FNaniteVertTransforms Transforms, FMaterialVertexParameters VertexParameters, float3 WorldPositionOffset, FMaterialVertexParameters PrevVertexParameters, float3 PrevWorldPositionOffset)
+{
+	FNaniteFirstPersonOffsets Result = (FNaniteFirstPersonOffsets)0;
+	
+	const float3 TranslatedWorldPosition = VertexParameters.WorldPosition + WorldPositionOffset;
+	const float3 PrevTranslatedWorldPosition = PrevVertexParameters.WorldPosition + PrevWorldPositionOffset;
+	const float InterpolationAlpha = GetMaterialFirstPersonInterpolationAlpha(VertexParameters);
+	const float PrevInterpolationAlpha = GetMaterialPreviousFirstPersonInterpolationAlpha(PrevVertexParameters);
+
+	Result.WorldOffset = mul(TranslatedWorldPosition, Transforms.TranslatedWorldToFirstPerson) - TranslatedWorldPosition;
+	Result.PrevWorldOffset = mul(PrevTranslatedWorldPosition, Transforms.PrevTranslatedWorldToFirstPerson) - PrevTranslatedWorldPosition;
+	Result.WorldOffset *= InterpolationAlpha;
+	Result.PrevWorldOffset *= PrevInterpolationAlpha;
+	Result.LocalOffset = mul(Result.WorldOffset, Transforms.WorldToLocalVector);
+	Result.PrevLocalOffset = mul(Result.PrevWorldOffset, Transforms.PrevWorldToLocalVector);
+
+	return Result;
+}
+
+template<uint N>
+void TransformNaniteVerts(in FNaniteView NaniteView, FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FNaniteVertTransforms Transforms, bool bEvaluateWPO, FNanitePostDeformVertex InVerts[N], inout FNaniteTransformedVert OutVerts[N])
+{
+	const bool bIsFirstPerson = IsFirstPerson_FromFlags(PrimitiveData.Flags);
+
+#if USES_WORLD_POSITION_OFFSET
+	#if ALWAYS_EVALUATE_WORLD_POSITION_OFFSET
+		bEvaluateWPO = true;
+	#else
+		bEvaluateWPO &= (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_EVALUATE_WORLD_POSITION_OFFSET) != 0u;
+	#endif
+	BRANCH
+	if (bEvaluateWPO)
+	{
+		UNROLL
+		for (int i = 0; i < N; ++i)
+		{
+			FMaterialVertexParameters VertexParameters = MakeInitializedMaterialVertexParameters();
+			SetVertexParameterInstanceData(VertexParameters, InstanceData, PrimitiveData, true /* WPO */);
+			SetVertexParameterAttributeData(VertexParameters, InVerts[i], Transforms.LocalToTranslatedWorld, Transforms.LocalToWorldNoScale, false /*bUsePrevPosition*/);
+
+			FMaterialVertexParameters PrevVertexParameters = MakeInitializedMaterialVertexParameters();
+			SetVertexParameterInstanceData(PrevVertexParameters, InstanceData, PrimitiveData, true /* WPO */);
+			SetVertexParameterAttributeData(PrevVertexParameters, InVerts[i], Transforms.PrevLocalToTranslatedWorld, Transforms.PrevLocalToWorldNoScale, true /*bUsePrevPosition*/);
+
+		#if ENABLE_NEW_HLSL_GENERATOR
+			EvaluateVertexMaterialAttributes(VertexParameters);
+			EvaluateVertexMaterialAttributes(PrevVertexParameters);
+		#endif
+			const float3 WorldPositionOffset = GetMaterialWorldPositionOffset(VertexParameters);
+			const float3 PrevWorldPositionOffset = GetMaterialPreviousWorldPositionOffset(PrevVertexParameters);
+			const float3 LocalOffset = mul(WorldPositionOffset, Transforms.WorldToLocalVector);
+			const float3 PrevLocalOffset = mul(PrevWorldPositionOffset, Transforms.PrevWorldToLocalVector);
+			const float3 NormalWorld = mul(float4(InVerts[i].TangentBasis.TangentZ, 0), Transforms.LocalToTranslatedWorld).xyz;
+
+			OutVerts[i].VertIndex			= InVerts[i].VertIndex;
+			OutVerts[i].Color				= InVerts[i].Color;
+			OutVerts[i].SplineDist			= InVerts[i].SplineDist;
+			OutVerts[i].NormalClip			= mul(float4(NormalWorld, 0), Transforms.TranslatedWorldToClip);
+			OutVerts[i].TangentBasis		= InVerts[i].TangentBasis;
+			OutVerts[i].PointLocal			= InVerts[i].PointLocal;
+			OutVerts[i].PointPostDeform		= InVerts[i].Position + LocalOffset;
+			OutVerts[i].PrevPointPostDeform	= InVerts[i].PrevPosition + PrevLocalOffset;
+			OutVerts[i].PointWorld			= VertexParameters.WorldPosition + WorldPositionOffset;
+			OutVerts[i].PointWorld_NoOffset	= VertexParameters.WorldPosition;
+
+		#if SUPPORT_FIRST_PERSON_RENDERING
+			BRANCH
+			if (bIsFirstPerson)
+			{
+				const FNaniteFirstPersonOffsets FPOffsets = GetNaniteFirstPersonOffsets(Transforms, VertexParameters, WorldPositionOffset, PrevVertexParameters, PrevWorldPositionOffset);
+				OutVerts[i].PointPostDeform += FPOffsets.LocalOffset;
+				OutVerts[i].PrevPointPostDeform += FPOffsets.PrevLocalOffset;
+				OutVerts[i].PointWorld += FPOffsets.WorldOffset;
+			}
+		#endif // SUPPORT_FIRST_PERSON_RENDERING
+
+			OutVerts[i].PointClip			= GetNaniteClipPosition(NaniteView, VertexParameters, PrimitiveData, Transforms, InVerts[i], OutVerts[i].PointWorld);
+
+		#if NUM_TEX_COORD_INTERPOLATORS
+			GetMaterialCustomizedUVs(VertexParameters, OutVerts[i].CustomizedUVs);
+			GetCustomInterpolators(VertexParameters, OutVerts[i].CustomizedUVs);
+		#endif
+		}
+	}
+	else
+#endif // USES WORLD_POSITION_OFFSET
+	{
+		UNROLL
+		for (int i = 0; i < N; ++i)
+		{
+			const float3 NormalWorld			= mul(float4(InVerts[i].TangentBasis.TangentZ, 0), Transforms.LocalToTranslatedWorld).xyz;
+
+			FMaterialVertexParameters VertexParameters = MakeInitializedMaterialVertexParameters();
+			SetVertexParameterInstanceData(VertexParameters, InstanceData, PrimitiveData, false /* WPO */);
+			SetVertexParameterAttributeData(VertexParameters, InVerts[i], Transforms.LocalToTranslatedWorld, Transforms.LocalToWorldNoScale, false /*bUsePrevPosition*/);
+		#if ENABLE_NEW_HLSL_GENERATOR && ((NANITE_VERTEX_PROGRAMMABLE && SUPPORT_FIRST_PERSON_RENDERING) || NUM_TEX_COORD_INTERPOLATORS)
+			EvaluateVertexMaterialAttributes(VertexParameters);
+		#endif
+
+			OutVerts[i].VertIndex			= InVerts[i].VertIndex;
+			OutVerts[i].Color				= InVerts[i].Color;
+			OutVerts[i].SplineDist			= InVerts[i].SplineDist;
+			OutVerts[i].NormalClip			= mul(float4(NormalWorld, 0), Transforms.TranslatedWorldToClip);
+			OutVerts[i].TangentBasis		= InVerts[i].TangentBasis;
+			OutVerts[i].PointLocal			= InVerts[i].PointLocal;
+			OutVerts[i].PointPostDeform		= InVerts[i].Position;
+			OutVerts[i].PrevPointPostDeform	= InVerts[i].PrevPosition;
+			OutVerts[i].PointWorld			= VertexParameters.WorldPosition;
+			OutVerts[i].PointWorld_NoOffset	= VertexParameters.WorldPosition;
+			
+		#if SUPPORT_FIRST_PERSON_RENDERING
+			BRANCH
+			if (bIsFirstPerson)
+			{
+				FMaterialVertexParameters PrevVertexParameters = MakeInitializedMaterialVertexParameters();
+				SetVertexParameterInstanceData(PrevVertexParameters, InstanceData, PrimitiveData, false /* WPO */);
+				SetVertexParameterAttributeData(PrevVertexParameters, InVerts[i], Transforms.PrevLocalToTranslatedWorld, Transforms.PrevLocalToWorldNoScale, true /*bUsePrevPosition*/);
+			#if ENABLE_NEW_HLSL_GENERATOR && NANITE_VERTEX_PROGRAMMABLE
+				EvaluateVertexMaterialAttributes(PrevVertexParameters);
+			#endif
+
+				const FNaniteFirstPersonOffsets FPOffsets = GetNaniteFirstPersonOffsets(Transforms, VertexParameters, /*WorldPositionOffset*/ 0.0f, PrevVertexParameters, /*PrevWorldPositionOffset*/ 0.0f);
+				OutVerts[i].PointPostDeform += FPOffsets.LocalOffset;
+				OutVerts[i].PrevPointPostDeform += FPOffsets.PrevLocalOffset;
+				OutVerts[i].PointWorld += FPOffsets.WorldOffset;
+			}
+		#endif // SUPPORT_FIRST_PERSON_RENDERING
+			
+			OutVerts[i].PointClip			=  GetNaniteClipPosition(NaniteView, VertexParameters, PrimitiveData, Transforms, InVerts[i], OutVerts[i].PointWorld);
+
+		#if NUM_TEX_COORD_INTERPOLATORS
+			GetMaterialCustomizedUVs(VertexParameters, OutVerts[i].CustomizedUVs);
+			GetCustomInterpolators(VertexParameters, OutVerts[i].CustomizedUVs);
+		#endif
+		}
+	}
+}
+
+template<uint N>
+void FetchTransformedNaniteVerts(
+	FNaniteView NaniteView,
+	FPrimitiveSceneData PrimitiveData,
+	FInstanceSceneData InstanceData,
+	FInstanceViewData InstanceViewData,
+	FNaniteVertTransforms Transforms,
+	FCluster Cluster,
+	FVisibleCluster VisibleCluster,
+	uint3 VertIndexes,
+	FReconstructedVoxelData VoxelData,
+	bool bEvaluateWPO,
+	inout FNaniteTransformedVert OutVerts[N]
+	)
+{
+	FNaniteLocalVertex LocalVerts[N];
+	FetchLocalNaniteVerts<N>(PrimitiveData, InstanceData, InstanceViewData, Cluster, VisibleCluster, VertIndexes, NANITE_NUM_TEXCOORDS_TO_DECODE, LocalVerts);
+
+	FNanitePostDeformVertex DeformedVerts[N];
+
+	BRANCH
+	if (Cluster.bVoxel)
+	{
+		UNROLL
+		for(uint i = 0; i < N; i++)
+		{
+			DeformedVerts[i] = DeformLocalNaniteVoxelVertex(VoxelData, LocalVerts[i]);
+		}
+	}
+	else
+	{
+		UNROLL
+		for(uint i = 0; i < N; i++)
+		{
+			DeformedVerts[i] = DeformLocalNaniteVertex(PrimitiveData, InstanceData, InstanceViewData, Cluster, LocalVerts[i]);
+		}
+	}
+
+	TransformNaniteVerts<N>(NaniteView, PrimitiveData, InstanceData, Transforms, bEvaluateWPO, DeformedVerts, OutVerts);
+}
+
+FNaniteTransformedVert TransformNaniteVertex(FPrimitiveSceneData PrimitiveData, FInstanceSceneData InstanceData, FNaniteVertTransforms Transforms, FNanitePostDeformVertex InVert, bool bEvaluateWPO)
+{
+	FNaniteTransformedVert Vert = (FNaniteTransformedVert)0;
+
+	Vert.VertIndex			= InVert.VertIndex;
+	Vert.Color				= InVert.Color;
+	Vert.TangentBasis		= InVert.TangentBasis;
+	Vert.PointLocal			= InVert.PointLocal;
+	Vert.SplineDist			= InVert.SplineDist;
+
+	const float3 NormalWorld = mul(float4(InVert.TangentBasis.TangentZ, 0), Transforms.LocalToTranslatedWorld).xyz;
+	Vert.NormalClip = mul(float4(NormalWorld, 0), Transforms.TranslatedWorldToClip);
+
+	const bool bIsFirstPerson = IsFirstPerson_FromFlags(PrimitiveData.Flags);
+
+#if USES_WORLD_POSITION_OFFSET
+	#if ALWAYS_EVALUATE_WORLD_POSITION_OFFSET
+		bEvaluateWPO = true;
+	#else
+		bEvaluateWPO &= (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_EVALUATE_WORLD_POSITION_OFFSET) != 0u;
+	#endif
+	BRANCH
+	if (bEvaluateWPO)
+	{
+		FMaterialVertexParameters VertexParameters = MakeInitializedMaterialVertexParameters();
+		SetVertexParameterInstanceData(VertexParameters, InstanceData, PrimitiveData, true /* WPO */);
+		SetVertexParameterAttributeData(VertexParameters, InVert, Transforms.LocalToTranslatedWorld, Transforms.LocalToWorldNoScale, false /*bUsePrevPosition*/);
+
+		FMaterialVertexParameters PrevVertexParameters = MakeInitializedMaterialVertexParameters();
+		SetVertexParameterInstanceData(PrevVertexParameters, InstanceData, PrimitiveData, true /* WPO */);
+		SetVertexParameterAttributeData(PrevVertexParameters, InVert, Transforms.PrevLocalToTranslatedWorld, Transforms.PrevLocalToWorldNoScale, true /*bUsePrevPosition*/);
+
+	#if ENABLE_NEW_HLSL_GENERATOR
+		EvaluateVertexMaterialAttributes(VertexParameters);
+		EvaluateVertexMaterialAttributes(PrevVertexParameters);
+	#endif
+		const float3 WorldPositionOffset = GetMaterialWorldPositionOffset(VertexParameters);
+		const float3 PrevWorldPositionOffset = GetMaterialPreviousWorldPositionOffset(PrevVertexParameters);
+		const float3 LocalOffset = mul(WorldPositionOffset, Transforms.WorldToLocalVector);
+		const float3 PrevLocalOffset = mul(PrevWorldPositionOffset, Transforms.PrevWorldToLocalVector);
+
+		Vert.PointPostDeform = InVert.Position + LocalOffset;
+		Vert.PrevPointPostDeform = InVert.PrevPosition + PrevLocalOffset;
+		Vert.PointWorld = VertexParameters.WorldPosition + WorldPositionOffset;
+		Vert.PointWorld_NoOffset = VertexParameters.WorldPosition;
+		
+	#if SUPPORT_FIRST_PERSON_RENDERING
+		BRANCH
+		if (bIsFirstPerson)
+		{
+			const FNaniteFirstPersonOffsets FPOffsets = GetNaniteFirstPersonOffsets(Transforms, VertexParameters, WorldPositionOffset, PrevVertexParameters, PrevWorldPositionOffset);
+			Vert.PointPostDeform += FPOffsets.LocalOffset;
+			Vert.PrevPointPostDeform += FPOffsets.PrevLocalOffset;
+			Vert.PointWorld += FPOffsets.WorldOffset;
+		}
+	#endif // SUPPORT_FIRST_PERSON_RENDERING
+		
+		Vert.PointClip = mul(float4(Vert.PointWorld, 1), Transforms.TranslatedWorldToClip);
+
+	#if NUM_TEX_COORD_INTERPOLATORS
+		GetMaterialCustomizedUVs(VertexParameters, Vert.CustomizedUVs);
+		GetCustomInterpolators(VertexParameters, Vert.CustomizedUVs);
+	#endif
+	}
+	else
+#endif // USES WORLD_POSITION_OFFSET
+	{
+		FMaterialVertexParameters VertexParameters = MakeInitializedMaterialVertexParameters();
+		SetVertexParameterInstanceData(VertexParameters, InstanceData, PrimitiveData, false /* WPO */);
+		SetVertexParameterAttributeData(VertexParameters, InVert, Transforms.LocalToTranslatedWorld, Transforms.LocalToWorldNoScale, false /*bUsePrevPosition*/);
+
+	#if ENABLE_NEW_HLSL_GENERATOR && ((NANITE_VERTEX_PROGRAMMABLE && SUPPORT_FIRST_PERSON_RENDERING) || NUM_TEX_COORD_INTERPOLATORS)
+		EvaluateVertexMaterialAttributes(VertexParameters);
+	#endif
+
+		Vert.PointPostDeform = InVert.Position;
+		Vert.PrevPointPostDeform = InVert.PrevPosition;
+		Vert.PointWorld = VertexParameters.WorldPosition;
+		Vert.PointWorld_NoOffset = VertexParameters.WorldPosition;
+		
+	#if SUPPORT_FIRST_PERSON_RENDERING
+		BRANCH
+		if (bIsFirstPerson)
+		{
+			FMaterialVertexParameters PrevVertexParameters = MakeInitializedMaterialVertexParameters();
+			SetVertexParameterInstanceData(PrevVertexParameters, InstanceData, PrimitiveData, false /* WPO */);
+			SetVertexParameterAttributeData(PrevVertexParameters, InVert, Transforms.PrevLocalToTranslatedWorld, Transforms.PrevLocalToWorldNoScale, true /*bUsePrevPosition*/);
+		#if ENABLE_NEW_HLSL_GENERATOR && NANITE_VERTEX_PROGRAMMABLE
+			EvaluateVertexMaterialAttributes(PrevVertexParameters);
+		#endif
+
+			const FNaniteFirstPersonOffsets FPOffsets = GetNaniteFirstPersonOffsets(Transforms, VertexParameters, /*WorldPositionOffset*/ 0.0f, PrevVertexParameters, /*PrevWorldPositionOffset*/ 0.0f);
+			Vert.PointPostDeform += FPOffsets.LocalOffset;
+			Vert.PrevPointPostDeform += FPOffsets.PrevLocalOffset;
+			Vert.PointWorld += FPOffsets.WorldOffset;
+		}
+	#endif // SUPPORT_FIRST_PERSON_RENDERING
+		
+		Vert.PointClip = mul(float4(Vert.PointWorld, 1), Transforms.TranslatedWorldToClip);
+
+	#if NUM_TEX_COORD_INTERPOLATORS
+		GetMaterialCustomizedUVs(VertexParameters, Vert.CustomizedUVs);
+		GetCustomInterpolators(VertexParameters, Vert.CustomizedUVs);
+	#endif
+	}
+
+	return Vert;
+}
+
+FNaniteTransformedVert FetchTransformedNaniteVertex(
+	FPrimitiveSceneData PrimitiveData,
+	FInstanceSceneData InstanceData,
+	FInstanceViewData InstanceViewData,
+	FNaniteVertTransforms Transforms,
+	FCluster Cluster,
+	FVisibleCluster VisibleCluster,
+	uint VertIndex,
+	bool bEvaluateWPO)
+{
+	FNanitePostDeformVertex Vert = FetchAndDeformLocalNaniteVertex(PrimitiveData, InstanceData, InstanceViewData, Cluster, VisibleCluster, VertIndex, NANITE_NUM_TEXCOORDS_TO_DECODE);
+	return TransformNaniteVertex(PrimitiveData, InstanceData, Transforms, Vert, bEvaluateWPO);
+}
+
+HLSL_STATIC_ASSERT(sizeof(FNaniteTransformedVert) == (144 + 8 * NUM_TEX_COORD_INTERPOLATORS), "Unexpected size of FNaniteTransformedVert. WaveReadLaneAt implementation needs to be updated.");
+FNaniteTransformedVert WaveReadLaneAt(FNaniteTransformedVert Vert, uint SrcIndex)
+{
+	FNaniteTransformedVert Result;
+
+	Result.VertIndex			= WaveReadLaneAt( Vert.VertIndex,			SrcIndex );
+	Result.PointLocal			= WaveReadLaneAt( Vert.PointLocal,			SrcIndex );
+	Result.PointPostDeform		= WaveReadLaneAt( Vert.PointPostDeform,		SrcIndex );
+	Result.PrevPointPostDeform	= WaveReadLaneAt( Vert.PrevPointPostDeform,	SrcIndex );
+	Result.PointWorld			= WaveReadLaneAt( Vert.PointWorld,			SrcIndex );
+	Result.PointWorld_NoOffset	= WaveReadLaneAt( Vert.PointWorld_NoOffset,	SrcIndex );
+	Result.PointClip			= WaveReadLaneAt( Vert.PointClip,			SrcIndex );
+	Result.SplineDist			= WaveReadLaneAt( Vert.SplineDist,			SrcIndex );
+	Result.TangentBasis			= WaveReadLaneAt( Vert.TangentBasis,		SrcIndex );
+	Result.NormalClip			= WaveReadLaneAt( Vert.NormalClip,			SrcIndex );
+	Result.Color				= WaveReadLaneAt( Vert.Color,				SrcIndex );
+#if NUM_TEX_COORD_INTERPOLATORS
+	UNROLL
+	for (uint i = 0; i < NUM_TEX_COORD_INTERPOLATORS; ++i)
+	{
+		Result.CustomizedUVs[i] = WaveReadLaneAt(Vert.CustomizedUVs[i], SrcIndex);
+	}
+#endif
+	
+	return Result;
+}
+
+struct FNanitePixelAttributes
+{
+	TDual< float3 > PointWorld;
+	TDual< float3 > PointWorld_NoOffset;
+	TDual< float3 > PrevPointPostDeform;
+	TDual< float4 > PointClip;
+	
+	TDual< half3 > 	TangentZ;
+
+	/** Interpolated vertex color, in linear color space. */
+	TDual< float4 >	Color;
+
+#if NUM_TEX_COORD_INTERPOLATORS 
+	TDual< float2 >	TexCoords[NUM_TEX_COORD_INTERPOLATORS];
+#endif
+
+	/** Orthonormal rotation-only transform from tangent space to world space. */
+	half3x3 TangentToWorld;
+
+	half UnMirrored;
+};
+
+FNanitePixelAttributes GetPixelAttributes(
+	FInstanceSceneData InstanceData,
+	FCluster Cluster,
+	FNaniteVertTransforms Transforms,
+	FNaniteTransformedVert Verts[1],
+	FBarycentrics Barycentrics
+)
+{
+	FNanitePixelAttributes PixelAttributes = (FNanitePixelAttributes)0;
+
+	// Decode vertex color
+	PixelAttributes.Color.Value					= Verts[0].Color;
+	
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < NUM_TEX_COORD_INTERPOLATORS; ++TexCoordIndex)
+	{		
+		PixelAttributes.TexCoords[TexCoordIndex].Value = Verts[0].CustomizedUVs[TexCoordIndex];
+	}
+#endif
+	PixelAttributes.PointWorld.Value			= Verts[0].PointWorld;
+	PixelAttributes.PointWorld_NoOffset.Value 	= Verts[0].PointWorld_NoOffset;
+	PixelAttributes.PrevPointPostDeform.Value 	= Verts[0].PrevPointPostDeform;
+	PixelAttributes.PointClip.Value				= Verts[0].PointClip;
+
+	PixelAttributes.TangentZ.Value				= Verts[0].TangentBasis.TangentZ;
+
+	const float4 TangentXAndSign				= Verts[0].TangentBasis.TangentXAndSign;
+
+	float3x3 TangentToLocal						= NaniteTangentToLocal( TangentXAndSign, PixelAttributes.TangentZ.Value );
+	PixelAttributes.UnMirrored					= TangentXAndSign.w;
+
+	PixelAttributes.TangentToWorld				= mul( TangentToLocal, Transforms.LocalToWorldNoScale );
+	
+	return PixelAttributes;
+}
+
+
+FNanitePixelAttributes GetPixelAttributes(
+	FInstanceSceneData InstanceData,
+	FCluster Cluster,
+	FNaniteVertTransforms Transforms,
+	FNaniteTransformedVert Verts[3],
+	FBarycentrics Barycentrics
+)
+{
+	FNanitePixelAttributes PixelAttributes = (FNanitePixelAttributes)0;
+
+	// Decode vertex color
+	if (Cluster.ColorMode == NANITE_VERTEX_COLOR_MODE_VARIABLE)
+	{
+		PixelAttributes.Color			= Lerp( Verts[0].Color, Verts[1].Color, Verts[2].Color, Barycentrics );
+	}
+	else
+	{
+		PixelAttributes.Color.Value		= Verts[0].Color;
+	}
+
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < NUM_TEX_COORD_INTERPOLATORS; ++TexCoordIndex)
+	{		
+		PixelAttributes.TexCoords[TexCoordIndex] = Lerp( Verts[0].CustomizedUVs[TexCoordIndex], Verts[1].CustomizedUVs[TexCoordIndex], Verts[2].CustomizedUVs[TexCoordIndex], Barycentrics );
+	}
+#endif
+	PixelAttributes.PointWorld			= Lerp( Verts[0].PointWorld, Verts[1].PointWorld, Verts[2].PointWorld, Barycentrics );
+	PixelAttributes.PointWorld_NoOffset	= Lerp( Verts[0].PointWorld_NoOffset, Verts[1].PointWorld_NoOffset, Verts[2].PointWorld_NoOffset, Barycentrics );
+	PixelAttributes.PrevPointPostDeform	= Lerp( Verts[0].PrevPointPostDeform, Verts[1].PrevPointPostDeform, Verts[2].PrevPointPostDeform, Barycentrics );
+	PixelAttributes.PointClip			= Lerp( Verts[0].PointClip, Verts[1].PointClip, Verts[2].PointClip, Barycentrics );
+	PixelAttributes.TangentZ			= Lerp( Verts[0].TangentBasis.TangentZ, Verts[1].TangentBasis.TangentZ, Verts[2].TangentBasis.TangentZ, Barycentrics );
+	
+	const float4 TangentXAndSign		= Lerp( Verts[0].TangentBasis.TangentXAndSign, Verts[1].TangentBasis.TangentXAndSign, Verts[2].TangentBasis.TangentXAndSign, Barycentrics ).Value;
+
+	float3x3 TangentToLocal				= NaniteTangentToLocal( TangentXAndSign, PixelAttributes.TangentZ.Value );
+	PixelAttributes.UnMirrored			= TangentXAndSign.w;
+
+	PixelAttributes.TangentToWorld		= mul( TangentToLocal, Transforms.LocalToWorldNoScale );
+	
+	return PixelAttributes;
+}
+
+float GetNaniteVoxelTwoSidedSign(FInstanceSceneData InstanceData, FNaniteView NaniteView, FNaniteTransformedVert Vert)
+{
+	// VOXELTODO
+	// Hack to determine TwoSidedSign from normals for voxel. Doesn't work well with trees that bend normals for shading
+	const float3 WorldNormal = mul(Vert.TangentBasis.TangentZ, DFToFloat3x3(InstanceData.LocalToWorld));
+	float Dot = dot(WorldNormal, NaniteView.ViewForward);
+
+	//return Dot < 0.0 ? -1.0f : 1.0f;
+	return 1.0f;
+}
+
+float GetNaniteTwoSidedSign(FInstanceSceneData InstanceData, FNaniteView NaniteView, FCluster Cluster, FBarycentrics Barycentrics, FNaniteTransformedVert Verts[1])
+{
+	// Assume voxel
+	return GetNaniteVoxelTwoSidedSign(InstanceData, NaniteView, Verts[0]);
+}
+
+float GetNaniteTwoSidedSign(FInstanceSceneData InstanceData, FNaniteView NaniteView, FCluster Cluster, FBarycentrics Barycentrics, FNaniteTransformedVert Verts[3])
+{
+	if (Cluster.bVoxel)
+	{
+		return GetNaniteVoxelTwoSidedSign(InstanceData, NaniteView, Verts[0]);
+	}
+	else
+	{
+		// TODO: FIXME: using barycentric derivs here causes issues with tessellation
+	#if USES_DISPLACEMENT
+		const float SignTest = dot(cross(Verts[1].PointClip.xyw - Verts[0].PointClip.xyw, Verts[2].PointClip.xyw - Verts[0].PointClip.xyw), Verts[0].PointClip.xyw);
+	#else
+		const float SignTest = Barycentrics.Value_dx.y * Barycentrics.Value_dy.x - Barycentrics.Value_dx.x * Barycentrics.Value_dy.y;
+	#endif
+		return SignTest < 0.0f ? -1.0f : 1.0f;
+	}
+}
+
+template<uint N>
+FMaterialPixelParameters FetchNaniteMaterialPixelParameters(
+	FPrimitiveSceneData PrimitiveData,
+	FInstanceSceneData InstanceData,
+	FInstanceDynamicData InstanceDynamicData,
+	FNaniteVertTransforms Transforms,
+	FNaniteView NaniteView,
+	FNaniteTransformedVert Verts[N],
+	FCluster Cluster,
+	FBarycentrics Barycentrics,
+	inout FVertexFactoryInterpolantsVSToPS Interpolants,
+	inout float4 SvPosition)
+{
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+
+	Result.TwoSidedSign 	= GetNaniteTwoSidedSign(InstanceData, NaniteView, Cluster, Barycentrics, Verts);
+
+	FNanitePixelAttributes PixelAttributes = GetPixelAttributes(InstanceData, Cluster, Transforms, Verts, Barycentrics);
+	
+#if INTERPOLATE_VERTEX_COLOR
+	Result.VertexColor		= PixelAttributes.Color.Value;
+	Result.VertexColor_DDX	= PixelAttributes.Color.Value_dx;
+	Result.VertexColor_DDY	= PixelAttributes.Color.Value_dy;
+#else
+	// Coerce compiler into DCE as much code as possible.
+	Result.VertexColor = float4(1, 1, 1, 1);
+	Result.VertexColor_DDX = 0.0f;
+	Result.VertexColor_DDY = 0.0f;
+#endif
+
+	Result.TangentToWorld = PixelAttributes.TangentToWorld;
+	Result.UnMirrored = PixelAttributes.UnMirrored;
+
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+	UNROLL
+	for (uint TexCoordIndex = 0; TexCoordIndex < NUM_TEX_COORD_INTERPOLATORS; TexCoordIndex++)
+	{
+		TDual< float2 > TexCoord = PixelAttributes.TexCoords[TexCoordIndex];
+		
+		Result.TexCoords[TexCoordIndex]		= TexCoord.Value;
+		Result.TexCoords_DDX[TexCoordIndex]	= TexCoord.Value_dx;
+		Result.TexCoords_DDY[TexCoordIndex]	= TexCoord.Value_dy;
+	}
+#endif
+
+	TDual<float3> PointWorld = PixelAttributes.PointWorld;
+
+	Result.WorldPosition_CamRelative	= PointWorld.Value;
+	Result.WorldPosition_DDX			= PointWorld.Value_dx;
+	Result.WorldPosition_DDY			= PointWorld.Value_dy;
+
+#if !MATERIAL_CACHE
+	// VOXELTODO Fix PointWorld properly.
+	// TODO PixelTranslatedWorld is already calculated outside this function.
+	const float4 PixelTranslatedWorld = mul( float4( SvPosition.xyz, 1.0f ), NaniteView.SVPositionToTranslatedWorld );
+	Result.WorldPosition_CamRelative = PixelTranslatedWorld.xyz / PixelTranslatedWorld.w;
+#endif // MATERIAL_CACHE
+
+	Result.WorldGeoNormal_DDX	= mul(PixelAttributes.TangentZ.Value_dx, Transforms.LocalToWorldNoScale);
+	Result.WorldGeoNormal_DDY	= mul(PixelAttributes.TangentZ.Value_dy, Transforms.LocalToWorldNoScale);
+
+	Result.WorldPosition_NoOffsets_CamRelative = PixelAttributes.PointWorld_NoOffset.Value;
+
+	float3 PrevPointPostDeform = PixelAttributes.PrevPointPostDeform.Value;
+	
+	float3 PrevPointWorld = mul(float4(PrevPointPostDeform.xyz, 1), InstanceDynamicData.PrevLocalToTranslatedWorld).xyz;
+#if USES_DISPLACEMENT && !MATERIAL_CACHE
+	{
+		// TODO GetMaterialPreviousDisplacementScaled so that dynamic displacement gets velocities.
+		const float3 Displacement = PixelTranslatedWorld.xyz / PixelTranslatedWorld.w - PointWorld.Value;
+		PrevPointWorld += Displacement;
+	}
+#endif
+
+	Result.PrevScreenPosition = mul(float4(PrevPointWorld, 1), NaniteView.PrevTranslatedWorldToClip);
+	Result.NormalDistribution = PixelAttributes.TangentToWorld[2];
+
+	if( Cluster.bVoxel )
+	{
+		const float3 V = -normalize( Result.WorldPosition_CamRelative );
+
+		if( NANITE_USE_ANALYTIC_SGGX )
+		{
+			half NoV = dot( Result.NormalDistribution, V );
+			Result.NormalDistribution *= ( NoV >= 0 ? 1 : -1 ) * ( 1 - 2 * PixelAttributes.Color.Value.a );
+		}
+
+		float3 Alpha = 1;
+		if( PixelAttributes.Color.Value.a > 0.5 )
+			Alpha.z = 2 - 2 * PixelAttributes.Color.Value.a;
+		else
+			Alpha.xy = 2 * PixelAttributes.Color.Value.a;
+
+		const float2 Noise = Rand3DPCG16( int3( SvPosition.xy, View.StateFrameIndex ) ).xy / 65535.0;
+
+		float3 TangentV = mul( PixelAttributes.TangentToWorld, V );
+		float3 TangentN = SGGX_DvisSample( Noise, Alpha, TangentV ).xyz;
+		float3 WorldNormal = mul( TangentN, PixelAttributes.TangentToWorld );
+
+		Result.TangentToWorld = GetTangentBasis( WorldNormal );
+	}
+
+	// Update screen W and all screen derivatives. This is rarely used and will be dead code eliminated most of the time.
+	{
+		TDual< float4 > PointClip = PixelAttributes.PointClip;
+		SvPosition.w = PointClip.Value.w;
+
+		float2 Z_DDX_DDY = float2( PointClip.Value_dx.z, PointClip.Value_dy.z );
+		float2 W_DDX_DDY = float2( PointClip.Value_dx.w, PointClip.Value_dy.w );
+
+		// PPZ = Z / W
+		// PPZ' = (Z'W - ZW')/W^2
+		float2 PPZ_DDX_DDY = (Z_DDX_DDY * PointClip.Value.w - PointClip.Value.z * W_DDX_DDY) / (PointClip.Value.w * PointClip.Value.w);
+		SvPositionToResolvedScreenPositionDeriv(SvPosition, PPZ_DDX_DDY, W_DDX_DDY, Result.ScreenPosition, Result.ScreenPosition_DDX, Result.ScreenPosition_DDY);
+	}
+	
+#if USE_PARTICLE_SUBUVS && NUM_TEX_COORD_INTERPOLATORS > 0
+	// Output TexCoord0 for when previewing materials that use ParticleSubUV.
+	Result.Particle.SubUVCoords[0] = Result.TexCoords[0];
+	Result.Particle.SubUVCoords[1] = Result.TexCoords[0];
+#endif
+
+	// Required for previewing materials that use ParticleColor
+	Result.Particle.Color = half4(1, 1, 1, 1);
+
+	Result.PerInstanceRandom = InstanceData.RandomID;
+
+#if NEEDS_LIGHTMAP_COORDINATE
+	const uint LightMapDataIndex = PrimitiveData.LightmapDataIndex;
+	const uint LightMapUVIndex   = PrimitiveData.LightmapUVIndex;
+
+	TDual< float2 > LightMapCoordinateInput;
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+	if (LightMapUVIndex < NUM_TEX_COORD_INTERPOLATORS)
+	{
+		LightMapCoordinateInput = PixelAttributes.TexCoords[LightMapUVIndex];
+	}
+	else
+#endif
+	{
+		// We don't already have the UV in the attribute data, so retrieve it
+		LightMapCoordinateInput	 = GetTexCoord(Cluster, uint3(Verts[0].VertIndex, Verts[1].VertIndex, Verts[2].VertIndex), Barycentrics, LightMapUVIndex);
+	}
+
+	const bool bHasPerInstanceCoordinateScaleBias = (InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_LIGHTSHADOW_UV_BIAS);
+
+	const float4 LightMapCoordinateScaleBias = GetLightmapData(LightMapDataIndex).LightMapCoordinateScaleBias;
+	const float2 InstanceLightMapScaleBias = CondMask(bHasPerInstanceCoordinateScaleBias, InstanceData.LightMapAndShadowMapUVBias.xy, LightMapCoordinateScaleBias.zw);
+
+	// TODO: Figure out why LightMapCoordinateInput * LightMapCoordinateScaleBias.xy + InstanceLightMapScaleBias fails to compile
+	TDual< float2 > LightMapCoordinate = LightMapCoordinateInput;
+	LightMapCoordinate.Value *= LightMapCoordinateScaleBias.xy;
+	LightMapCoordinate.Value_dx *= LightMapCoordinateScaleBias.xy;
+	LightMapCoordinate.Value_dy *= LightMapCoordinateScaleBias.xy;
+	LightMapCoordinate.Value += InstanceLightMapScaleBias;
+
+	TDual< float2 > ShadowMapCoordinate = (TDual< float2 >)0;
+#if STATICLIGHTING_TEXTUREMASK
+	const float4 ShadowMapCoordinateScaleBias = GetLightmapData(LightMapDataIndex).ShadowMapCoordinateScaleBias;
+	const float2 InstanceShadowMapScaleBias = CondMask(bHasPerInstanceCoordinateScaleBias, InstanceData.LightMapAndShadowMapUVBias.zw, ShadowMapCoordinateScaleBias.zw);
+
+	// TODO: Figure out why LightMapCoordinateInput * ShadowMapCoordinateScaleBias.xy + InstanceShadowMapScaleBias fails to compile
+	ShadowMapCoordinate = LightMapCoordinateInput;
+	ShadowMapCoordinate.Value *= ShadowMapCoordinateScaleBias.xy;
+	ShadowMapCoordinate.Value_dx *= ShadowMapCoordinateScaleBias.xy;
+	ShadowMapCoordinate.Value_dy *= ShadowMapCoordinateScaleBias.xy;
+	ShadowMapCoordinate.Value += InstanceShadowMapScaleBias;
+#endif
+
+#if LIGHTMAP_UV_ACCESS
+	// Store unscaled/unbiased lightmap UVs
+	Result.LightmapUVs		= LightMapCoordinateInput.Value;
+	Result.LightmapUVs_DDX	= LightMapCoordinateInput.Value_dx;
+	Result.LightmapUVs_DDY	= LightMapCoordinateInput.Value_dy;
+#endif
+
+	SetLightMapCoordinate(Interpolants, LightMapCoordinate, ShadowMapCoordinate);
+	SetLightMapDataIndex(Interpolants, LightMapDataIndex);
+
+#endif // NEEDS_LIGHTMAP_COORDINATE
+
+#if USES_PER_INSTANCE_CUSTOM_DATA
+	Result.CustomDataOffset = InstanceData.CustomDataOffset;
+	Result.CustomDataCount  = InstanceData.CustomDataCount;
+#endif
+
+#if HAS_INSTANCE_LOCAL_TO_WORLD_PS
+	Result.InstanceLocalToWorld = InstanceData.LocalToWorld;
+#endif
+#if HAS_INSTANCE_WORLD_TO_LOCAL_PS
+	Result.InstanceWorldToLocal = InstanceData.WorldToLocal;
+#endif
+
+	Result.PrimitiveId  = InstanceData.PrimitiveId;
+	Result.InstanceId   = InstanceData.RelativeId;
+
+	return Result;
+}
+
+FBarycentrics CalculateBarycentrics(
+	FNaniteView NaniteView,
+	FInstanceSceneData InstanceData,
+	FCluster Cluster,
+	FNaniteTransformedVert Verts[1],
+	float4 SvPosition)
+{
+	FBarycentrics Barycentrics;
+	Barycentrics.Value = float3(1, 0, 0);
+	Barycentrics.Value_dx = 0.0f;
+	Barycentrics.Value_dy = 0.0f;
+	return Barycentrics;
+}
+
+FBarycentrics CalculateBarycentrics(
+	FNaniteView NaniteView,
+	FInstanceSceneData InstanceData,
+	FCluster Cluster,
+	FNaniteTransformedVert Verts[3],
+	float4 SvPosition)
+{
+	FBarycentrics Barycentrics;
+
+	if (!Cluster.bVoxel)
+	{
+		// Calculate perspective correct barycentric coordinates with screen derivatives
+		const float2 PixelClip = (SvPosition.xy - NaniteView.ViewRect.xy) * NaniteView.ViewSizeAndInvSize.zw * float2(2, -2) + float2(-1, 1);
+
+	#if USES_DISPLACEMENT && !MATERIAL_CACHE
+		float4x4 TranslatedWorldToLocal = DFFastToTranslatedWorld(InstanceData.WorldToLocal, NaniteView.PreViewTranslation);
+		float3 CameraLocal = TranslatedWorldToLocal[3].xyz;
+
+		float4 PixelTranslatedWorld		= mul(float4(SvPosition.xyz, 1.0f), NaniteView.SVPositionToTranslatedWorld);
+		float4 PixelTranslatedWorld_dx	= mul(float4(1, 0, 0, 0), NaniteView.SVPositionToTranslatedWorld);
+		float4 PixelTranslatedWorld_dy	= mul(float4(0, 1, 0, 0), NaniteView.SVPositionToTranslatedWorld);
+
+		float4 PixelLocal		= mul(PixelTranslatedWorld, TranslatedWorldToLocal);
+		float4 PixelLocal_dx	= mul(PixelTranslatedWorld_dx, TranslatedWorldToLocal);
+		float4 PixelLocal_dy	= mul(PixelTranslatedWorld_dy, TranslatedWorldToLocal);
+
+		Barycentrics = CalculateTriangleBarycentrics(
+			CameraLocal,
+			PixelLocal.xyz / PixelLocal.w,
+			(PixelLocal.xyz + PixelLocal_dx.xyz) / PixelLocal.w,
+			(PixelLocal.xyz + PixelLocal_dy.xyz) / PixelLocal.w,
+			Verts[0].PointPostDeform,
+			Verts[1].PointPostDeform,
+			Verts[2].PointPostDeform,
+			Verts[0].TangentBasis.TangentZ,
+			Verts[1].TangentBasis.TangentZ,
+			Verts[2].TangentBasis.TangentZ);
+	#else
+		Barycentrics = CalculateTriangleBarycentrics(PixelClip, Verts[0].PointClip, Verts[1].PointClip, Verts[2].PointClip, NaniteView.ViewSizeAndInvSize.zw);
+	#endif
+		return Barycentrics;
+	}
+	else
+	{
+		Barycentrics.Value = float3(1,0,0);
+		Barycentrics.Value_dx = 0.0f;
+		Barycentrics.Value_dy = 0.0f;
+		return Barycentrics;
+	}
+}
+
+
+template<uint N>
+FMaterialPixelParameters FetchNaniteMaterialPixelParameters_Inner(
+	FNaniteView NaniteView,
+	FCluster Cluster,
+	FVisibleCluster VisibleCluster,
+	FBarycentrics Barycentrics,
+	uint TriIndex,
+	bool bCalcBarycentrics,
+	uint3 TriIndices,
+	bool bCalcTriIndices,
+	bool bIsImposter,
+	inout FVertexFactoryInterpolantsVSToPS Interpolants,
+	float4 SvPosition)
+{
+	FPrimitiveSceneData PrimitiveData;
+	FInstanceSceneData InstanceData;
+	GetNaniteMaterialSceneData(VisibleCluster, PrimitiveData, InstanceData);
+
+	const FInstanceViewData InstanceViewData		= GetInstanceViewData(InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId);
+	const FInstanceDynamicData InstanceDynamicData	= CalculateInstanceDynamicData(NaniteView, InstanceData);
+	
+	FMaterialPixelParameters Result;
+
+	FReconstructedVoxelData VoxelData = (FReconstructedVoxelData)0;
+
+	BRANCH
+	if( Cluster.bVoxel )
+	{
+		VoxelData = ReconstructVoxel(NaniteView, PrimitiveData, InstanceData, InstanceViewData, VisibleCluster, Cluster, SvPosition, TriIndex);
+		TriIndices = VoxelData.VertIndex;
+	}
+	else if( bCalcTriIndices )
+	{
+		TriIndices = DecodeTriangleIndices(Cluster, TriIndex);
+	}
+
+	// Don't evaluate WPO for imposter pixels or for clusters that don't have WPO enabled
+	bool bEvaluateWPO = !bIsImposter;
+#if !ALWAYS_EVALUATE_WORLD_POSITION_OFFSET
+	bEvaluateWPO &= (VisibleCluster.Flags & NANITE_CULLING_FLAG_ENABLE_WPO) != 0;
+#endif
+
+	const FNaniteVertTransforms Transforms = CalculateNaniteVertexTransforms(InstanceData, InstanceDynamicData, NaniteView);
+
+	FNaniteTransformedVert Verts[N];
+	FetchTransformedNaniteVerts<N>(NaniteView, PrimitiveData, InstanceData, InstanceViewData, Transforms, Cluster, VisibleCluster, TriIndices, VoxelData, bEvaluateWPO, Verts);
+
+	if (bCalcBarycentrics)
+	{
+		Barycentrics = CalculateBarycentrics(NaniteView, InstanceData, Cluster, Verts, SvPosition);
+	}
+
+	Result = FetchNaniteMaterialPixelParameters<N>(PrimitiveData, InstanceData, InstanceDynamicData, Transforms, NaniteView, Verts, Cluster, Barycentrics, Interpolants, SvPosition);
+
+	if( Cluster.bVoxel )
+	{
+		float Depth = NaniteView.ViewToClip[3][2] / ( SvPosition.z - NaniteView.ViewToClip[2][2] );
+
+		// TODO: Should we explicitly take voxel size / sampling rate into account ?
+		const bool bOrtho = NaniteView.ViewToClip[3][3] >= 1;
+		const float ViewToPixels = NaniteView.ViewToClip[1][1] * NaniteView.ViewSizeAndInvSize.y * 0.5f;
+		const float dViewPos_dXY = ( bOrtho ? 1.0f : Depth ) / ViewToPixels;
+			
+		// DDX and DDY should be orthogonal to behave nicely with anisotropic filtering.
+		// We have no direction information, so for now just use some orthogonal basis that is unlikely to be aligned with any projection the material shader might do.
+		Result.WorldPosition_DDX = float3(0.766585, -0.240119, -0.595559) * dViewPos_dXY;
+		Result.WorldPosition_DDY = float3(0.230514, -0.762736, 0.604233) * dViewPos_dXY;
+
+#if NUM_TEX_COORD_INTERPOLATORS > 0
+		const float4 UVDensities = GetMaterialUVDensities(Cluster, InstanceData.PrimitiveId, TriIndex);
+
+		UNROLL
+		for (uint TexCoordIndex = 0; TexCoordIndex < NUM_TEX_COORD_INTERPOLATORS; TexCoordIndex++)
+		{
+			const float UVDensity = UVDensities[TexCoordIndex] != 0.0f ? UVDensities[TexCoordIndex] : 20.0f; //VOXELTODO: UVDensity can be 0, because of broken fallback meshes. Just assume some semi-reasonable number until that gets fixed.
+			float dUV_dXY = dViewPos_dXY / ( UVDensity * InstanceData.NonUniformScale.w ) * ( 1.0f / sqrt( 2.0f ) );
+				
+			dUV_dXY = min( dUV_dXY, 0.125f );	// VOXELTODO: Clamp to avoid some VT Aniso artifacts as a temporary workaround
+				
+			Result.TexCoords_DDX[TexCoordIndex] = float2( dUV_dXY, dUV_dXY );
+			Result.TexCoords_DDY[TexCoordIndex] = float2(-dUV_dXY, dUV_dXY );
+		}
+#endif
+	}
+	return Result;
+}
+
+// Shared function (for Nanite raster and shading passes) to fetch a valid FMaterialPixelParameters struct, which is used by material inputs.
+FMaterialPixelParameters FetchNaniteMaterialPixelParameters(FNaniteView NaniteView, UlongType PackedPixel, bool bHasPageData, FBarycentrics Barycentrics, bool bCalcBarycentrics, uint3 TriIndices, bool bCalcTriIndices, inout FVertexFactoryInterpolantsVSToPS Interpolants, inout float4 SvPosition)
+{
+	FMaterialPixelParameters Result = MakeInitializedMaterialPixelParameters();
+
+	uint DepthInt = 0;
+	uint VisibleClusterIndex = 0;
+	uint TriIndex = 0;
+	bool bIsImposter = false;
+	UnpackVisPixel(PackedPixel, DepthInt, VisibleClusterIndex, TriIndex, bIsImposter);
+
+	// Update to real depth from VisBuffer
+	SvPosition.z = asfloat(DepthInt);
+
+	if (VisibleClusterIndex != 0xFFFFFFFFu)
+	{
+#if VIRTUAL_TEXTURE_TARGET
+		FVisibleCluster VisibleCluster          = GetVisibleCluster( VisibleClusterIndex, VIRTUAL_TEXTURE_TARGET );
+#else
+		FVisibleCluster VisibleCluster          = GetVisibleCluster( VisibleClusterIndex );
+#endif
+		FCluster Cluster						= GetCluster( VisibleCluster.PageIndex, VisibleCluster.ClusterIndex );
+
+	#if NANITE_SHADING_PASS_FORCE_VOXELS
+		Cluster.bVoxel = true;
+		Result = FetchNaniteMaterialPixelParameters_Inner<1>(NaniteView, Cluster, VisibleCluster, Barycentrics, TriIndex, bCalcBarycentrics, TriIndices, bCalcTriIndices, bIsImposter, Interpolants, SvPosition);
+	#elif NANITE_SHADING_PASS_FORCE_TRIANGLES
+		Cluster.bVoxel = false;
+		Result = FetchNaniteMaterialPixelParameters_Inner<3>(NaniteView, Cluster, VisibleCluster, Barycentrics, TriIndex, bCalcBarycentrics, TriIndices, bCalcTriIndices, bIsImposter, Interpolants, SvPosition);
+	#else
+		// Voxels and Triangles in same permutation. Used by Lumen.
+		Result = FetchNaniteMaterialPixelParameters_Inner<3>(NaniteView, Cluster, VisibleCluster, Barycentrics, TriIndex, bCalcBarycentrics, TriIndices, bCalcTriIndices, bIsImposter, Interpolants, SvPosition);
+	#endif
+
+	}
+
+	return Result;
+}
+
+#if IS_NANITE_SHADING_PASS
+
+#if NANITE_USE_HW_BARYCENTRICS
+#error NOT_SUPPORTED
+#endif
+
+/** Converts from vertex factory specific interpolants to a FMaterialPixelParameters, which is used by material inputs. */
+FMaterialPixelParameters GetMaterialPixelParameters(FNaniteView NaniteView, inout FVertexFactoryInterpolantsVSToPS Interpolants, inout float4 SvPosition)
+{
+	UlongType PackedPixel = (UlongType)0;
+	// Note: because of quad shading the CS shading can produce OOB pixels that need to return a safe value (0 translates into an invalid visible cluster ID which will skip most of the work)
+	if(all(Interpolants.PixelPos >= NaniteView.ViewRect.xy) && all(Interpolants.PixelPos < NaniteView.ViewRect.zw))
+	{
+		PackedPixel = NaniteShading.VisBuffer64[Interpolants.PixelPos];
+	}
+	
+	const FBarycentrics Barycentrics = (FBarycentrics)0; // Unused for shading pass (barycentrics are invalid here for full screen tile grid)
+	return FetchNaniteMaterialPixelParameters(NaniteView, PackedPixel, VIRTUAL_TEXTURE_TARGET, Barycentrics, true, uint3(0,0,0), true, Interpolants, SvPosition);
+}
+
+FMaterialPixelParameters GetMaterialPixelParameters(inout FVertexFactoryInterpolantsVSToPS Interpolants, inout float4 SvPosition)
+{
+#if INSTANCED_STEREO
+	const FNaniteView NaniteView = GetNaniteView(Interpolants.EyeIndex);
+#else
+	const FNaniteView NaniteView = GetNaniteView(0);
+#endif
+	return GetMaterialPixelParameters(NaniteView, Interpolants, SvPosition);
+}
+
+#endif // IS_NANITE_SHADING_PASS
+
+#if RAYHITGROUPSHADER
+
+struct FVertexFactoryInput
+{
+	// Dynamic instancing related attributes with InstanceIdOffset : ATTRIBUTE13
+	VF_GPUSCENE_DECLARE_INPUT_BLOCK(13)
+};
+
+////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Material evaluation for raytracing
+
+// define this to let shaders know this alternative method is available
+#define VF_SUPPORTS_RAYTRACING_PREPARE_MATERIAL_PIXEL_PARAMETERS 1
+
+FMaterialPixelParameters GetMaterialPixelParameters(float3 RayOrigin, float3 RayDirection, float HitT, uint HitPrimitiveIndex, FRayTracingIntersectionAttributes HitAttributes, uint HitKind, float4 SvPosition, out float3 WorldGeoNormal)
+{
+#if VF_USE_PRIMITIVE_SCENE_DATA
+	const uint GPUSceneInstanceId = GetInstanceUserData();
+	const FInstanceSceneData InstanceSceneData = GetInstanceSceneData(GPUSceneInstanceId);
+
+	FVertexFactoryInput Input = (FVertexFactoryInput)0;
+	VF_GPUSCENE_SET_INPUT_FOR_RT(Input, GPUSceneInstanceId, InstanceSceneData.RelativeId);
+#else
+	#error "HGS requires GPU Scene support"
+#endif // VF_USE_PRIMITIVE_SCENE_DATA
+
+	FSceneDataIntermediates SceneData = VF_GPUSCENE_GET_INTERMEDIATES(Input); // NOTE: Input is not used when VF_USE_PRIMITIVE_SCENE_DATA == 0
+	FInstanceSceneData InstanceData = SceneData.InstanceData;
+	FPrimitiveSceneData PrimitiveData = SceneData.Primitive;
+
+	const uint InstanceId = SceneData.InstanceId;
+
+	const uint FirstTriangle = HitGroupSystemRootConstants.FirstPrimitive;
+#if NANITE_ASSEMBLY_DATA
+	const uint2 PackedNaniteData = RayTracingDataBuffer.Load2(8u * (PrimitiveData.NaniteRayTracingDataOffset + FirstTriangle + HitPrimitiveIndex));
+	const uint PackedTriangleData = PackedNaniteData.x;
+	const uint AssemblyTransformIndex = PackedNaniteData.y;
+#else
+	const uint PackedTriangleData = RayTracingDataBuffer.Load(4u * (PrimitiveData.NaniteRayTracingDataOffset + FirstTriangle + HitPrimitiveIndex));
+	const uint AssemblyTransformIndex = NANITE_MAX_ASSEMBLY_TRANSFORMS;
+#endif
+
+	const uint PageIndex = PackedTriangleData & NANITE_MAX_GPU_PAGES_MASK;
+	const uint ClusterIndex = (PackedTriangleData >> NANITE_MAX_GPU_PAGES_BITS) & NANITE_MAX_CLUSTERS_PER_PAGE_MASK;
+	const uint TriIndex = (PackedTriangleData >> (NANITE_MAX_GPU_PAGES_BITS + NANITE_MAX_CLUSTERS_PER_PAGE_BITS)) & NANITE_MAX_CLUSTER_TRIANGLES_MASK;
+
+	const FNaniteView NaniteView = GetNaniteView(0);
+
+	FInstanceDynamicData InstanceDynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData);
+	FCluster Cluster = GetCluster(PageIndex, ClusterIndex);
+
+	// TODO: Nanite-Assemblies: No assembly support here for RT
+	FVisibleCluster VisibleCluster = (FVisibleCluster)0;
+	VisibleCluster.AssemblyTransformIndex = AssemblyTransformIndex;
+
+	const uint3 TriIndices = DecodeTriangleIndices(Cluster, TriIndex);
+	const FNaniteVertTransforms Transforms = CalculateNaniteVertexTransforms(InstanceData, InstanceDynamicData, NaniteView);
+	const bool bEvaluateWPO = false;
+
+	// VOXELTODO: No voxel support for RT
+	FNaniteTransformedVert Verts[3];
+	FetchTransformedNaniteVerts<3>(NaniteView, PrimitiveData, InstanceData, GetInstanceViewData(InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId), Transforms, Cluster, VisibleCluster, TriIndices, (FReconstructedVoxelData)0, bEvaluateWPO, Verts);
+
+	const float2 HitBarycentrics = HitAttributes.GetBarycentrics();
+
+#if USE_ANALYTIC_DERIVATIVES
+	const float2 PixelClip = (SvPosition.xy - View.ViewRectMin.xy) * View.ViewSizeAndInvSize.zw * float2(2, -2) + float2(-1, 1);
+	FBarycentrics Barycentrics = CalculateTriangleBarycentrics(PixelClip, Verts[0].PointClip, Verts[1].PointClip, Verts[2].PointClip, View.ViewSizeAndInvSize.zw);
+#else
+	FBarycentrics Barycentrics = (FBarycentrics)0;
+#endif
+	// Replace value with barycentrics from the raytracer, the function above is to make sure derivatives are populated
+	Barycentrics.Value = float3(1 - HitBarycentrics.x - HitBarycentrics.y, HitBarycentrics.x, HitBarycentrics.y);
+
+	FVertexFactoryInterpolantsVSToPS Interpolants;
+	FMaterialPixelParameters Result = FetchNaniteMaterialPixelParameters(PrimitiveData, InstanceData, InstanceDynamicData, Transforms, NaniteView, Verts, Cluster, Barycentrics, Interpolants, SvPosition);
+
+	WorldGeoNormal = normalize(cross(Verts[1].PointWorld - Verts[0].PointWorld, Verts[2].PointWorld - Verts[0].PointWorld));
+
+	Result.TwoSidedSign = -sign(dot(RayDirection, WorldGeoNormal));
+	Result.TangentToWorld[2] *= Result.TwoSidedSign;
+
+	return Result;
+}
+
+#endif // RAYHITGROUPSHADER
+
+struct FVertexFactoryRayTracingInterpolants
+{
+	FVertexFactoryInterpolantsVSToPS InterpolantsVSToPS;
+};
+
+float2 VertexFactoryGetRayTracingTextureCoordinate( FVertexFactoryRayTracingInterpolants Interpolants )
+{
+	return float2(0,0);
+}
+
+FVertexFactoryInterpolantsVSToPS VertexFactoryAssignInterpolants(FVertexFactoryRayTracingInterpolants Input)
+{
+	return Input.InterpolantsVSToPS;
+}
+
+FVertexFactoryRayTracingInterpolants VertexFactoryInterpolate(FVertexFactoryRayTracingInterpolants a, float aInterp, FVertexFactoryRayTracingInterpolants b, float bInterp)
+{
+	return a;
+}
+
+#if RAYHITGROUPSHADER
+
+// Fake structs / functions required to compile RayTracingHitShaders.usf
+
+struct FVertexFactoryIntermediates
+{
+	half3x3 TangentToLocal;
+};
+
+FVertexFactoryInput LoadVertexFactoryInputForHGS(uint TriangleIndex, int VertexIndex)
+{
+	FVertexFactoryInput Input = (FVertexFactoryInput)0;
+	return Input;
+}
+
+FVertexFactoryIntermediates GetVertexFactoryIntermediates(FVertexFactoryInput Input)
+{
+	FVertexFactoryIntermediates Intermediates = (FVertexFactoryIntermediates)0;
+	return Intermediates;
+}
+
+half3x3 VertexFactoryGetTangentToLocal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return Intermediates.TangentToLocal;
+}
+
+float4 VertexFactoryGetWorldPosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return 0.0f;
+}
+
+float3 VertexFactoryGetWorldNormal(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return 0.0f;
+}
+
+float3 VertexFactoryGetInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return 0.0f;
+}
+
+float3 VertexFactoryGetPreviousInstanceSpacePosition(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates)
+{
+	return 0.0f;
+}
+
+FMaterialVertexParameters GetMaterialVertexParameters(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, float3 WorldPosition, half3x3 TangentToLocal, bool bIsPreviousFrame = false)
+{
+	FMaterialVertexParameters Result = MakeInitializedMaterialVertexParameters();
+	return Result;
+}
+
+FVertexFactoryRayTracingInterpolants VertexFactoryGetRayTracingInterpolants(FVertexFactoryInput Input, FVertexFactoryIntermediates Intermediates, FMaterialVertexParameters VertexParameters)
+{
+	FVertexFactoryRayTracingInterpolants Interpolants = (FVertexFactoryRayTracingInterpolants)0;
+	return Interpolants;
+}
+
+#endif

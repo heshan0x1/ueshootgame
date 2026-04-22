@@ -1,0 +1,6 @@
+LIBRARY libtcpinfo.dll
+EXPORTS
+	GetLinuxTcpInfo
+	GetCongestionAlgorithm
+	SetCongestionAlgorithm
+	GetTcpAutoTuning

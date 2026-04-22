@@ -1,0 +1,60 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/**
+ * Raw buffer: Flat list of raw bytes, read/written in uints.
+ * 
+ * No multi-data support currently. Would need software-bindless, in order to keep each buffer pure rather than adding headers.
+ */
+
+// @todo_pcg: Support having a non-RW byte address buffer for input data.
+RWByteAddressBuffer {DataInterfaceName}_Data;
+
+// Number of bytes in buffer.
+uint {DataInterfaceName}_SizeBytes;
+
+// #################### META INFO ##########################
+
+uint GetNumData_{DataInterfaceName}()
+{
+	// Multi-data not currently supported. Could be done with multiple buffers (each individual buffer should be a pure raw buffer).
+	return 1u;
+}
+
+uint GetNumElements_{DataInterfaceName}(uint InDataIndex)
+{
+	// InDataIndex unused for now as multi-data not currently supported.
+	return {DataInterfaceName}_SizeBytes >> 2;
+}
+
+// #################### ACCESSORS ##########################
+
+uint Load_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return {DataInterfaceName}_Data.Load(InElementIndex << 2);
+}
+
+uint4 Load4_{DataInterfaceName}(uint InDataIndex, uint InFirstElementIndex)
+{
+	return {DataInterfaceName}_Data.Load4(InFirstElementIndex << 2);
+}
+
+void Store_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, uint InValue)
+{
+	{DataInterfaceName}_Data.Store(InElementIndex << 2, InValue);
+}
+
+void Store4_{DataInterfaceName}(uint InDataIndex, uint InFirstElementIndex, uint4 InValue)
+{
+	{DataInterfaceName}_Data.Store4(InFirstElementIndex << 2, InValue);
+}
+
+// #################### ATOMICS ##########################
+
+// Returns value of attribute before incrementing.
+uint AtomicAdd_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, uint InValueToAdd)
+{
+	uint OriginalValue;
+	{DataInterfaceName}_Data.InterlockedAdd(InElementIndex << 2, (uint)InValueToAdd, OriginalValue);
+
+	return OriginalValue;
+}

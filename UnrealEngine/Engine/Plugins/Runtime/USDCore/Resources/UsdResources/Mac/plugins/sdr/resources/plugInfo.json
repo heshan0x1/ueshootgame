@@ -1,0 +1,21 @@
+{
+    "Plugins": [
+        {
+            "Info": {
+                "Types": {
+                    "SdrDiscoveryPlugin": {},
+                    "_SdrFilesystemDiscoveryPlugin" : {
+                        "bases": ["SdrDiscoveryPlugin"],
+                        "displayName": "Filesystem Discovery"
+                    },
+                    "SdrParserPlugin": {}
+                }
+            },
+            "LibraryPath": "../../../../../Source/ThirdParty/USD/Mac/lib/libusd_sdr.dylib", 
+            "Name": "sdr", 
+            "ResourcePath": "resources", 
+            "Root": "..", 
+            "Type": "library"
+        }
+    ]
+}

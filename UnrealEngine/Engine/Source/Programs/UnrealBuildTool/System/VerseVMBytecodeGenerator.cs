@@ -1,0 +1,1255 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using EpicGames.Core;
+using Microsoft.Extensions.Logging;
+
+namespace UnrealBuildTool
+{
+	namespace VerseVMBytecode
+	{
+		internal enum Role
+		{
+			Use,
+			Immediate,  // This means that the operand will be embedded in the bytecode itself.
+			UnifyDef,
+			ClobberDef,
+		}
+
+		internal enum Arity
+		{
+			Fixed,
+			Optional,
+			Variadic,
+		}
+
+		static class Extensions
+		{
+			public static string ToCpp(this Role TheRole)
+			{
+				switch (TheRole)
+				{
+					case Role.Use:
+						return "EOperandRole::Use";
+					case Role.Immediate:
+						return "EOperandRole::Immediate";
+					case Role.UnifyDef:
+						return "EOperandRole::UnifyDef";
+					case Role.ClobberDef:
+						return "EOperandRole::ClobberDef";
+					default:
+						break;
+				}
+				return "#error \"Unknown role.\"";
+			}
+
+			public static string DefCppType(this Argument TheArg)
+			{
+				switch (TheArg.Role)
+				{
+					case Role.Use:
+						return "FValueOperand";
+					case Role.Immediate:
+						return $"{TheArg.CppTypeName}";
+					case Role.UnifyDef:  // fallthrough
+					case Role.ClobberDef:
+						return "FRegisterIndex";
+					default:
+						throw new ArgumentException("Unknown role.");
+				}
+			}
+
+			public static string ToCpp(this bool Bool)
+			{
+				return Bool ? "true" : "false";
+			}
+
+			public static IEnumerable<T> Yield<T>(this T item)
+			{
+				yield return item;
+			}
+		}
+
+		internal class Argument
+		{
+			public string Name;
+			public Role Role;
+			public Arity Arity;
+
+			/// <summary>
+			/// If this is an immediate operand, the value will be embedded in the opcode itself.
+			/// This should be set to the the string name of the underlying operand native type.
+			/// </summary>
+			public string CppTypeName;
+
+			public Argument(string InName, Role InRole, Arity InArity, string InCppTypeName)
+			{
+				Name = InName;
+				Role = InRole;
+				Arity = InArity;
+				CppTypeName = InCppTypeName;
+			}
+		}
+
+		internal class Constant
+		{
+			public string Name;
+			public string CppType;
+			public Arity Arity;
+			public string Default;
+
+			public Constant(string InName, string InCppType, Arity InArity, string InDefault)
+			{
+				Name = InName;
+				CppType = InCppType;
+				Arity = InArity;
+				Default = InDefault;
+			}
+
+			public bool IsJump()
+			{
+				return CppType == "FLabelOffset";
+			}
+
+			public string ToCpp()
+			{
+				return CppType;
+			}
+		}
+
+		internal class Instruction
+		{
+			public string Name;
+			public List<Argument> Args = new List<Argument>();
+			public List<Constant> Consts = new List<Constant>();
+			public bool _CapturesEffectToken = false;
+			public bool _CreatesNewReturnEffectToken = false;
+			public bool _Suspends = false;
+			public bool _Jumps = false;
+
+			public Instruction(string _Name)
+			{
+				Name = _Name;
+			}
+
+			public string CppName => $"FOp{Name}";
+
+			public string CppCapturesName => $"F{Name}SuspensionCaptures";
+
+			public Instruction Arg(string InName, Role InRole, Arity InArity, string InCppTypeName)
+			{
+				Args.Add(new Argument(InName, InRole, InArity, InCppTypeName));
+				return this;
+			}
+
+			public Instruction Arg(string InName, Role InRole, Arity InArity)
+			{
+				return Arg(InName, InRole, InArity, "");
+			}
+
+			public Instruction Arg(in string InName, in Role InRole)
+			{
+				return Arg(InName, InRole, Arity.Fixed);
+			}
+
+			public Instruction Const(string Name, string CppType, Arity InArity, string Default = "")
+			{
+				Consts.Add(new Constant(Name, CppType, InArity, Default));
+				return this;
+			}
+
+			public Instruction Const(string Name, string CppType, string Default = "")
+			{
+				return Const(Name, CppType, Arity.Fixed, Default);
+			}
+
+			public Instruction Jump(string Name, Arity InArity)
+			{
+				_Jumps = true;
+				return Const(Name, "FLabelOffset", InArity);
+			}
+
+			public Instruction Jump(string Name)
+			{
+				return Jump(Name, Arity.Fixed);
+			}
+
+			public Instruction CapturesEffectToken()
+			{
+				_CapturesEffectToken = true;
+				return this;
+			}
+
+			public Instruction CreatesNewReturnEffectToken()
+			{
+				_CreatesNewReturnEffectToken = true;
+				return this;
+			}
+
+			public Instruction Suspends()
+			{
+				_Suspends = true;
+				return this;
+			}
+		}
+	}
+}
+
+namespace UnrealBuildTool
+{
+	using VerseVMBytecode;
+
+	/// <summary>
+	/// Generates bytecode and bytecode helpers for the VerseVM.
+	/// </summary>
+	public class VerseVMBytecodeGenerator
+	{
+		readonly List<Instruction> Instructions = new List<Instruction>();
+
+		Instruction Inst(string Name)
+		{
+			Instruction I = new Instruction(Name);
+			Instructions.Add(I);
+			return I;
+		}
+
+		static string Preamble()
+		{
+			StringBuilder S = new StringBuilder();
+			S.Append("// Copyright Epic Games, Inc. All Rights Reserved.\n\n");
+			S.Append("// WARNING: This code is autogenerated by VerseVMBytecodeGenerator.cs. Do not edit directly\n\n");
+			S.Append("#pragma once\n\n");
+			return S.ToString();
+		}
+
+		string EmitBytecodeMacroList()
+		{
+			StringBuilder S = new StringBuilder();
+			S.Append(Preamble());
+
+			S.Append("// IWYU pragma: private, include \"VVMBytecodeOps.h\"\n\n");
+
+			S.Append("#define VERSE_ENUM_OPS(v) \\\n");
+			foreach (Instruction Inst in Instructions)
+			{
+				S.Append($"    v({Inst.Name}) \\\n");
+			}
+			S.Append('\n');
+
+			return S.ToString();
+		}
+
+		string EmitBytecodeAndCaptureDefs()
+		{
+			StringBuilder S = new StringBuilder();
+			S.Append(Preamble());
+
+			S.Append("// IWYU pragma: private, include \"VVMBytecodesAndCaptures.h\"\n\n");
+
+			S.Append("namespace Verse {\n");
+
+			// Emit bytecode structs.
+			foreach (Instruction Inst in Instructions)
+			{
+				S.Append($"struct {Inst.CppName} : public FOp\n");
+				S.Append("{\n");
+
+				// Define fields
+				foreach (Argument Arg in Inst.Args)
+				{
+					switch (Arg.Arity)
+					{
+						case Arity.Fixed:
+						case Arity.Optional:
+							if (Arg.Role == Role.Immediate)
+							{
+								S.Append($"    TWriteBarrier<{Arg.DefCppType()}> {Arg.Name};\n");
+							}
+							else
+							{
+								S.Append($"    {Arg.DefCppType()} {Arg.Name};\n");
+							}
+							break;
+						case Arity.Variadic:
+							if (Arg.Role == Role.Immediate)
+							{
+								S.Append($"    TOperandRange<TWriteBarrier<{Arg.DefCppType()}>> {Arg.Name};\n");
+							}
+							else
+							{
+								S.Append($"    TOperandRange<{Arg.DefCppType()}> {Arg.Name};\n");
+							}
+							break;
+					}
+				}
+				foreach (Constant Const in Inst.Consts)
+				{
+					switch (Const.Arity)
+					{
+						case Arity.Fixed:
+							S.Append($"    {Const.ToCpp()} {Const.Name};\n");
+							break;
+						case Arity.Optional:
+							S.Append($"    TOptional<{Const.ToCpp()}> {Const.Name};\n");
+							break;
+						case Arity.Variadic:
+							S.Append($"    TOperandRange<{Const.ToCpp()}> {Const.Name};\n");
+							break;
+					}
+				}
+				S.Append('\n');
+
+				S.Append($"    static constexpr EOpcode StaticOpcode = EOpcode::{Inst.Name};\n");
+				S.Append($"    static constexpr bool bHasJumps = {Inst._Jumps.ToCpp()};\n\n");
+
+				// Constructor
+				bool bWriteBarrier = Inst.Args.Any(Arg => Arg.Role == Role.Immediate && Arg.Arity != Arity.Variadic);
+				IEnumerable<string> Context = bWriteBarrier ? Extensions.Yield("FAccessContext Context") : Enumerable.Empty<string>();
+				IEnumerable<string> Operands = Inst.Args.Select(Arg =>
+				{
+					switch (Arg.Arity)
+					{
+						case Arity.Fixed:
+						case Arity.Optional:
+							if (Arg.Role == Role.Immediate)
+							{
+								if (Arg.CppTypeName == "VValue")
+								{
+									return $"VValue {Arg.Name}";
+								}
+								else if (Arg.Arity == Arity.Fixed)
+								{
+									return $"{Arg.DefCppType()}& {Arg.Name}";
+								}
+								else
+								{
+									return $"{Arg.DefCppType()}* {Arg.Name}";
+								}
+							}
+							else
+							{
+								return $"{Arg.DefCppType()} {Arg.Name}";
+							}
+						case Arity.Variadic:
+							if (Arg.Role == Role.Immediate)
+							{
+								return $"TOperandRange<TWriteBarrier<{Arg.DefCppType()}>> {Arg.Name}";
+							}
+							else
+							{
+								return $"TOperandRange<{Arg.DefCppType()}> {Arg.Name}";
+							}
+						default:
+							return "UnknownArity";
+					}
+				});
+				IEnumerable<string> Constants = Inst.Consts.Select(Const =>
+				{
+					string Default = Const.Default.Length > 0 ? $" = {Const.Default}" : "";
+					switch (Const.Arity)
+					{
+						case Arity.Fixed:
+							return $"{Const.ToCpp()} {Const.Name} {Default}";
+						case Arity.Optional:
+							return $"TOptional<{Const.ToCpp()}> {Const.Name} {Default}";
+						case Arity.Variadic:
+							return $"TOperandRange<{Const.ToCpp()}> {Const.Name} {Default}";
+						default:
+							return "UnknownArity";
+					}
+				});
+				S.Append($"    {Inst.CppName}({String.Join(", ", Context.Concat(Operands).Concat(Constants))})\n");
+				S.Append("        : FOp(StaticOpcode)\n");
+				foreach (Argument Arg in Inst.Args)
+				{
+					string ContextString = (Arg.Role == Role.Immediate && Arg.Arity != Arity.Variadic) ? "Context, " : "";
+					S.Append($"        , {Arg.Name}({ContextString}{Arg.Name})\n");
+				}
+				foreach (Constant Const in Inst.Consts)
+				{
+					S.Append($"        , {Const.Name}({Const.Name})\n");
+				}
+				S.Append("    {}\n\n");
+
+				// Reflection methods
+				EmitReflectionMethods(S, Inst, false);
+				S.Append('\n');
+
+				S.Append("    template <typename FunctionType>\n");
+				S.Append("    AUTORTFM_INFER void ForEachJump(FunctionType&& Function)\n");
+				S.Append("    {\n");
+				foreach (Constant Const in Inst.Consts.Where(C => C.IsJump()))
+				{
+					S.Append($"        Function({Const.Name}, TEXT(\"{Const.Name}\"));\n");
+				}
+				S.Append("    }\n");
+
+				S.Append("};\n");
+				S.Append($"static_assert(alignof({Inst.CppName}) == OpAlignment);\n\n");
+			}
+
+			// Emit captures structs.
+			foreach (Instruction Inst in Instructions.Where(I => I._Suspends))
+			{
+				S.Append($"struct {Inst.CppCapturesName}\n");
+				S.Append("{\n");
+
+				// Generate the fields.
+				foreach (Argument Arg in Inst.Args)
+				{
+					switch (Arg.Arity)
+					{
+						case Arity.Fixed:
+						case Arity.Optional:
+							if (Arg.Role == Role.Immediate)
+							{
+								S.Append($"    TWriteBarrier<{Arg.DefCppType()}> {Arg.Name};\n");
+							}
+							else
+							{
+								S.Append($"    TWriteBarrier<VValue> {Arg.Name};  \n");
+							}
+							break;
+						case Arity.Variadic:
+							if (Arg.Role == Role.Immediate)
+							{
+								S.Append($"    TArray<TWriteBarrier<{Arg.DefCppType()}>> {Arg.Name};\n");
+							}
+							else
+							{
+								S.Append($"    TArray<TWriteBarrier<VValue>> {Arg.Name};\n");
+							}
+							break;
+					}
+				}
+				if (Inst._CapturesEffectToken)
+				{
+					S.Append($"    TWriteBarrier<VValue> EffectToken;\n");
+				}
+				if (Inst._CreatesNewReturnEffectToken)
+				{
+					S.Append($"    TWriteBarrier<VValue> ReturnEffectToken;\n");
+				}
+				foreach (Constant Const in Inst.Consts)
+				{
+					switch (Const.Arity)
+					{
+						case Arity.Fixed:
+							S.Append($"    {Const.ToCpp()} {Const.Name};\n");
+							break;
+						case Arity.Optional:
+							S.Append($"    TOptional<{Const.ToCpp()}> {Const.Name};\n");
+							break;
+						case Arity.Variadic:
+							S.Append($"    TOperandRange<{Const.ToCpp()}> {Const.Name};\n");
+							break;
+					}
+				}
+				S.Append('\n');
+
+				// Generate the constructor.
+				{
+					IEnumerable<string> Context = Extensions.Yield("FAccessContext Context");
+					IEnumerable<string> Operands = Inst.Args.Select(Arg =>
+					{
+						switch (Arg.Arity)
+						{
+							case Arity.Fixed:
+							case Arity.Optional:
+								if (Arg.Role == Role.Immediate)
+								{
+									if (Arg.CppTypeName == "VValue")
+									{
+										return $"VValue {Arg.Name}";
+									}
+									else if (Arg.Arity == Arity.Fixed)
+									{
+										return $"{Arg.DefCppType()}& {Arg.Name}";
+									}
+									else
+									{
+										return $"{Arg.DefCppType()}* {Arg.Name}";
+									}
+								}
+								else
+								{
+									return $"VValue {Arg.Name}";
+								}
+							case Arity.Variadic:
+								if (Arg.Role == Role.Immediate)
+								{
+									return $"TArray<TWriteBarrier<{Arg.DefCppType()}>>&& {Arg.Name}";
+								}
+								else
+								{
+									return $"TArray<TWriteBarrier<VValue>>&& {Arg.Name}";
+								}
+							default:
+								return $"UnknownArity {Arg.Name}";
+						}
+					});
+					IEnumerable<string> EffectToken = Inst._CapturesEffectToken ? Extensions.Yield("VValue EffectToken") : Enumerable.Empty<string>();
+					IEnumerable<string> ReturnEffectToken = Inst._CreatesNewReturnEffectToken ? Extensions.Yield("VValue ReturnEffectToken") : Enumerable.Empty<string>();
+					IEnumerable<string> Constants = Inst.Consts.Select(Const =>
+					{
+						switch (Const.Arity)
+						{
+							case Arity.Fixed:
+								return $"{Const.ToCpp()} {Const.Name}";
+							case Arity.Optional:
+								return $"TOptional<{Const.ToCpp()}> {Const.Name}";
+							case Arity.Variadic:
+								return $"TOperandRange<{Const.ToCpp()}> {Const.Name}";
+							default:
+								return $"UnknownArity {Const.Name}";
+						}
+					});
+					S.Append($"    {Inst.CppCapturesName}({String.Join(", ", Context.Concat(Operands).Concat(EffectToken).Concat(ReturnEffectToken).Concat(Constants))})\n");
+					string Prefix = ":";
+					foreach (Argument Arg in Inst.Args)
+					{
+						switch (Arg.Arity)
+						{
+							case Arity.Fixed:
+							case Arity.Optional:
+								S.Append($"        {Prefix} {Arg.Name}(Context, {Arg.Name})\n");
+								break;
+							case Arity.Variadic:
+								S.Append($"        {Prefix} {Arg.Name}(MoveTemp({Arg.Name}))\n");
+								break;
+						}
+						Prefix = ",";
+					}
+					if (Inst._CapturesEffectToken)
+					{
+						S.Append($"        {Prefix} EffectToken(Context, EffectToken)\n");
+						Prefix = ",";
+					}
+					if (Inst._CreatesNewReturnEffectToken)
+					{
+						S.Append($"        {Prefix} ReturnEffectToken(Context, ReturnEffectToken)\n");
+						Prefix = ",";
+					}
+					foreach (Constant Const in Inst.Consts)
+					{
+						S.Append($"        {Prefix} {Const.Name}({Const.Name})\n");
+						Prefix = ",";
+					}
+					S.Append("    {}\n");
+				}
+				S.Append('\n');
+
+				// Generate the copy constructor.
+				{
+					S.Append($"    {Inst.CppCapturesName}(FAccessContext Context, const {Inst.CppCapturesName}& Other)\n");
+					string Prefix = ":";
+					foreach (Argument Arg in Inst.Args)
+					{
+						switch (Arg.Arity)
+						{
+							case Arity.Fixed:
+							case Arity.Optional:
+								S.Append($"        {Prefix} {Arg.Name}(Context, Other.{Arg.Name}.Get())\n");
+								break;
+							case Arity.Variadic:
+								S.Append($"        {Prefix} {Arg.Name}(Other.{Arg.Name})\n");
+								break;
+						}
+						Prefix = ",";
+					}
+					if (Inst._CapturesEffectToken)
+					{
+						S.Append($"        {Prefix} EffectToken(Context, Other.EffectToken.Get())\n");
+						Prefix = ",";
+					}
+					if (Inst._CreatesNewReturnEffectToken)
+					{
+						S.Append($"        {Prefix} ReturnEffectToken(Context, Other.ReturnEffectToken.Get())\n");
+						Prefix = ",";
+					}
+					foreach (Constant Const in Inst.Consts)
+					{
+						S.Append($"        {Prefix} {Const.Name}(Other.{Const.Name})\n");
+						Prefix = ",";
+					}
+					S.Append("    {}\n");
+				}
+				S.Append('\n');
+
+				EmitReflectionMethods(S, Inst, true);
+				S.Append("};\n\n");
+			}
+
+			S.Append("} // namespace Verse\n");
+
+			return S.ToString();
+		}
+
+		void EmitReflectionMethods(StringBuilder S, Instruction Inst, bool bIsSuspensionCapture)
+		{
+			S.Append("    template <typename FunctionType>\n");
+			S.Append("    AUTORTFM_INFER void ForEachOperand(FunctionType&& Function)\n");
+			S.Append("    {\n");
+			foreach (Argument Arg in Inst.Args)
+			{
+				S.Append($"        Function({Arg.Role.ToCpp()}, {Arg.Name}, TEXT(\"{Arg.Name}\"));\n");
+			}
+			if (bIsSuspensionCapture)
+			{
+				if (Inst._CapturesEffectToken)
+				{
+					S.Append($"        Function({Role.Use.ToCpp()}, EffectToken, TEXT(\"EffectToken\"));\n");
+				}
+				if (Inst._CreatesNewReturnEffectToken)
+				{
+					S.Append($"        Function({Role.UnifyDef.ToCpp()}, ReturnEffectToken, TEXT(\"ReturnEffectToken\"));\n");
+				}
+			}
+			S.Append("    }\n");
+		}
+
+		string EmitMakeCapturesFunctions()
+		{
+			StringBuilder S = new StringBuilder();
+			S.Append(Preamble());
+
+			foreach (Instruction Inst in Instructions.Where(I => I._Suspends))
+			{
+				S.Append($"FORCEINLINE {Inst.CppCapturesName} MakeCaptures({Inst.CppName}& Op)\n{{\n");
+
+				if (Inst._CapturesEffectToken)
+				{
+					S.Append("    VValue IncomingEffectToken = EffectToken.Get(Context);\n");
+				}
+				if (Inst._CreatesNewReturnEffectToken)
+				{
+					S.Append("    BumpEffectEpoch();\n");
+					S.Append("    VValue ReturnEffectToken = EffectToken.Get(Context);\n");
+				}
+				foreach (Argument Arg in Inst.Args.Where(A => A.Arity == Arity.Variadic))
+				{
+					if (Arg.Role == Role.Immediate)
+					{
+						S.Append($"    TArray<TWriteBarrier<{Arg.DefCppType()}>> Array{Arg.Name};\n");
+						S.Append($"    for (auto& CurrentValue : GetOperands(Op.{Arg.Name}))\n");
+						S.Append($"    {{\n");
+						if (Arg.CppTypeName == "VValue")
+						{
+							S.Append($"        Array{Arg.Name}.Add({{Context, CurrentValue.Get()}});\n");
+						}
+						else
+						{
+							S.Append($"        Array{Arg.Name}.Add({{Context, *CurrentValue}});\n");
+						}
+						S.Append($"    }}\n");
+					}
+					else
+					{
+						S.Append($"    TArray<TWriteBarrier<VValue>> Array{Arg.Name};\n");
+						S.Append($"    for (auto& CurrentValue : GetOperands(Op.{Arg.Name}))\n");
+						S.Append($"    {{\n");
+						S.Append($"        Array{Arg.Name}.Add({{Context, GetOperand(CurrentValue)}});\n");
+						S.Append($"    }}\n");
+					}
+				}
+				S.Append($"    return {Inst.CppCapturesName}(Context");
+				foreach (Argument Arg in Inst.Args)
+				{
+					switch (Arg.Arity)
+					{
+						case Arity.Fixed:
+						case Arity.Optional:
+							if (Arg.Role == Role.Immediate)
+							{
+								if (Arg.CppTypeName == "VValue")
+								{
+									S.Append($", Op.{Arg.Name}.Get()");
+								}
+								else if (Arg.Arity == Arity.Fixed)
+								{
+									S.Append($", *Op.{Arg.Name}");
+								}
+								else
+								{
+									S.Append($", Op.{Arg.Name}.Get()");
+								}
+							}
+							else
+							{
+								S.Append($", GetOperand(Op.{Arg.Name})");
+							}
+							break;
+						case Arity.Variadic:
+							S.Append($", MoveTemp(Array{Arg.Name})");
+							break;
+					}
+				}
+				if (Inst._CapturesEffectToken)
+				{
+					S.Append(", IncomingEffectToken");
+				}
+				if (Inst._CreatesNewReturnEffectToken)
+				{
+					S.Append(", ReturnEffectToken");
+				}
+				foreach (Constant Const in Inst.Consts)
+				{
+					S.Append($", Op.{Const.Name}");
+				}
+				S.Append(");\n");
+
+				S.Append("}\n\n");
+			}
+
+			return S.ToString();
+		}
+
+		string EmitCaptureSwitch()
+		{
+			StringBuilder S = new StringBuilder();
+			S.Append(Preamble());
+
+			S.Append("// IWYU pragma: private, include \"VVMCaptureSwitch.h\"\n\n");
+
+			S.Append("namespace Verse {\n");
+			S.Append("template <typename TFunc>\n");
+			S.Append("void VBytecodeSuspension::CaptureSwitch(const TFunc& Func)\n");
+			S.Append("{\n");
+			S.Append("    switch (Opcode)\n");
+			S.Append("    {\n");
+			foreach (Instruction Inst in Instructions.Where(I => I._Suspends))
+			{
+				S.Append($"        case EOpcode::{Inst.Name}:\n");
+				S.Append("        {\n");
+				S.Append($"            Func(GetCaptures<{Inst.CppCapturesName}>());\n");
+				S.Append("            break;\n");
+				S.Append("        }\n");
+			}
+			S.Append("        default:\n");
+			S.Append("        {\n");
+			S.Append("            V_DIE(\"Opcode doesn't have a captures\");\n");
+			S.Append("            break;\n");
+			S.Append("        }\n");
+			S.Append("    }\n");
+			S.Append("}\n");
+			S.Append("} // namespace Verse\n");
+
+			return S.ToString();
+		}
+
+		VerseVMBytecodeGenerator(ILogger Logger, DirectoryReference GenDirectory)
+		{
+			DefineOps();
+
+			Action<string, Func<string>> GenFile = (FileName, Method) =>
+			{
+				FileReference File = FileReference.Combine(GenDirectory, FileName);
+				bool bWritten = FileReference.WriteAllTextIfDifferent(File, Method());
+				Logger.LogDebug($"\tWriting out generated header file. Changed:{bWritten} Path:'{File}'");
+			};
+
+			GenFile("VVMBytecodeOps.gen.h", EmitBytecodeMacroList);
+			GenFile("VVMBytecodesAndCaptures.gen.h", EmitBytecodeAndCaptureDefs);
+			GenFile("VVMMakeCapturesFuncs.gen.h", EmitMakeCapturesFunctions);
+			GenFile("VVMCaptureSwitch.gen.h", EmitCaptureSwitch);
+		}
+
+		/// <summary>
+		/// Entrypoint to generate the bytecode. Generated code will go in Directory.
+		/// </summary>
+		public static void Generate(ILogger Logger, DirectoryReference Directory)
+		{
+			Logger.LogDebug($"VerseVMBytecodeGenerator.Generate, generating CPP headers in: '{Directory}'");
+			new VerseVMBytecodeGenerator(Logger, Directory);
+		}
+
+		void DefineOps()
+		{
+			string[] BinOps =
+			{
+				"Add", "Sub", "Mul", "Div", "Mod"
+			};
+			foreach (string Op in BinOps)
+			{
+				Inst(Op)
+					.Arg("Dest", Role.UnifyDef)
+					.Arg("LeftSource", Role.Use)
+					.Arg("RightSource", Role.Use)
+					.Suspends();
+			}
+
+			Inst("MutableAdd")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("LeftSource", Role.Use)
+				.Arg("RightSource", Role.Use)
+				.Suspends();
+
+			string[] UnaryOps =
+			{
+				"Neg",
+				"Query"
+			};
+			foreach (string Op in UnaryOps)
+			{
+				Inst(Op)
+					.Arg("Dest", Role.UnifyDef)
+					.Arg("Source", Role.Use)
+					.Suspends();
+			}
+
+			Inst("Err");
+			Inst("Tracepoint")
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString");  // Essentially a no-op but allows for inserting debug markers in the bytecode.
+
+			Inst("Move")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Source", Role.Use);
+
+			// Reset and ResetNonTrailed must have identical layout.  See
+			// AnalyzeAndTransformResets.
+			Inst("Reset")
+				.Arg("Dest", Role.ClobberDef)
+				.Const("LiveRange", "BytecodeAnalysis::FLiveRange", "{}");
+			Inst("ResetNonTrailed")
+				.Arg("Dest", Role.ClobberDef)
+				.Const("LiveRange", "BytecodeAnalysis::FLiveRange", "{}");
+
+			Inst("Jump")
+				.Jump("JumpOffset");
+
+			Inst("JumpIfInitialized")
+				.Arg("Source", Role.Use)
+				.Jump("JumpOffset");
+
+			Inst("Switch")
+				.Arg("Which", Role.Use)
+				.Jump("JumpOffsets", Arity.Variadic);
+
+			string[] FastFailBinaryOps = {
+				"LtFastFail",
+				"LteFastFail",
+				"GtFastFail",
+				"GteFastFail",
+				"EqFastFail",
+				"NeqFastFail",
+			};
+			foreach (string Op in FastFailBinaryOps)
+			{
+				Inst(Op)
+					.Arg("Dest", Role.UnifyDef)
+					.Arg("LeniencyIndicator", Role.UnifyDef)
+					.Arg("Lhs", Role.Use)
+					.Arg("Rhs", Role.Use)
+					.Jump("OnFailure")
+					.Suspends();
+			}
+
+			Inst("ArrayIndexFastFail")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("LeniencyIndicator", Role.UnifyDef)
+				.Arg("Array", Role.Use)
+				.Arg("Index", Role.Use)
+				.Jump("OnFailure")
+				.Suspends();
+
+			Inst("TypeCastFastFail")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("LeniencyIndicator", Role.UnifyDef)
+				.Arg("Type", Role.Use)
+				.Arg("Value", Role.Use)
+				.Jump("OnFailure")
+				.Suspends();
+
+			Inst("QueryFastFail")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("LeniencyIndicator", Role.UnifyDef)
+				.Arg("Source", Role.Use)
+				.Jump("OnFailure")
+				.Suspends();
+
+			Inst("EndFastFailureContext")
+				.Arg("OuterLeniencyIndicator", Role.UnifyDef)
+				.Arg("LeniencyIndicator", Role.Use)
+				.Jump("OnDone");
+
+			// These labels are needed for lenient execution.
+			// On success, EndFailureContext falls through.
+			// On failure, it jumps to OnFailure.
+			// When there are still unresolved suspensions in this failure context,
+			// we jump to "Done" to continue lenient execution.
+			Inst("BeginFailureContext")
+				.Jump("OnFailure")
+				.Const("Id", "FFailureContextId");
+			Inst("EndFailureContext")
+				.Jump("Done")
+				.Const("Id", "FFailureContextId");
+
+			Inst("SelfTask")
+				.Arg("Dest", Role.UnifyDef);
+
+			Inst("BeginTask")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Parent", Role.Use)
+				.Const("bAddToTaskGroup", "bool")
+				.Jump("OnYield");
+			Inst("EndTask")
+				.Arg("Write", Role.ClobberDef, Arity.Optional)
+				.Arg("Signal", Role.Use, Arity.Optional)
+				.Arg("Value", Role.Use);
+
+			Inst("BeginAwait");
+			Inst("AwaitSuccess");
+			Inst("EndAwait");
+
+			Inst("Yield")
+				.Jump("ResumeOffset");
+
+			Inst("NewSemaphore")
+				.Arg("Dest", Role.UnifyDef);
+			Inst("WaitSemaphore")
+				.Arg("Source", Role.Use)
+				.Const("Count", "int32");
+
+			Inst("Call")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Callee", Role.Use)
+				.Arg("Arguments", Role.Use, Arity.Variadic)
+				.Arg("NamedArguments", Role.Immediate, Arity.Variadic, "VUniqueString")
+				.Arg("NamedArgumentValues", Role.Use, Arity.Variadic)
+				.Const("bSuspends", "bool", "true")
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("CallWithSelf")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Callee", Role.Use)
+				.Arg("Self", Role.Use)
+				.Arg("Arguments", Role.Use, Arity.Variadic)
+				.Arg("NamedArguments", Role.Immediate, Arity.Variadic, "VUniqueString")
+				.Arg("NamedArgumentValues", Role.Use, Arity.Variadic)
+				.Const("bSuspends", "bool")
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("Return")
+				.Arg("Value", Role.Use);
+			Inst("ResumeUnwind");
+
+			Inst("NewRef")
+				.Arg("Dest", Role.UnifyDef);
+
+			Inst("RefGet")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Ref", Role.Use)
+				.CapturesEffectToken()
+				.Suspends();
+
+			Inst("RefSet")
+				.Arg("Ref", Role.Use)
+				.Arg("Value", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("RefSetLive")
+				.Arg("Ref", Role.Use)
+				.Arg("Value", Role.Use)
+				.Arg("Task", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("Freeze")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Value", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("Melt")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Value", Role.Use)
+				.Suspends();
+
+			Inst("Length")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Container", Role.Use)
+				.Suspends();
+
+			Inst("CallSet")
+				.Arg("Container", Role.Use)
+				.Arg("Index", Role.Use)
+				.Arg("ValueToSet", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("CallSetLive")
+				.Arg("Container", Role.Use)
+				.Arg("Index", Role.Use)
+				.Arg("ValueToSet", Role.Use)
+				.Arg("Task", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("NewArray")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Values", Role.Use, Arity.Variadic)
+				.Suspends();
+
+			Inst("NewMutableArray")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Values", Role.Use, Arity.Variadic)
+				.Suspends();
+
+			Inst("NewMutableArrayWithCapacity")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Size", Role.Use)
+				.Suspends();
+
+			Inst("ArrayAdd")
+				.Arg("Container", Role.Use)
+				.Arg("ValueToAdd", Role.Use)
+				.CapturesEffectToken()
+				.Suspends();
+
+			// This in place converts a VMutableArray into a VArray.
+			// This can get away with being non-transactional because we
+			// call it on data structures before they become observable
+			// to user code.
+			Inst("InPlaceMakeImmutable")
+				.Arg("Container", Role.Use)
+				.Suspends();
+
+			Inst("NewOption")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Value", Role.Use)
+				.Suspends();
+
+			Inst("NewMap")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Keys", Role.Use, Arity.Variadic)
+				.Arg("Values", Role.Use, Arity.Variadic)
+				.Suspends();
+
+			Inst("MapKey")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Map", Role.Use)
+				.Arg("Index", Role.Use)
+				.Suspends();
+
+			Inst("MapValue")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Map", Role.Use)
+				.Arg("Index", Role.Use)
+				.Suspends();
+
+			Inst("NewClass")
+				// This is what the newly-created class will unify to.
+				.Arg("ClassDest", Role.UnifyDef)
+				// This gets unified once the class finishes construction and clones the archetype with the new functions that are bound to new scopes.
+				.Arg("ArchetypeDest", Role.UnifyDef)
+				// This is the placeholder for the `VFunction` that contains the bytecode initializing the class fields.
+				.Arg("ConstructorDest", Role.UnifyDef)
+				.Arg("Package", Role.Immediate, Arity.Fixed, "VPackage")
+				.Arg("RelativePath", Role.Immediate, Arity.Fixed, "VArray")
+				.Arg("ClassName", Role.Immediate, Arity.Fixed, "VArray")
+				.Arg("AttributeIndices", Role.Immediate, Arity.Variadic, "VValue")
+				.Arg("Attributes", Role.Use, Arity.Variadic)
+				.Arg("ImportStruct", Role.Immediate, Arity.Optional, "VValue")
+				.Const("bNativeBound", "bool")
+				.Const("ClassKind", "VClass::EKind")
+				.Const("Flags", "VClass::EFlags")
+				.Arg("Inherited", Role.Use, Arity.Variadic)
+				.Arg("Archetype", Role.Immediate, Arity.Fixed, "VArchetype")
+				// This is the `VProcedure` that actually contains the bytecode for creating/initializing the class fields.
+				.Arg("ConstructorBody", Role.Immediate, Arity.Optional, "VProcedure")
+				.Suspends();
+
+			Inst("BindNativeClass")
+				.Arg("Class", Role.Use)
+				.Const("bImported", "bool")
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+			Inst("ConstructNativeDefaultObject")
+				.Arg("Class", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+			Inst("BeginDefaultConstructor")
+				.Arg("Object", Role.Use)
+				.Jump("OnDefaultSubObject");
+			Inst("EndDefaultConstructor")
+				.Arg("Object", Role.Use)
+				.Arg("ConstructedToken", Role.Use)
+				.Suspends();
+			Inst("RequireConcreteDefaultField")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Object", Role.Use)
+				.Arg("FieldInitialized", Role.Use)
+				.Arg("FieldValue", Role.Use)
+				.Suspends();
+			Inst("MoveConcreteDefaultObject")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Outgoing", Role.UnifyDef)
+				.Arg("Incoming", Role.UnifyDef)
+				.Arg("Source", Role.Use)
+				.Suspends();
+
+			string[] NewObjectOps = ["NewObject", "NewObjectICClass"];
+			foreach (string Op in NewObjectOps)
+			{
+				Inst(Op)
+					.Arg("Dest", Role.UnifyDef)
+					.Arg("Archetype", Role.Use)
+					.Arg("Class", Role.Use)
+					.Const("CachedClass", "VClass*", "nullptr")
+					.Const("EmergentTypeOffset", "uint32", "0")
+					.CapturesEffectToken()
+					.CreatesNewReturnEffectToken()
+					.Suspends();
+			}
+
+			string[] LoadFieldOps = ["LoadField", "LoadFieldICOffset", "LoadFieldICConstant", "LoadFieldICFunction", "LoadFieldICNativeFunction", "LoadFieldICAccessor"];
+			foreach (string Op in LoadFieldOps)
+			{
+				Inst(Op)
+					.Arg("Dest", Role.UnifyDef)
+					.Arg("Object", Role.Use)
+					.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+					.Const("EmergentTypeOffset", "uint32", "0")
+					.Const("ICPayload", "uint64", "0")
+					.Suspends();
+			}
+
+			Inst("LoadFieldFromSuper")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Scope", Role.Use)
+				.Arg("Self", Role.Use)
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Suspends();
+
+			// Creates a field on an object, or fails if it already exists.
+			// Threads through an effect-like token to ensure archetype and subclass CreateFields run before superclass CreateFields.
+			string[] CreateFieldOps = ["CreateField", "CreateFieldICValueObjectConstant", "CreateFieldICValueObjectField", "CreateFieldICNativeStruct", "CreateFieldICUObject"];
+			foreach (string Op in CreateFieldOps)
+			{
+				Inst(Op)
+					.Arg("LeniencyIndicator", Role.UnifyDef)
+					.Arg("Token", Role.Use)
+					.Arg("Object", Role.Use)
+					.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+					.Jump("OnFailure")
+					.Const("SourceEmergentTypeOffset", "uint32", "0")
+					.Const("FieldIndex", "uint32", "0")
+					.Const("NextEmergentTypeOffset", "uint32", "0")
+					.Suspends();
+			}
+			Inst("UnifyField")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Object", Role.Use)
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Arg("Value", Role.Use)
+				.Suspends();
+			Inst("InitializeVar")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Object", Role.Use)
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Arg("Value", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+			Inst("InitializeAccessor")
+				.Arg("Object", Role.Use)
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Suspends();
+
+			Inst("SetField")
+				.Arg("Object", Role.Use)
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Arg("Value", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("SetFieldLive")
+				.Arg("Object", Role.Use)
+				.Arg("Name", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Arg("Value", Role.Use)
+				.Arg("Task", Role.Use)
+				.CapturesEffectToken()
+				.CreatesNewReturnEffectToken()
+				.Suspends();
+
+			Inst("UnifyNativeObject")
+				.Arg("Token", Role.Use)
+				.Arg("Object", Role.Use)
+				.Suspends();
+			Inst("UnwrapNativeConstructorWrapper")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Object", Role.Use)
+				.Suspends();
+
+			Inst("NewScope")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Captures", Role.Use, Arity.Variadic)
+				.Suspends();
+
+			Inst("NewFunction")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Procedure", Role.Use)
+				.Arg("Self", Role.Use)
+				.Arg("ParentScope", Role.Use)
+				.Suspends();
+
+			Inst("LoadParentScope")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Scope", Role.Use)
+				.Suspends();
+
+			Inst("LoadCapture")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Scope", Role.Use)
+				.Const("Index", "uint32")
+				.Suspends();
+
+			Inst("BeginProfileBlock")
+				.Arg("Dest", Role.UnifyDef)
+				.Suspends();
+			Inst("EndProfileBlock")
+				.Arg("WallTimeStart", Role.Use)
+				.Arg("UserTag", Role.Use)
+				// Locus Info
+				.Arg("SnippetPath", Role.Immediate, Arity.Fixed, "VUniqueString")
+				.Arg("BeginRow", Role.Use)
+				.Arg("BeginColumn", Role.Use)
+				.Arg("EndRow", Role.Use)
+				.Arg("EndColumn", Role.Use)
+				.Suspends();
+			Inst("LoadConstructor")
+				.Arg("Dest", Role.UnifyDef)
+				.Arg("Class", Role.Use)
+				.Suspends();
+
+			string[] ComparisonOps =
+			{
+				"Neq", "Lt", "Lte", "Gt", "Gte"
+			};
+			foreach (string Op in ComparisonOps)
+			{
+				Inst(Op)
+					.Arg("Dest", Role.UnifyDef)
+					.Arg("LeftSource", Role.Use)
+					.Arg("RightSource", Role.Use)
+					.Suspends();
+			}
+		}
+	}
+}

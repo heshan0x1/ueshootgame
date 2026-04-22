@@ -1,0 +1,33 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+#pragma once
+
+#include "/Engine/Private/SceneData.ush"
+
+bool GetMaterialCacheState()
+{
+#if MATERIAL_CACHE
+	return true;
+#else // MATERIAL_CACHE
+	return false;
+#endif // MATERIAL_CACHE
+}
+
+uint GetMaterialCacheTextureDescriptor(FPrimitiveSceneData PrimitiveData)
+{
+	return PrimitiveData.MaterialCacheDescriptor;
+}
+
+uint GetMaterialCacheTagOffset(FPrimitiveSceneData PrimitiveData)
+{
+	return GetMaterialCacheTextureDescriptor(PrimitiveData) & 0x3FFFFFFF;
+}
+
+uint GetMaterialCacheTextureCoordinateIndex(FPrimitiveSceneData PrimitiveData)
+{
+	return GetMaterialCacheTextureDescriptor(PrimitiveData) >> 30;
+}
+
+bool GetMaterialCacheTextureDescriptorIsValid(FPrimitiveSceneData PrimitiveData)
+{
+	return GetMaterialCacheTextureDescriptor(PrimitiveData) != ~0u;
+}

@@ -1,0 +1,30 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "NaniteDataDecode.ush"
+#include "NaniteStreaming.ush"
+#include "../ComputeShaderUtils.ush"
+
+RWStructuredBuffer<FStreamingRequest>	OutStreamingRequests;
+RWByteAddressBuffer						DstBuffer;
+
+[numthreads(1, 1, 1)]
+void ClearStreamingRequestCount()
+{
+	OutStreamingRequests[0].RuntimeResourceID_Magic = 0;	// First entry holds count
+}
+
+uint SrcOffset;
+uint DstOffset;
+uint NumThreads;
+
+[numthreads(64, 1, 1)]
+void Memcpy(uint3 GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint DispatchThreadId = GetUnWrappedDispatchThreadId(GroupID, GroupIndex, 64);
+	if (DispatchThreadId >= NumThreads)
+		return;
+	
+	const uint4 Data = DstBuffer.Load4(SrcOffset + (DispatchThreadId << 4));
+	DstBuffer.Store4(DstOffset + (DispatchThreadId << 4), Data);
+}

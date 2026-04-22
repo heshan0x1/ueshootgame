@@ -1,0 +1,3 @@
+../../../Templates/TemplateResources/Standard/XRFramework/FeaturePack/manifest.json
+../../../Templates/TemplateResources/Standard/XRFramework/Media/XRFramework.png
+../../../Templates/TemplateResources/Standard/XRFramework/Media/XRFramework_Preview.png

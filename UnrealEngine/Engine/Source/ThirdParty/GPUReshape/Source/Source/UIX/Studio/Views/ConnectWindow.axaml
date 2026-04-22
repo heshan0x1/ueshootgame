@@ -1,0 +1,170 @@
+﻿<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<Window x:Class="Studio.Views.ConnectWindow"
+        xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+        xmlns:vc="using:Studio.ValueConverters"
+        xmlns:r="using:Studio.Resources"
+        xmlns:converters="clr-namespace:Avalonia.Markup.Xaml.Converters;assembly=Avalonia.Markup.Xaml"
+        xmlns:controls="clr-namespace:Studio.Views.Controls"
+        mc:Ignorable="d"
+        d:DesignWidth="550" d:DesignHeight="350"
+        Width="550" Height="350"
+        UseLayoutRounding="True" RenderOptions.BitmapInterpolationMode="HighQuality"
+        WindowState="Normal" WindowStartupLocation="CenterScreen"
+        TransparencyLevelHint="None"
+        Foreground="{DynamicResource DockThemeForegroundBrush}"
+        BorderThickness="1" BorderBrush="{DynamicResource DockThemeBorderLowBrush}"
+        FontFamily="Segoe UI, SF Pro Display, Noto Sans, Cantarel"
+        Icon="/Resources/Icons/Icon_Frame.ico"
+        Title="Create Workspace Connection"
+        ExtendClientAreaChromeHints="SystemChrome"
+        ExtendClientAreaToDecorationsHint="True"
+        SystemDecorations="BorderOnly">
+    <Window.Resources>
+        <ResourceDictionary>
+            <vc:ConnectionStatusToProgressConverter x:Key="ConnectionStatusToProgressConverter" />
+            <converters:ColorToBrushConverter x:Key="ColorToBrushConverter"/>
+        </ResourceDictionary>
+    </Window.Resources>
+
+    <Grid>
+        <!-- Tool Header -->
+        <controls:WindowChrome Title="Create Workspace Connection" Separator="True"/>
+
+        <!-- Content -->
+        <Grid Margin="10,45,5,35" VerticalAlignment="Stretch">
+            <Panel VerticalAlignment="Top">
+                <AutoCompleteBox 
+                    x:Name="QueryBox"
+                    HorizontalAlignment="Stretch"
+                    VerticalAlignment="Top"
+                    Height="27"
+                    Margin="0,0,0,0"
+                    Text="{Binding ConnectionString}" />
+                    
+                <Button 
+                    Classes="Icon"
+                    HorizontalAlignment="Right"
+                    Width="25"
+                    Height="25"
+                    Margin="0 -1 1 0">
+                    <PathIcon ToolTip.Tip="{x:Static r:Resources.Help_Tooltip}" Data="{StaticResource Question}" Width="13" />
+                    
+                    <Button.Flyout>
+                        <Flyout Placement="BottomEdgeAlignedRight">
+                            <StackPanel Orientation="Vertical" Width="350">
+                                <TextBlock TextWrapping="Wrap">
+Connection strings define the endpoint query and application filter, each attribute is specified as name:value.
+
+Valid attributes:
+                                </TextBlock>
+                                <Grid Margin="25 0 0 0" ColumnDefinitions="35,*">
+                                    <TextBlock TextWrapping="Wrap" Grid.Column="0">
+ip   <LineBreak />
+port <LineBreak />
+app  <LineBreak />
+pid  <LineBreak />
+api  <LineBreak />
+                                    </TextBlock>
+                                    <TextBlock TextWrapping="Wrap" Grid.Column="1">
+- Endpoint hostname or ipv4/6 string                    <LineBreak />
+- Endpoint host resolver port, leave default if unknown <LineBreak />
+- Application name filter                               <LineBreak />
+- Application process id                                <LineBreak />
+- Application backend API filter                        <LineBreak />
+                                    </TextBlock>
+                                </Grid>
+                                
+                                <TextBlock Margin="0 10 0 0" TextWrapping="Wrap">
+Examples:
+    ip:localhost app:UE4Editor
+    ip:test_agent port:8865 app:UnitTest api:Vulkan  
+                                </TextBlock>
+                            </StackPanel>
+                        </Flyout>
+                    </Button.Flyout>
+                </Button>
+
+                <controls:QueryAttributeSegments x:Name="AttributeSegments" HorizontalAlignment="Left" VerticalAlignment="Top" Margin="0 26 0 0"/>
+            </Panel>
+
+            <Grid Margin="0,35,0,0">
+                <DataGrid
+                    x:Name="ConnectionGrid"
+                    IsReadOnly="True"
+                    HeadersVisibility="Column"
+                    CanUserResizeColumns="True"
+                    AutoGenerateColumns="False"
+                    SelectedItem="{Binding SelectedApplication}"
+                    ItemsSource="{Binding ResolvedApplications}">
+                    <DataGrid.Columns>
+                        <DataGridTextColumn Header="Process" Width="*" Binding="{Binding Process}" />
+                        <DataGridTextColumn Header="Name" Width="*" Binding="{Binding Name}" />
+                        <DataGridTextColumn Header="API" Width="55" Binding="{Binding API }" />
+                        <DataGridTextColumn Header="Objects" Width="55" Binding="{Binding DeviceObjects}" />
+                        <DataGridTextColumn Header="UID" Width="40" Binding="{Binding DeviceUid}" />
+                        <DataGridTextColumn Header="PID" Width="40" Binding="{Binding Pid}" />
+                    </DataGrid.Columns>
+                </DataGrid>
+            </Grid>
+
+            <ProgressBar
+                VerticalAlignment="Bottom"
+                MinHeight="5"
+                x:Name="ProgressIndicator"
+                Value="100"
+                IsIndeterminate="{Binding ConnectionStatus, Converter={StaticResource ConnectionStatusToProgressConverter}}"
+                Foreground="{Binding ConnectionStatus, Converter={StaticResource ConnectionStatusToProgressConverter}}" />
+        </Grid>
+
+        <!-- Tool Result -->
+        <Grid VerticalAlignment="Bottom" Margin="5">
+            <TextBlock
+                x:Name="StatusBlock"
+                Margin="5,0,0,0"
+                VerticalAlignment="Center"
+                HorizontalAlignment="Left"
+                Text="{Binding ConnectionStatus, Converter={StaticResource ConnectionStatusToProgressConverter}}" />
+
+            <StackPanel HorizontalAlignment="Right" Orientation="Horizontal">
+                <Button
+                    Classes="Primary"
+                    HorizontalAlignment="Right"
+                    Command="{Binding Connect}"
+                    ToolTip.Tip="{x:Static r:Resources.Workspace_Connect}">
+                    Connect
+                </Button>
+            </StackPanel>
+        </Grid>
+    </Grid>
+</Window>

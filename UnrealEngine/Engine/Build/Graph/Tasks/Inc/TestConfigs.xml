@@ -1,0 +1,22 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../../Engine/Build/Graph/Schema.xsd" >
+
+	<!-- Test Configs allows to override the default homogenous configurations passed to tests -->
+	<!-- This paradigm allows to explicitly declare test configurations for each target set -->
+
+	<!-- Include this file with: <Include Script="$(RootDir)/Engine/Build/Graph/Tasks/Inc/TestConfigs.xml"/> -->
+	<!-- Then Expand the Macro 'AddTestConfig' with corresponding configuration inputs. ie: -->
+	<!-- <Expand Name="AddTestConfig"
+			TestConfigName="Vulkan SM6"
+			TestPlatform="Win64"
+			AdditionalAppArguments="-vulkan -sm6"
+			ArtifactPostfix="Vulkan_SM6"
+		/> -->
+
+	<Option Name="TestConfigList" DefaultValue="" Description="Input TestConfigs; expand macro AddTestConfig after including Engine/Build/Graph/Tasks/Inc/TestConfigs.xml to populate"/>
+
+	<Macro Name="AddTestConfig" Arguments="TestConfigName" OptionalArguments="TestPlatform;AdditionalTestArguments;ArtifactPostfix;AdditionalAppArguments;AgentType">
+		<Property Name="TestConfigList" Value="$(TestConfigList)^$(TestConfigName)|$(TestPlatform)|$(ArtifactPostfix)|$(AdditionalTestArguments)|$(AdditionalAppArguments)|$(AgentType)"/>
+	</Macro>
+
+</BuildGraph>

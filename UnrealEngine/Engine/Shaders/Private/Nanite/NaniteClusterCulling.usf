@@ -1,0 +1,1161 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Nanite visibility culling
+
+// In Nanite scene traversal, visibility determination and LOD selection all happens on the GPU. At the highest level the goal is to calculate a set of triangle clusters
+// that needs to be rasterized based on the Scene and the set of active views.
+// (Scene, Views) -> Clusters for rasterization
+
+#ifndef CULLING_PASS
+#define CULLING_PASS 0
+#endif
+
+#ifndef VIRTUAL_TEXTURE_TARGET
+#define VIRTUAL_TEXTURE_TARGET 0
+#endif
+
+#ifndef NANITE_HIERARCHY_TRAVERSAL
+#define NANITE_HIERARCHY_TRAVERSAL 0
+#endif
+
+#include "NaniteCulling.ush"
+
+#define GROUP_NODE_SIZE		NANITE_CANDIDATE_NODE_SIZE_DWORDS(CULLING_PASS == CULLING_PASS_OCCLUSION_POST)
+
+// Main and Post pass candidates are allocated from opposite ends of the buffer
+// Trim count so we don't have to worry about main and post stomping each other
+#define CHECK_AND_TRIM_CLUSTER_COUNT (CULLING_PASS == CULLING_PASS_OCCLUSION_MAIN || CULLING_PASS == CULLING_PASS_OCCLUSION_POST)
+
+#if NANITE_HIERARCHY_TRAVERSAL
+#	define NANITE_HIERARCHY_TRAVERSAL_TYPE (CULLING_TYPE)
+#	include "NaniteHierarchyTraversal.ush"
+#endif
+
+#if MATERIAL_CACHE
+#include "../MaterialCache/MaterialCacheCommon.ush"
+#endif // MATERIAL_CACHE 
+
+// Do not use shared samplers as it requires the View uniform buffer, which is not bound for this shader.
+#define USE_HZB_SHARED_SAMPLERS 0
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../ViewData.ush"
+#include "../WaveOpUtil.ush"
+#include "../ComputeShaderUtils.ush"
+#if VIRTUAL_TEXTURE_TARGET
+#include "../VirtualShadowMaps/VirtualShadowMapPageOverlap.ush"
+#include "../VirtualShadowMaps/VirtualShadowMapPageCacheCommon.ush"
+#endif
+#include "NaniteCullingCommon.ush"
+#include "NaniteDataDecode.ush"
+#include "NaniteAttributeDecode.ush"
+#include "NaniteVertexDeformation.ush"
+#include "NaniteHZBCull.ush"
+#include "NaniteStreaming.ush"
+#include "../GPUMessaging.ush"
+#if USE_SPLINEDEFORM
+#include "../SplineMeshCommon.ush"
+#endif
+
+#define NANITE_DEPTH_BUCKETING	NANITE_EXTENDED_VISIBLE_CLUSTERS
+
+#if CULLING_PASS == CULLING_PASS_OCCLUSION_POST
+static const bool bIsPostPass = true;
+static const uint QueueStateIndex = 1;
+#else
+static const bool bIsPostPass = false;
+static const uint QueueStateIndex = 0;
+#endif
+
+groupshared uint GroupOccludedBitmask[NANITE_MAX_BVH_NODES_PER_GROUP];
+
+#if CULLING_TYPE == NANITE_CULLING_TYPE_PERSISTENT_NODES_AND_CLUSTERS
+#define OPTIONAL_COHERENT(Name)			Name##Coherent
+RWCoherentByteAddressBuffer				CandidateNodes;
+RWCoherentByteAddressBuffer				CandidateClusters;
+RWCoherentByteAddressBuffer				ClusterBatches;
+RWCoherentByteAddressBuffer				InOutAssemblyTransforms;
+#else
+#define OPTIONAL_COHERENT(Name)			Name
+RWByteAddressBuffer						CandidateNodes;
+RWByteAddressBuffer						CandidateClusters;
+RWByteAddressBuffer						InOutAssemblyTransforms;
+#endif
+
+Buffer<uint>							OffsetClustersArgsSWHW;
+StructuredBuffer<uint2>					InTotalPrevDrawClusters;
+
+RWStructuredBuffer<FStreamingRequest>	OutStreamingRequests;			// First entry holds count
+
+RWByteAddressBuffer						OutVisibleClustersSWHW;
+RWBuffer<uint>							VisibleClustersArgsSWHW;
+
+#if DEBUG_FLAGS
+RWStructuredBuffer<FNaniteStats>		OutStatsBuffer;
+RWByteAddressBuffer 					OutDebugBuffer;
+#endif
+
+uint									MaxAssemblyTransforms;
+uint									LargePageRectThreshold;
+float									DepthBucketsMinZ;
+float									DepthBucketsMaxZ;
+
+void TransformNodeCullingBounds(
+	FNaniteView NaniteView,
+	FPrimitiveSceneData PrimitiveData,
+	FInstanceSceneData InstanceData,
+	FCluster Cluster,
+	bool bCompileTimeCluster,
+	bool bIsAssemblyPart,
+	uint CullingFlags,
+	bool bEnableWPOBoundsExpansion,
+	inout FNodeCullingBounds Bounds
+)
+{
+	// TODO: Nanite-Skinning
+
+#if USE_SPLINEDEFORM
+	// To reduce the cost of register pressure from loading the spline mesh parameters, we loop once for each spline
+	// mesh instance in the wave so the compiler can treat the parameters as uniform across the entire wave as an
+	// optimization
+	bool bLoop = (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SPLINE_MESH) != 0 &&
+				 (InstanceData.Flags & INSTANCE_SCENE_DATA_FLAG_HAS_PAYLOAD_EXTENSION) != 0;
+	LOOP
+	while (WaveActiveAnyTrue(bLoop))
+	{
+		if (bLoop)
+		{
+			uint UniformPayloadOffset = WaveReadLaneFirst(InstanceData.PayloadExtensionOffset);
+			if (InstanceData.PayloadExtensionOffset == UniformPayloadOffset)
+			{
+				// Calculate the approximate post-deformed cluster bounds and LOD bounds
+				FSplineMeshShaderParams SplineMeshParams = SplineMeshLoadParamsFromInstancePayload(UniformPayloadOffset);
+				FSplineMeshDeformedLocalBounds NewBounds = SplineMeshDeformLocalBounds(SplineMeshParams, Bounds.BoxCenter, Bounds.BoxExtent);
+				Bounds.BoxCenter = NewBounds.BoundsCenter;
+				Bounds.BoxExtent = NewBounds.BoundsExtent;
+
+				// Also modify the sphere used to select the cut of the DAG for final LOD selection.
+				// NOTE: This solution currently does nothing to maintain the inherent monotonicity of bounds between levels of
+				// the DAG and as a result, it is possible this could result in clusters from different LODs overlapping, or
+				// in clusters dropping out entirely.
+				Bounds.Sphere = SplineMeshDeformLODSphereBounds(SplineMeshParams, Bounds.Sphere);
+
+				Bounds.MeshMinDeformScale = SplineMeshParams.MeshDeformScaleMinMax.x;
+				Bounds.NodeMaxDeformScale = NewBounds.MaxDeformScale;
+
+				bLoop = false;
+			}
+		}
+	}
+#endif
+
+	// Extend the bounds for WPO or displacement
+	// NOTE: always extend the bounds if any material ignores the Enable WPO flag
+	const bool bFallbackRaster = (CullingFlags & NANITE_CULLING_FLAG_FALLBACK_RASTER);
+#if VIRTUAL_TEXTURE_TARGET
+	const bool bIsShadowPass = true; // We know at compile time that this permutation is always for shadow
+#else
+	const bool bIsShadowPass = (RenderFlags & NANITE_RENDER_FLAG_IS_SHADOW_PASS) != 0;
+#endif
+	const float3 LocalWPOExtent = GetLocalMaxWPOExtent(PrimitiveData, InstanceData, bEnableWPOBoundsExpansion);
+	Bounds.BoxExtent += LocalWPOExtent + GetMaxMaterialDisplacementExtent(PrimitiveData, bFallbackRaster, bIsShadowPass);
+	
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0
+		&& !bIsAssemblyPart // TODO: Nanite-Assemblies: Remove this when part bone transforms are accessible
+		&& GetInstanceViewData(InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId).bIsDeforming)
+	{
+		BRANCH
+		if (bCompileTimeCluster)
+		{
+			const FSkinningHeader SkinningHeader = LoadSkinningHeader(InstanceData.PrimitiveId);
+
+			BRANCH
+			if (Cluster.bVoxel)
+			{
+				const float4x3 SkinningTransform4x3 = SampleVoxelPerClusterSkinningTransform(InstanceData, Cluster, SkinningHeader);
+
+				Bounds.BoxExtent = mul(Bounds.BoxExtent, abs((float3x3)SkinningTransform4x3));
+				Bounds.BoxCenter = mul(float4(Bounds.BoxCenter, 1.0f), SkinningTransform4x3);
+			}
+			else
+			{
+				BRANCH
+				if (Cluster.NumClusterBoneInfluences > 0)
+				{
+					SkinClusterBounds(Cluster, InstanceData, SkinningHeader, Bounds.BoxCenter, Bounds.BoxExtent);
+				}
+				else
+				{
+					Bounds.BoxExtent = InstanceData.LocalBoundsExtent;
+					Bounds.BoxCenter = InstanceData.LocalBoundsCenter;
+				}
+			}
+		}
+		else
+		{
+			// TODO: Nanite-Skinning - Fun hack to temporarily "fix" broken cluster culling and VSM
+			// Set the cluster bounds for skinned meshes equal to the skinned instance local bounds
+			// for clusters and also node hierarchy slices. This satisfies the constraint that all
+			// clusters in a node hierarchy have bounds fully enclosed in the parent bounds (monotonic).
+
+			// Note: We do not touch the bounding sphere in Bounds because that would break actual
+			// LOD decimation of the Nanite mesh. Instead we leave these in the offline computed ref-pose
+			// so that we get reasonable "small enough to draw" calculations driving the actual LOD.
+
+			// This is not a proper solution, as it hurts culling rate, and also causes VSM to touch far
+			// more pages than necessary. But it's decent in the short term during R&D on a proper calculation.
+		
+			Bounds.BoxExtent = InstanceData.LocalBoundsExtent;
+			Bounds.BoxCenter = InstanceData.LocalBoundsCenter;
+		}
+	}
+
+#if SUPPORT_FIRST_PERSON_RENDERING
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_IS_FIRST_PERSON) != 0)
+	{
+		ApplyFirstPersonTransformToBounds(NaniteView, InstanceData, Bounds.BoxCenter, Bounds.BoxExtent);
+	}
+#endif // SUPPORT_FIRST_PERSON_RENDERING
+}
+
+// Get the area of an "inclusive" rect (which means that the max is inside the rect), also guards against negative area (where min > max)
+uint GetInclusiveRectArea(uint4 Rect)
+{
+	if (all(Rect.zw >= Rect.xy))
+	{
+		uint2 Size = Rect.zw - Rect.xy;
+		return (Size.x  + 1) * (Size.y + 1);
+	}
+	return 0;
+}
+
+float2 GetProjectedEdgeScales(FNaniteView NaniteView, FInstanceSceneData InstanceData, FInstanceDynamicData DynamicData, float4 Bounds)	// float2(min, max)
+{
+	if( NaniteView.ViewToClip[ 3 ][ 3 ] >= 1.0f )
+	{
+		// Ortho
+		return float2( 1, 1 );
+	}
+	float3 Center = mul( float4( Bounds.xyz, 1.0f ), DynamicData.LocalToTranslatedWorld ).xyz;
+	float Radius = Bounds.w * InstanceData.NonUniformScale.w;
+
+	float ZNear = NaniteView.NearPlane;
+	float DistToClusterSq = length2( Center );	// camera origin in (0,0,0)
+	
+	float Z = dot(NaniteView.ViewForward.xyz, Center);
+	float XSq = DistToClusterSq - Z * Z;
+	float X = sqrt( max(0.0f, XSq) );
+	float DistToTSq = DistToClusterSq - Radius * Radius;
+	float DistToT = sqrt( max(0.0f, DistToTSq) );
+	float ScaledCosTheta = DistToT;
+	float ScaledSinTheta = Radius;
+	float ScaleToUnit = rcp( DistToClusterSq );
+	float By = (  ScaledSinTheta * X + ScaledCosTheta * Z ) * ScaleToUnit;
+	float Ty = ( -ScaledSinTheta * X + ScaledCosTheta * Z ) * ScaleToUnit;
+	
+	float H = ZNear - Z;
+	if( DistToTSq < 0.0f || By * DistToT < ZNear )
+	{
+		float Bx = max( X - sqrt( Radius * Radius - H * H ), 0.0f );
+		By = ZNear * rsqrt( Bx * Bx + ZNear * ZNear );
+	}
+
+	if( DistToTSq < 0.0f || Ty * DistToT < ZNear )
+	{	
+		float Tx = X + sqrt( Radius * Radius - H * H );
+		Ty = ZNear * rsqrt( Tx * Tx + ZNear * ZNear );
+	}
+
+	float MinZ = max( Z - Radius, ZNear );
+	float MaxZ = max( Z + Radius, ZNear );
+	float MinCosAngle = Ty;
+	float MaxCosAngle = By;
+
+	if(Z + Radius > ZNear)
+		return float2( MinZ * MinCosAngle, MaxZ * MaxCosAngle );
+	else
+		return float2( 0.0f, 0.0f );
+}
+
+bool ShouldVisitChildInternal(
+	FNaniteView NaniteView,
+	FInstanceSceneData InstanceData,
+	FInstanceDynamicData DynamicData,
+	FNodeCullingBounds Bounds,
+	FHierarchyNodeSlice HierarchyNodeSlice,
+	inout float Priority
+)
+{
+	float2 ProjectedEdgeScales = GetProjectedEdgeScales(NaniteView, InstanceData, DynamicData, Bounds.Sphere);
+	float UniformScale = Bounds.MeshMinDeformScale * min3( InstanceData.NonUniformScale.x, InstanceData.NonUniformScale.y, InstanceData.NonUniformScale.z );
+	float Threshold = NaniteView.LODScale * UniformScale * HierarchyNodeSlice.MaxParentLODError;
+	if( ProjectedEdgeScales.x <= Threshold )
+	{
+		Priority = Threshold / ProjectedEdgeScales.x;	// TODO: Experiment with better priority
+		
+		bool bSkipMinLODCulling = false;
+	#if DEBUG_FLAGS
+		bSkipMinLODCulling |= (DebugFlags & (NANITE_DEBUG_FLAG_DISABLE_CULL_MIN_LOD | NANITE_DEBUG_FLAG_DRAW_ONLY_ROOT_DATA)) != 0u;
+	#endif
+
+		return bSkipMinLODCulling || !HierarchyNodeSlice.bLeaf || (ProjectedEdgeScales.y >= NaniteView.LODScale * UniformScale * HierarchyNodeSlice.MinLODError);
+	}
+	else
+	{
+		return false;
+	}
+}
+
+bool SmallEnoughToDraw(
+	FNaniteView NaniteView,
+	FInstanceSceneData InstanceData,
+	FInstanceDynamicData DynamicData,
+	FNodeCullingBounds Bounds,
+	float LODError,
+	float EdgeLength,
+	inout bool bUseHWRaster
+)
+{
+	float ProjectedEdgeScale = GetProjectedEdgeScales( NaniteView, InstanceData, DynamicData, Bounds.Sphere ).x;
+	float UniformScale = Bounds.MeshMinDeformScale * min3( InstanceData.NonUniformScale.x, InstanceData.NonUniformScale.y, InstanceData.NonUniformScale.z );
+	bool bVisible = ProjectedEdgeScale > UniformScale * LODError * NaniteView.LODScale;
+
+	if (RenderFlags & NANITE_RENDER_FLAG_FORCE_HW_RASTER)
+	{
+		bUseHWRaster = true;
+	}
+	else
+	{
+		float HWEdgeScale = InstanceData.NonUniformScale.w * Bounds.NodeMaxDeformScale;
+		bUseHWRaster |= ProjectedEdgeScale < HWEdgeScale * abs( EdgeLength ) * NaniteView.LODScaleHW; // TODO: EdgeLength shouldn't have sign
+	}
+
+	return bVisible;
+}
+
+uint DepthToBucket(float Z)
+{
+	const float ClampedZ = clamp(Z, DepthBucketsMinZ, DepthBucketsMaxZ);
+#if 1
+	// TODO: Consider a bucket distribution with infinite max z?
+	const float A = 1.0f / (log2(DepthBucketsMaxZ) - log2(DepthBucketsMinZ));
+	const float B = -log2(DepthBucketsMinZ) * A;
+	const float T = log2(ClampedZ) * A + B;
+#else	
+	const float T = (ClampedZ - DepthBucketsMinZ) / (DepthBucketsMaxZ - DepthBucketsMinZ);
+#endif
+	int DepthBucket = floor(T * NANITE_NUM_DEPTH_BUCKETS_PER_BLOCK);
+	return (uint)clamp(DepthBucket, 0, (int)NANITE_NUM_DEPTH_BUCKETS_PER_BLOCK - 1);
+}
+
+float4x4 LoadAssemblyTransform(uint TransformIndex)
+{
+#if NANITE_ASSEMBLY_DATA
+	const uint BufferAddress = TransformIndex * (uint)sizeof(float3x4);
+	const float3x4 TransposedTransform = InOutAssemblyTransforms.Load<float3x4>(BufferAddress);
+	return transpose(float4x4(
+		TransposedTransform[0],
+		TransposedTransform[1],
+		TransposedTransform[2],
+		float4(0, 0, 0, 1)
+	));
+#else
+	return float4x4(
+		float4(1, 0, 0, 0),
+		float4(0, 1, 0, 0),
+		float4(0, 0, 1, 0),
+		float4(0, 0, 0, 1)
+	);
+#endif
+}
+
+#if NANITE_HIERARCHY_TRAVERSAL
+
+MAX_OCCUPANCY
+DISABLE_TARGET_OCCUPANCY_WARNING
+
+struct FNaniteTraversalClusterCullCallback
+{
+	uint ChildIndex;
+	uint LocalNodeIndex;
+
+	FCandidateNode CandidateNode;
+	FNaniteView NaniteView;
+	FInstanceSceneData InstanceData;
+	uint AssemblyTransformIndex;
+
+	bool bVisible;
+
+	float StreamingPriority;
+
+	void Init(uint InChildIndex, uint InLocalNodeIndex, uint GroupNodeFetchIndex)
+	{
+		ChildIndex = InChildIndex;
+		LocalNodeIndex = InLocalNodeIndex;
+		
+		const uint4 NodeData = GetGroupNodeData(GroupNodeFetchIndex);
+
+		CandidateNode = UnpackCandidateNode(NodeData, bIsPostPass);
+
+		NaniteView = GetNaniteView(CandidateNode.ViewId);
+
+		InstanceData = GetInstanceSceneDataUnchecked(CandidateNode.InstanceId);
+
+		AssemblyTransformIndex = CandidateNode.AssemblyTransformIndex;
+	}
+
+	uint GetHierarchyNodeOffset()
+	{
+		return ::GetHierarchyNodeOffset(InstanceData.NaniteHierarchyOffset, CandidateNode.NodeIndex);
+	}
+
+	bool ShouldVisitChild(FHierarchyNodeSlice HierarchyNodeSlice, bool bInVisible)
+	{
+		bVisible = bInVisible;
+
+	#if CULLING_PASS == CULLING_PASS_OCCLUSION_POST
+		if ((CandidateNode.EnabledBitmask & (1u << ChildIndex)) == 0u)	// Need to check bEnabled because instance cull always writes full mask
+		{
+			bVisible = false;
+		}
+	#endif
+
+		StreamingPriority = 0.0f;
+
+		bool bOccluded = false;
+
+		float4x4 AssemblyTransform = (float4x4)0;
+		float4x4 UnskinnedAssemblyTransform = (float4x4)0;	// Used for LOD bounds
+
+		FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceData.PrimitiveId);
+		bool bWriteAssemblyTransform = false;
+		bool bHasAssemblyTransform = IsValidAssemblyTransformIndex(AssemblyTransformIndex);
+		
+		const FInstanceViewData InstanceViewData = GetInstanceViewData(InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId);
+		const bool bSkinned = (PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) != 0;
+		const bool bActiveSkinning = bSkinned && InstanceViewData.bIsDeforming;
+
+		BRANCH
+		if (bHasAssemblyTransform)
+		{
+			AssemblyTransform = LoadAssemblyTransform(AssemblyTransformIndex);
+			BRANCH
+			if (bActiveSkinning)
+			{
+				UnskinnedAssemblyTransform = LoadAssemblyTransform(AssemblyTransformIndex + 2);
+			}
+			else
+			{
+				UnskinnedAssemblyTransform = AssemblyTransform;
+			}
+		}
+		
+		BRANCH
+		if (bVisible)
+		{
+			FInstanceDynamicData DynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData, true);
+			FNodeCullingBounds NodeBounds = InitNodeCullingBounds(HierarchyNodeSlice);
+
+			BRANCH
+			if (IsValidHierarchyAssemblyTransformIndex(HierarchyNodeSlice.AssemblyTransformIndex))
+			{
+				// TODO: Combine the matrices for recursive assemblies
+				AssemblyTransform = LoadNaniteHierarchyAssemblyTransform(PrimitiveData.NaniteAssemblyTransformOffset, HierarchyNodeSlice.AssemblyTransformIndex);
+				UnskinnedAssemblyTransform = AssemblyTransform;
+
+				BRANCH
+				if (bActiveSkinning)
+				{
+					AssemblyTransform = SkinNaniteHierarchyAssemblyTransform(PrimitiveData, InstanceData, HierarchyNodeSlice.AssemblyTransformIndex, AssemblyTransform, false);
+				}
+				bHasAssemblyTransform = true;
+				bWriteAssemblyTransform = true;
+			}
+
+			BRANCH
+			if (bHasAssemblyTransform)
+			{
+				NodeBounds = TransformNodeCullingBounds(NodeBounds, AssemblyTransform, UnskinnedAssemblyTransform);
+			}
+
+			const bool bEnableWPO = (CandidateNode.Flags & NANITE_CULLING_FLAG_ENABLE_WPO) != 0u;
+			bool bExpandWPOBounds = bEnableWPO;
+
+		#if VIRTUAL_TEXTURE_TARGET
+			{
+				// We always need to expand the bounds even if WPO is distance disabled because we still need to
+				// invalidate the whole region in case it starts animating next frame/in the future.
+				const bool bWPOAllowed = VirtualShadowMapIsWPOAllowed(PrimitiveData, NaniteView.TargetLayerIndex);
+				bExpandWPOBounds = ShouldMaterialInvalidateShadowCache(PrimitiveData, bWPOAllowed);
+			}
+		#endif
+
+			TransformNodeCullingBounds(NaniteView, PrimitiveData, InstanceData, (FCluster)0, false, bHasAssemblyTransform, CandidateNode.Flags, bExpandWPOBounds, NodeBounds);
+
+			FBoxCull Cull;
+			Cull.Init( NaniteView, NodeBounds.BoxCenter, NodeBounds.BoxExtent, InstanceData.NonUniformScale, DynamicData.LocalToTranslatedWorld, DynamicData.PrevLocalToTranslatedWorld );
+			Cull.Distance();
+			Cull.GlobalClipPlane();
+
+		#if CULLING_PASS == CULLING_PASS_OCCLUSION_POST
+			if (Cull.bIsVisible && CandidateNode.Flags & NANITE_CULLING_FLAG_TEST_LOD)
+		#endif
+			{
+				Cull.bIsVisible = ShouldVisitChildInternal(NaniteView, InstanceData, DynamicData, NodeBounds, HierarchyNodeSlice, StreamingPriority);
+			}
+
+			BRANCH
+			if (Cull.bIsVisible)
+			{
+			#if VIRTUAL_TEXTURE_TARGET
+				const bool bCacheAsStatic = (CandidateNode.Flags & NANITE_CULLING_FLAG_CACHE_AS_STATIC) != 0u;
+				// If we're rendering into the static cache, it's not safe to use the receiver mask as we may cache that (full) page
+				Cull.bUseReceiverMask = Cull.bUseReceiverMask && !bCacheAsStatic;
+				Cull.PageFlagMask = GetPageFlagMaskForRendering(bCacheAsStatic, CandidateNode.InstanceId, NaniteView.SceneRendererPrimaryViewId);
+				Cull.bIsStaticGeometry = bCacheAsStatic;
+			#endif
+
+				Cull.FrustumHZB( false );
+			}
+
+		#if CULLING_PASS == CULLING_PASS_OCCLUSION_MAIN
+			BRANCH
+			if (Cull.bIsVisible && Cull.bWasOccluded && HierarchyNodeSlice.bLoaded)
+			{
+				bOccluded = true;
+			}
+		#endif
+
+			bVisible = Cull.bIsVisible && !Cull.bWasOccluded;
+		}
+
+		
+	#if DEBUG_FLAGS
+		if ((DebugFlags & NANITE_DEBUG_FLAG_HIDE_ASSEMBLY_PARTS) != 0 && bHasAssemblyTransform)
+		{
+			bVisible = false;
+			bOccluded = false;
+		}
+	#endif
+
+		BRANCH
+		if (bVisible && bWriteAssemblyTransform)
+		{
+			const uint NumAssemblyTransformsToWrite = bActiveSkinning ? 3 : 1;
+			uint TempAssemblyTransformIndex = 0; // writing to a temp before assignment to member fixes an error with VK
+			WaveInterlockedAdd_(QueueState[0].AssemblyTransformsWriteOffset, NumAssemblyTransformsToWrite, TempAssemblyTransformIndex);
+			AssemblyTransformIndex = TempAssemblyTransformIndex;
+
+			BRANCH
+			if (AssemblyTransformIndex + NumAssemblyTransformsToWrite <= MaxAssemblyTransforms)
+			{
+				InOutAssemblyTransforms.Store<float3x4>(AssemblyTransformIndex * (uint)sizeof(float3x4), (float3x4)transpose(AssemblyTransform));
+				if (bActiveSkinning)
+				{
+					// Explicitly reload assembly transform to break dependency and shorten lifetime.
+					// TODO: This will need to be fixed up for recursive assemblies
+					const float4x4 HierarchyAssemblyTransform = LoadNaniteHierarchyAssemblyTransform(PrimitiveData.NaniteAssemblyTransformOffset, HierarchyNodeSlice.AssemblyTransformIndex);
+
+					const float4x4 PrevSkinnedAssemblyTransform = SkinNaniteHierarchyAssemblyTransform(PrimitiveData, InstanceData, HierarchyNodeSlice.AssemblyTransformIndex, HierarchyAssemblyTransform, true);
+					InOutAssemblyTransforms.Store<float3x4>((AssemblyTransformIndex + 1) * (uint)sizeof(float3x4), (float3x4)transpose(PrevSkinnedAssemblyTransform));
+
+
+					InOutAssemblyTransforms.Store<float3x4>((AssemblyTransformIndex + 2) * (uint)sizeof(float3x4), (float3x4)transpose(HierarchyAssemblyTransform));
+				}
+
+			#if DEBUG_FLAGS
+				if ((DebugFlags & NANITE_DEBUG_FLAG_WRITE_ASSEMBLY_META) != 0)
+				{
+					// write the local assembly transform index for the sake of retrieving that for debug visualizers
+					OutDebugBuffer.Store(AssemblyTransformIndex * 4u, HierarchyNodeSlice.AssemblyTransformIndex);
+				}
+			#endif
+			}
+			else
+			{
+				bVisible = false;
+				bOccluded = false;
+			}
+		}
+		
+		if (bOccluded)
+		{
+			InterlockedOr(GroupOccludedBitmask[LocalNodeIndex], 1u << ChildIndex);
+		}
+
+		return bVisible;
+	}
+
+	void OnPreProcessNodeBatch(uint GroupIndex)
+	{
+#if CULLING_PASS == CULLING_PASS_OCCLUSION_MAIN
+		if (GroupIndex < NANITE_MAX_BVH_NODES_PER_GROUP)
+		{
+			GroupOccludedBitmask[GroupIndex] = 0u;
+		}
+#endif
+	}
+
+	void OnPostNodeVisit(FHierarchyNodeSlice HierarchyNodeSlice)
+	{
+		if (bVisible && HierarchyNodeSlice.bLeaf)
+		{
+			RequestPageRange(OutStreamingRequests, InstanceData.NaniteRuntimeResourceID, HierarchyNodeSlice.ResourcePageRangeKey, NaniteView.StreamingPriorityCategory, StreamingPriority);
+		}
+
+#if CULLING_PASS == CULLING_PASS_OCCLUSION_MAIN
+		if (ChildIndex == 0 && GroupOccludedBitmask[LocalNodeIndex])
+		{
+			uint OccludedNodesOffset;
+			WaveInterlockedAddScalar_(QueueState[0].PassState[1].NodeWriteOffset, 1, OccludedNodesOffset);
+			WaveInterlockedAddScalar(QueueState[0].PassState[1].NodeCount, 1);
+
+			if (OccludedNodesOffset < MaxNodes)
+			{
+				FCandidateNode Node;
+				Node.Flags = CandidateNode.Flags & ~NANITE_CULLING_FLAG_TEST_LOD;
+				Node.ViewId = CandidateNode.ViewId;
+				Node.InstanceId = CandidateNode.InstanceId;
+				Node.NodeIndex = CandidateNode.NodeIndex;
+				Node.EnabledBitmask = GroupOccludedBitmask[LocalNodeIndex];
+				Node.AssemblyTransformIndex = AssemblyTransformIndex;
+
+				OPTIONAL_COHERENT(StoreCandidateNodeData)(CandidateNodes, OccludedNodesOffset, PackCandidateNode(Node), true);
+			}
+		}
+#endif
+	}
+
+	void StoreChildNode(uint StoreIndex, FHierarchyNodeSlice HierarchyNodeSlice)
+	{
+		FCandidateNode Node;
+		Node.Flags = CandidateNode.Flags | NANITE_CULLING_FLAG_TEST_LOD;
+		Node.ViewId = CandidateNode.ViewId;
+		Node.InstanceId = CandidateNode.InstanceId;
+		Node.NodeIndex = HierarchyNodeSlice.ChildStartReference;
+		Node.EnabledBitmask = NANITE_BVH_NODE_ENABLE_MASK;
+		Node.AssemblyTransformIndex = AssemblyTransformIndex;
+
+		OPTIONAL_COHERENT(StoreCandidateNodeData)(CandidateNodes, StoreIndex, PackCandidateNode(Node), bIsPostPass);
+	}
+
+	void StoreCluster(uint StoreIndex, FHierarchyNodeSlice HierarchyNodeSlice, uint ClusterIndex)
+	{
+		StoreIndex = bIsPostPass ? (MaxCandidateClusters - 1 - StoreIndex) : StoreIndex;
+
+		FVisibleCluster CandidateCluster;
+		CandidateCluster.Flags = CandidateNode.Flags | NANITE_CULLING_FLAG_TEST_LOD;
+		CandidateCluster.ViewId = CandidateNode.ViewId;
+		CandidateCluster.InstanceId = CandidateNode.InstanceId;
+		CandidateCluster.PageIndex = HierarchyNodeSlice.ChildStartReference >> NANITE_MAX_CLUSTERS_PER_PAGE_BITS;
+		CandidateCluster.ClusterIndex = ClusterIndex;
+		CandidateCluster.AssemblyTransformIndex = AssemblyTransformIndex;
+		CandidateCluster.DepthBucket = 0;
+
+		OPTIONAL_COHERENT(StoreVisibleCluster)(CandidateClusters, StoreIndex, CandidateCluster, false);
+	}
+
+	uint4 LoadPackedCluster(uint CandidateIndex)
+	{
+		const uint LoadIndex = bIsPostPass ? (MaxCandidateClusters - 1 - CandidateIndex) : CandidateIndex;
+
+		return OPTIONAL_COHERENT(LoadVisibleClusterData)(CandidateClusters, LoadIndex, false);
+	}
+
+	bool IsNodeDataReady(uint4 RawData)
+	{
+		return all(RawData != 0xFFFFFFFFu);	// Unused parts are 0, which is ignored
+	}
+
+	bool LoadCandidateNodeDataToGroup(uint NodeIndex, uint GroupIndex, bool bCheckIfReady = true)
+	{
+		uint4 NodeData = OPTIONAL_COHERENT(LoadCandidateNodeData)(CandidateNodes, NodeIndex, bIsPostPass);
+
+		bool bNodeReady = IsNodeDataReady(NodeData);
+		if (!bCheckIfReady || bNodeReady)
+		{
+			SetGroupNodeData(GroupIndex, NodeData);
+		}
+
+		return bNodeReady;
+	}
+
+	void ClearCandidateNodeData(uint NodeIndex)
+	{
+		::OPTIONAL_COHERENT(StoreCandidateNodeData)(CandidateNodes, NodeIndex, 0xFFFFFFFFu, bIsPostPass);
+	}
+
+#if CULLING_TYPE == NANITE_CULLING_TYPE_PERSISTENT_NODES_AND_CLUSTERS
+	void AddToClusterBatch(uint BatchIndex, uint Num)
+	{
+		checkSlow(BatchIndex < GetMaxClusterBatches());
+		ClusterBatches.InterlockedAdd(GetClusterBatchesOffset(bIsPostPass) + BatchIndex * 4, Num);
+	}
+
+	void ClearClusterBatch(uint BatchIndex)
+	{
+		checkSlow(BatchIndex < GetMaxClusterBatches());
+		ClusterBatches.Store(GetClusterBatchesOffset(bIsPostPass) + BatchIndex * 4, 0);
+	}
+
+	uint LoadClusterBatch(uint BatchIndex)
+	{
+		checkSlow(BatchIndex < GetMaxClusterBatches());
+		return ClusterBatches.Load(GetClusterBatchesOffset(bIsPostPass) + BatchIndex * 4);
+	}
+#endif
+
+	void EmitVisibleCluster(bool bUseHWRaster, uint2 TotalPrevDrawClusters, uint HWClusterCounterIndex, FVisibleCluster VisibleCluster)
+	{
+		if (bUseHWRaster)
+		{
+			uint ClusterOffsetHW = 0;
+			WaveInterlockedAddScalar_(VisibleClustersArgsSWHW[HWClusterCounterIndex], 1, ClusterOffsetHW);
+
+			uint VisibleClusterOffsetHW = ClusterOffsetHW;
+			VisibleClusterOffsetHW += TotalPrevDrawClusters.y;
+#if CULLING_PASS == CULLING_PASS_OCCLUSION_POST
+			VisibleClusterOffsetHW += OffsetClustersArgsSWHW[HWClusterCounterIndex];
+#endif
+			if (VisibleClusterOffsetHW < MaxVisibleClusters)
+			{
+				StoreVisibleCluster(OutVisibleClustersSWHW, (MaxVisibleClusters - 1) - VisibleClusterOffsetHW, VisibleCluster, VIRTUAL_TEXTURE_TARGET);	// HW clusters written from the top
+			}
+		}
+		else
+		{
+			uint ClusterOffsetSW = 0;
+			WaveInterlockedAddScalar_(VisibleClustersArgsSWHW[0], 1, ClusterOffsetSW);
+
+			uint VisibleClusterOffsetSW = ClusterOffsetSW;
+			VisibleClusterOffsetSW += TotalPrevDrawClusters.x;
+#if CULLING_PASS == CULLING_PASS_OCCLUSION_POST
+			VisibleClusterOffsetSW += OffsetClustersArgsSWHW[0];
+#endif
+			if (VisibleClusterOffsetSW < MaxVisibleClusters)
+			{
+				StoreVisibleCluster(OutVisibleClustersSWHW, VisibleClusterOffsetSW, VisibleCluster, VIRTUAL_TEXTURE_TARGET);	// SW clusters written from the bottom
+			}
+		}	
+	}
+
+	void ProcessCluster(uint4 PackedCluster)
+	{
+		FVisibleCluster VisibleCluster = UnpackVisibleCluster(PackedCluster, false);
+		FInstanceSceneData InstanceData = GetInstanceSceneDataUnchecked(VisibleCluster.InstanceId);
+		FNaniteView NaniteView = GetNaniteView(VisibleCluster.ViewId);
+		FCluster Cluster = GetCluster(VisibleCluster.PageIndex, VisibleCluster.ClusterIndex);
+		FInstanceDynamicData DynamicData = CalculateInstanceDynamicData(NaniteView, InstanceData, true);
+		FInstanceViewData InstanceViewData = GetInstanceViewData(InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId);
+		const uint HWClusterCounterIndex = GetHWClusterCounterIndex(RenderFlags);
+		FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceData.PrimitiveId);
+		FNodeCullingBounds ClusterBounds = InitNodeCullingBounds(InstanceData, Cluster);
+		const bool bIsAssemblyPartCluster = IsAssemblyPartCluster(VisibleCluster);
+		const bool bActiveSkinning = Cluster.bSkinning && InstanceViewData.bIsDeforming;
+
+		if (bIsAssemblyPartCluster)
+		{
+			const float4x4 AssemblyTransform = LoadAssemblyTransform(VisibleCluster.AssemblyTransformIndex);
+			BRANCH
+			if (bActiveSkinning)
+			{
+				const float4x4 LODAssemblyTransform = LoadAssemblyTransform(VisibleCluster.AssemblyTransformIndex + 2);
+				ClusterBounds = TransformNodeCullingBounds(ClusterBounds, AssemblyTransform, LODAssemblyTransform);
+			}
+			else
+			{
+				ClusterBounds = TransformNodeCullingBounds(ClusterBounds, AssemblyTransform, AssemblyTransform);
+			}
+		}
+
+		const bool bEnableWPO = (VisibleCluster.Flags & NANITE_CULLING_FLAG_ENABLE_WPO) != 0u;
+		bool bExpandWPOBounds = bEnableWPO;
+
+#if VIRTUAL_TEXTURE_TARGET
+		bool bInvalidatePages = ShouldMaterialInvalidateShadowCache(PrimitiveData, bEnableWPO)
+							 || GetInstanceViewData(VisibleCluster.InstanceId, NaniteView.SceneRendererPrimaryViewId).bIsDeforming;
+		const bool bWPOAllowed = ShouldMaterialInvalidateShadowCache(PrimitiveData, VirtualShadowMapIsWPOAllowed(PrimitiveData, NaniteView.TargetLayerIndex));
+		// We always need to expand the bounds even if WPO is distance disabled because we still need to
+		// mark the whole region in case it starts animating next frame/in the future.
+		bExpandWPOBounds = bWPOAllowed;
+#endif
+
+		TransformNodeCullingBounds(NaniteView, PrimitiveData, InstanceData, Cluster, true, bIsAssemblyPartCluster, VisibleCluster.Flags, bExpandWPOBounds, ClusterBounds);
+
+		bool bUseHWRaster = false;
+		
+		FBoxCull Cull;
+		Cull.Init( NaniteView, ClusterBounds.BoxCenter, ClusterBounds.BoxExtent, InstanceData.NonUniformScale, DynamicData.LocalToTranslatedWorld, DynamicData.PrevLocalToTranslatedWorld );
+
+		// If the cluster isn't already sorted into the fallback bin, and the primitive enables per-cluster displacement fallback
+		// rasterization, we can check to disable displacement at a cluster level.
+		// NOTE: We never do WPO or pixel programmable distance at the cluster level, so skip those;
+		Cull.bSkipDisplacementFadeOutDistance |= 
+			(VisibleCluster.Flags & NANITE_CULLING_FLAG_FALLBACK_RASTER) != 0 ||
+			(PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_PER_CLUSTER_DISPLACEMENT_FALLBACK_RASTER) == 0;
+		Cull.bSkipWPODisableDistance = true;
+		Cull.bSkipPixelProgrammableDistance = true;
+
+		Cull.Distance();
+		Cull.GlobalClipPlane();
+		Cull.ProgrammableRasterDistance(PrimitiveData);
+
+		if (Cull.bFallbackRaster)
+		{
+			VisibleCluster.Flags |= NANITE_CULLING_FLAG_FALLBACK_RASTER;
+		}
+
+		BRANCH
+		if( Cull.bIsVisible )
+		{
+			BRANCH
+			if( CULLING_PASS != CULLING_PASS_OCCLUSION_POST || (VisibleCluster.Flags & NANITE_CULLING_FLAG_TEST_LOD) != 0 )
+			{
+				const bool bSmallEnoughToDraw = SmallEnoughToDraw(NaniteView, InstanceData, DynamicData, ClusterBounds, Cluster.LODError, Cluster.EdgeLength, bUseHWRaster);
+
+#if MATERIAL_CACHE
+				const uint TexCoordIndex = min(NANITE_MAX_UVS - 1, GetMaterialCacheUVCoordinateIndex(PrimitiveData));
+				const FUVHeader UVHeader = GetUVHeader(ClusterPageData, Cluster.PageBaseAddress + Cluster.DecodeInfoOffset, TexCoordIndex);
+
+				// Get the cluster domain range
+				float4 ClusterCacheUVMinMax = float4(
+					DecodeUVFloat(UVHeader.Min.x, UVHeader.NumMantissaBits),
+					DecodeUVFloat(UVHeader.Min.y, UVHeader.NumMantissaBits),
+					DecodeUVFloat(UVHeader.Min.x + (1u << UVHeader.NumBits.x) - 1, UVHeader.NumMantissaBits),
+					DecodeUVFloat(UVHeader.Min.y + (1u << UVHeader.NumBits.y) - 1, UVHeader.NumMantissaBits)
+				);
+
+				const float2 Min = NaniteView.MaterialCacheUnwrapMinAndInvSize.xy;
+				const float2 Max = Min + rcp(NaniteView.MaterialCacheUnwrapMinAndInvSize.zw);
+				
+				const bool bIsInUVDomain = any(ClusterCacheUVMinMax.zw >= Min) && any(ClusterCacheUVMinMax.xy <= Max);
+				Cull.bIsVisible = (bSmallEnoughToDraw || (Cluster.Flags & NANITE_CLUSTER_FLAG_STREAMING_LEAF)) && bIsInUVDomain;
+#else // MATERIAL_CACHE
+			#if VIRTUAL_TEXTURE_TARGET
+				// If there was a large delta between bSmallEnoughToDraw 
+				const bool bInvalidateFromSteamingLODDelta = (RenderFlags & NANITE_RENDER_FLAG_INVALIDATE_VSM_ON_LOD_DELTA) != 0 && !bSmallEnoughToDraw && (Cluster.Flags & NANITE_CLUSTER_FLAG_FULL_LEAF) == 0;
+				bInvalidatePages = bInvalidatePages || bInvalidateFromSteamingLODDelta;
+			#endif
+
+			#if DEBUG_FLAGS
+				if ((DebugFlags & NANITE_DEBUG_FLAG_DRAW_ONLY_ROOT_DATA) != 0u)
+				{
+					Cull.bIsVisible = (Cluster.Flags & NANITE_CLUSTER_FLAG_ROOT_GROUP) && (bSmallEnoughToDraw || (Cluster.Flags & NANITE_CLUSTER_FLAG_ROOT_LEAF));
+				}
+				else
+			#endif
+				{
+					Cull.bIsVisible = bSmallEnoughToDraw || (Cluster.Flags & NANITE_CLUSTER_FLAG_STREAMING_LEAF);
+				}
+#endif // MATERIAL_CACHE
+			}
+			else
+			{
+				bUseHWRaster |= (VisibleCluster.Flags & NANITE_CULLING_FLAG_USE_HW) != 0;
+			}
+		}
+
+#if VIRTUAL_TEXTURE_TARGET
+		const bool bCacheAsStatic = (VisibleCluster.Flags & NANITE_CULLING_FLAG_CACHE_AS_STATIC) != 0u;		
+		// If we're rendering into the static cache, it's not safe to use the receiver mask as we may cache that (full) page
+		Cull.bUseReceiverMask = Cull.bUseReceiverMask && !bCacheAsStatic;
+		Cull.PageFlagMask = GetPageFlagMaskForRendering(bCacheAsStatic, InstanceData.InstanceId, NaniteView.SceneRendererPrimaryViewId);
+		Cull.bIsStaticGeometry = bCacheAsStatic;
+#endif
+
+		Cull.FrustumHZB( true );
+
+		bUseHWRaster |= Cull.bNeedsClipping;
+
+		if( CULLING_PASS != CULLING_PASS_OCCLUSION_MAIN )
+			Cull.bIsVisible &= !Cull.bWasOccluded;
+
+		if (Cull.bIsVisible)
+		{
+			if (!Cull.bWasOccluded)
+			{
+				const uint2 TotalPrevDrawClusters = (RenderFlags & NANITE_RENDER_FLAG_HAS_PREV_DRAW_DATA) ? InTotalPrevDrawClusters[0] : 0;
+
+#if NANITE_DEPTH_BUCKETING
+				const float3 CenterTranslatedWorld = mul(float4(Cluster.BoxBoundsCenter, 1.0f), DynamicData.LocalToTranslatedWorld).xyz;
+				VisibleCluster.DepthBucket = DepthToBucket(dot(NaniteView.ViewForward.xyz, CenterTranslatedWorld));
+#endif
+				
+#if VIRTUAL_TEXTURE_TARGET
+				uint4 RectPages = Cull.RectPages;
+
+#if DEBUG_FLAGS
+				uint PageRectArea = GetInclusiveRectArea(RectPages);
+				if (PageRectArea >= LargePageRectThreshold)
+				{
+					WaveInterlockedAddScalar(OutStatsBuffer[0].NumLargePageRectClusters, 1);
+				}
+#endif
+				FVirtualSMLevelOffset PageTableLevelOffset = CalcPageTableLevelOffset(NaniteView.TargetLayerIndex, NaniteView.TargetMipLevel);
+				const uint MarkPageDirtyFlags = VirtualShadowMapGetMarkPageDirtyFlags(bCacheAsStatic, bInvalidatePages, bWPOAllowed);
+
+				uint WindowSize = bUseHWRaster ? VSM_RASTER_WINDOW_PAGES : (NANITE_LATE_VSM_PAGE_TRANSLATION ? NANITE_VSM_PAGE_TABLE_CACHE_DIM : 1);
+				for (uint WY = RectPages.y; WY <= RectPages.w; WY += WindowSize)
+				{
+					for (uint WX = RectPages.x; WX <= RectPages.z; WX += WindowSize)
+					{
+						uint2 WindowEnd = min(uint2(WX, WY) + WindowSize - 1u, RectPages.zw);
+						bool bEmitForWindow = false;
+						
+						// Clip window rect to the mapped pages.
+						uint4 ClippedWindowRect = uint4(WindowEnd, uint2(WX, WY));
+
+						for (uint Y = WY; Y <= WindowEnd.y; ++Y)
+						{
+							for (uint X = WX; X <= WindowEnd.x; ++X)
+							{
+								uint2 vPage = uint2(X, Y);
+								FVSMPageOffset PageFlagOffset = CalcPageOffset(PageTableLevelOffset, NaniteView.TargetMipLevel, vPage);
+								uint PageFlag = VirtualShadowMapGetPageFlag(PageFlagOffset);
+								if ((PageFlag & Cull.PageFlagMask) != 0)
+								{
+									if (MarkPageDirtyFlags)
+									{
+										VirtualShadowMapMarkPageDirty(PageFlagOffset, MarkPageDirtyFlags);
+									}
+
+									FShadowPhysicalPage PhysicalPageEntry = ShadowGetPhysicalPage(PageFlagOffset);
+									if (!PhysicalPageEntry.bThisLODValidForRendering)
+									{
+										// Skip this page
+										continue;
+									}
+
+									ClippedWindowRect.xy = min(ClippedWindowRect.xy, vPage);
+									ClippedWindowRect.zw = max(ClippedWindowRect.zw, vPage);
+
+									bEmitForWindow = true;
+								}
+							}
+						}
+						if (bEmitForWindow)
+						{
+							// if bEmitForWindow is true we're guaranteed to have set this to a valid rect.
+							VisibleCluster.vPage = ClippedWindowRect.xy;
+							VisibleCluster.vPageEnd = ClippedWindowRect.zw;
+							EmitVisibleCluster(bUseHWRaster, TotalPrevDrawClusters, HWClusterCounterIndex, VisibleCluster);
+						}
+					}
+				}
+#else
+				EmitVisibleCluster(bUseHWRaster, TotalPrevDrawClusters, HWClusterCounterIndex, VisibleCluster);
+#endif
+			}
+#if CULLING_PASS == CULLING_PASS_OCCLUSION_MAIN
+			else
+			{
+				uint ClusterIndex = 0;
+				WaveInterlockedAddScalar_(QueueState[0].TotalClusters, 1, ClusterIndex);
+				if (ClusterIndex < MaxCandidateClusters)
+				{
+					uint OccludedClusterOffset = 0;
+					WaveInterlockedAddScalar_(QueueState[0].PassState[1].ClusterWriteOffset, 1, OccludedClusterOffset);
+					VisibleCluster.Flags |= (bUseHWRaster ? NANITE_CULLING_FLAG_USE_HW : 0u);
+
+					OPTIONAL_COHERENT(StoreVisibleCluster)(CandidateClusters, (MaxCandidateClusters - 1) - OccludedClusterOffset, VisibleCluster, false);
+
+#if CULLING_TYPE == NANITE_CULLING_TYPE_PERSISTENT_NODES_AND_CLUSTERS
+					DeviceMemoryBarrier();
+					const uint BatchIndex = OccludedClusterOffset / NANITE_PERSISTENT_CLUSTER_CULLING_GROUP_SIZE;
+
+					checkSlow(BatchIndex < GetMaxClusterBatches());
+					ClusterBatches.InterlockedAdd(GetClusterBatchesOffset(true) + BatchIndex * 4, 1);
+#endif
+				}
+			}
+#endif
+		}
+	}
+};
+
+[numthreads(NANITE_PERSISTENT_CLUSTER_CULLING_GROUP_SIZE, 1, 1)]
+void NodeAndClusterCull(uint GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+#if CULLING_TYPE == NANITE_CULLING_TYPE_NODES
+	NodeCull<FNaniteTraversalClusterCullCallback>(GroupID, GroupIndex, QueueStateIndex);
+#elif CULLING_TYPE == NANITE_CULLING_TYPE_CLUSTERS
+	ClusterCull<FNaniteTraversalClusterCullCallback>(GroupID, GroupIndex, QueueStateIndex);
+#elif CULLING_TYPE == NANITE_CULLING_TYPE_PERSISTENT_NODES_AND_CLUSTERS
+	PersistentNodeAndClusterCull<FNaniteTraversalClusterCullCallback>(GroupIndex, QueueStateIndex);
+#endif
+}
+
+#endif // NANITE_HIERARCHY_TRAVERSAL
+
+// Make sure the indirect args we give to the rasterizer are not out of bounds and that the SW/HW ranges are not overlapping.
+Buffer<uint>				InRasterizerArgsSWHW;
+RWBuffer<uint>				OutSafeRasterizerArgsSWHW;
+RWStructuredBuffer<uint2>	OutClusterCountSWHW;
+RWBuffer<uint>				OutClusterClassifyArgs;
+
+[numthreads(1, 1, 1)]
+void CalculateSafeRasterizerArgs()
+{
+	int ClusterOffsetSW = 0;
+	int ClusterOffsetHW = 0;
+
+	BRANCH
+	if ((RenderFlags & NANITE_RENDER_FLAG_HAS_PREV_DRAW_DATA) != 0u)
+	{
+		const uint2 TotalPrevDrawClusters = InTotalPrevDrawClusters[0];
+		ClusterOffsetSW = TotalPrevDrawClusters.x;
+		ClusterOffsetHW = TotalPrevDrawClusters.y;
+	}
+
+	const uint HWClusterCounterIndex = GetHWClusterCounterIndex(RenderFlags);
+
+#if IS_POST_PASS
+	ClusterOffsetSW += OffsetClustersArgsSWHW[0];
+	ClusterOffsetHW += OffsetClustersArgsSWHW[HWClusterCounterIndex];
+#endif
+
+	int NumClustersSW = InRasterizerArgsSWHW[0];
+	int NumClustersHW = InRasterizerArgsSWHW[HWClusterCounterIndex];
+
+	const int TotalClustersSW = ClusterOffsetSW + NumClustersSW;
+	const int TotalClustersHW = ClusterOffsetHW + NumClustersHW;
+
+	if (TotalClustersSW + TotalClustersHW > (int)MaxVisibleClusters)
+	{
+		// Total number of visible clusters don't fit.
+		// Trim away the overlapping range from the SW/HW ranges.
+		
+		// TODO: Write status back to CPU so we can warn the user when this happens and r.NaniteRaster.MaxVisibleClusters needs to be adjusted higher.
+
+		const int MaxClustersSW = max((int)MaxVisibleClusters - ClusterOffsetSW - TotalClustersHW, 0);
+		const int MaxClustersHW = max((int)MaxVisibleClusters - ClusterOffsetHW - TotalClustersSW, 0);
+
+		NumClustersSW = min(NumClustersSW, MaxClustersSW);
+		NumClustersHW = min(NumClustersHW, MaxClustersHW);
+	}
+
+	const uint ArgsOffset = 0u;
+	WriteDispatchArgsSWHW(OutSafeRasterizerArgsSWHW, ArgsOffset, NumClustersSW, NumClustersHW);
+	OutClusterCountSWHW[0] = uint2(NumClustersSW, NumClustersHW);
+	OutClusterClassifyArgs[0] = ((NumClustersSW + NumClustersHW) + 63u) / 64u;
+	OutClusterClassifyArgs[1] = 1;
+	OutClusterClassifyArgs[2] = 1;
+}
+
+RWBuffer< uint > OutOccludedInstancesArgs;
+
+RWStructuredBuffer<FQueueState>			OutQueueState;
+RWStructuredBuffer< uint2 >				InOutTotalPrevDrawClusters;
+RWBuffer< uint >						InOutMainPassRasterizeArgsSWHW;
+RWBuffer< uint >						InOutPostPassRasterizeArgsSWHW;
+
+[numthreads(1, 1, 1)]
+void InitArgs()
+{
+	const uint HWClusterCounterIndex = GetHWClusterCounterIndex(RenderFlags);
+
+	uint2 DrawnClusterCounts = 0;
+
+	OutQueueState[0].TotalClusters = 0;
+	OutQueueState[0].AssemblyTransformsWriteOffset = 0;
+	for (uint i = 0; i < 2; i++)
+	{
+		OutQueueState[0].PassState[i].ClusterBatchReadOffset	= 0;
+		OutQueueState[0].PassState[i].ClusterWriteOffset		= 0;
+		OutQueueState[0].PassState[i].NodeReadOffset			= 0;
+		OutQueueState[0].PassState[i].NodeWriteOffset			= 0;
+		OutQueueState[0].PassState[i].NodeCount					= 0;
+	}
+
+	DrawnClusterCounts += uint2(InOutMainPassRasterizeArgsSWHW[0], InOutMainPassRasterizeArgsSWHW[HWClusterCounterIndex]);
+	
+	const uint ArgsOffset = 0u;
+	WriteRasterizerArgsSWHW(InOutMainPassRasterizeArgsSWHW, ArgsOffset, 0, 0);
+
+#if OCCLUSION_CULLING
+	OutOccludedInstancesArgs[0] = 0;
+	OutOccludedInstancesArgs[1] = 1;
+	OutOccludedInstancesArgs[2] = 1;
+	OutOccludedInstancesArgs[3] = 0;
+
+	DrawnClusterCounts += uint2(InOutPostPassRasterizeArgsSWHW[0], InOutPostPassRasterizeArgsSWHW[HWClusterCounterIndex]);
+
+	WriteRasterizerArgsSWHW(InOutPostPassRasterizeArgsSWHW, ArgsOffset, 0, 0);
+#endif
+
+#if DRAW_PASS_INDEX == 1
+	InOutTotalPrevDrawClusters[ 0 ] = DrawnClusterCounts;
+#elif DRAW_PASS_INDEX == 2
+	InOutTotalPrevDrawClusters[ 0 ] += DrawnClusterCounts;
+#endif
+}
+
+uint InitIsPostPass;
+
+RWBuffer< uint > OutClusterCullArgs;
+
+[numthreads(1, 1, 1)]
+void InitClusterCullArgs()
+{
+	const uint NumCandidateClusters = min(OutQueueState[0].PassState[InitIsPostPass].ClusterWriteOffset, MaxCandidateClusters);
+	OutClusterCullArgs[0] = (NumCandidateClusters + NANITE_PERSISTENT_CLUSTER_CULLING_GROUP_SIZE - 1) / NANITE_PERSISTENT_CLUSTER_CULLING_GROUP_SIZE;
+	OutClusterCullArgs[1] = 1;
+	OutClusterCullArgs[2] = 1;
+}
+
+RWBuffer< uint > OutNodeCullArgs0;
+RWBuffer< uint > OutNodeCullArgs1;
+
+[numthreads(NANITE_MAX_CLUSTER_HIERARCHY_DEPTH + 1, 1, 1)]
+void InitNodeCullArgs(uint GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint Offset = GroupIndex * NANITE_NODE_CULLING_ARG_COUNT;
+	if (GroupID == 0)
+	{
+		uint NumNodes = 0;
+		uint NumGroups = 0;
+
+		if (GroupIndex == 0)
+		{
+			const uint NodeWriteOffset = OutQueueState[0].PassState[InitIsPostPass].NodeWriteOffset;
+			NumNodes	= min(NodeWriteOffset, MaxNodes);
+			NumGroups	= (NumNodes + NANITE_MAX_BVH_NODES_PER_GROUP - 1) / NANITE_MAX_BVH_NODES_PER_GROUP;
+		}
+
+		OutNodeCullArgs0[Offset + 0] = NumGroups;		// ThreadGroupCountX
+		OutNodeCullArgs0[Offset + 1] = 1;				// ThreadGroupCountY
+		OutNodeCullArgs0[Offset + 2] = 1;				// ThreadGroupCountZ
+		OutNodeCullArgs0[Offset + 3] = NumNodes;		// NumNodes
+		OutNodeCullArgs0[Offset + 4] = 0;				// LevelStartIndex
+	}
+	else
+	{
+		OutNodeCullArgs1[Offset + 0] = 0;				// ThreadGroupCountX
+		OutNodeCullArgs1[Offset + 1] = 1;				// ThreadGroupCountY
+		OutNodeCullArgs1[Offset + 2] = 1;				// ThreadGroupCountZ
+		OutNodeCullArgs1[Offset + 3] = 0;				// NumNodes
+		OutNodeCullArgs1[Offset + 4] = 0;				// LevelStartIndex
+	}
+}
+
+Buffer<uint> InMainRasterizerArgsSWHW;
+Buffer<uint> InPostRasterizerArgsSWHW;
+uint StatusMessageId;
+
+[numthreads(1, 1, 1)]
+void FeedbackStatus()
+{
+	const uint HWClusterCounterIndex = GetHWClusterCounterIndex(RenderFlags);
+
+	const uint PeakNodes				= max(OutQueueState[0].PassState[0].NodeWriteOffset, OutQueueState[0].PassState[1].NodeWriteOffset);
+	const uint PeakCandidateClusters	= max(OutQueueState[0].PassState[0].ClusterWriteOffset, OutQueueState[0].PassState[1].ClusterWriteOffset);
+	const uint PeakVisibleClusters		= max(	InMainRasterizerArgsSWHW[0] + InMainRasterizerArgsSWHW[HWClusterCounterIndex],
+												InPostRasterizerArgsSWHW[0] + InPostRasterizerArgsSWHW[HWClusterCounterIndex]);
+												
+	FGPUMessageWriter Mw = GPUMessageBegin(StatusMessageId, 3U);
+	GPUMessageWriteItem(Mw, PeakNodes);
+	GPUMessageWriteItem(Mw, PeakCandidateClusters);
+	GPUMessageWriteItem(Mw, PeakVisibleClusters);
+}
+

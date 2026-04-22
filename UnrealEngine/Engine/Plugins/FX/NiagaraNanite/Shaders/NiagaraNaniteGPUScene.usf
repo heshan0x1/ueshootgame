@@ -1,0 +1,172 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ComputeShaderUtils.ush"
+#include "/Engine/Private/GPUScene/GPUSceneWriter.ush"
+
+#include "/Plugin/FX/Niagara/Private/NiagaraCommon.ush"
+#include "/Plugin/FX/Niagara/Private/NiagaraQuaternionUtils.ush"
+#include "/Plugin/FX/Niagara/Private/NiagaraTransformUtils.ush"
+
+uint NumAllocatedInstances;
+uint ParticleCpuCount;
+uint ParticleGpuCountOffset;
+
+uint ParticleBufferStride;
+Buffer<float> ParticleFloatData;
+Buffer<float> ParticleHalfData;
+Buffer<int> ParticleIntData;
+Buffer<uint>  ParticleCountBuffer;
+
+uint NumCustomFloats;
+uint NumCustomFloat4s;
+uint4 CustomFloatComponents[MAX_CUSTOM_FLOAT4S];
+float4 DefaultCustomFloats[MAX_CUSTOM_FLOAT4S];
+
+uint PositionComponentOffset;
+uint RotationComponentOffset;
+uint ScaleComponentOffset;
+
+uint PrevPositionComponentOffset;
+uint PrevRotationComponentOffset;
+uint PrevScaleComponentOffset;
+
+float3 DefaultPosition;
+float4 DefaultRotation;
+float3 DefaultScale;
+
+float3 DefaultPrevPosition;
+float4 DefaultPrevRotation;
+float3 DefaultPrevScale;
+
+float3 MeshScale;
+float4 MeshRotation;
+
+int MeshIndex;
+int RendererVis;
+uint MeshIndexComponentOffset;
+uint RendererVisComponentOffset;
+
+float3 SimulationToComponent_Translation;
+float4 SimulationToComponent_Rotation;
+float3 SimulationToComponent_Scale;
+float3 PreviousSimulationToComponent_Translation;
+float4 PreviousSimulationToComponent_Rotation;
+float3 PreviousSimulationToComponent_Scale;
+
+float3 SimulationLWCTile;
+
+uint PrimitiveId;
+
+#define USE_GLOBAL_NIAGARA_DATA_BUFFERS	0
+#define ENABLE_NIAGARA_INT_DATA_ACCESS	1
+#define NiagaraGetFloatBuffer() ParticleFloatData
+#define NiagaraGetHalfBuffer() ParticleHalfData
+#define NiagaraGetIntBuffer() ParticleIntData
+#define NiagaraGetFloatDataStride() ParticleBufferStride
+#define NiagaraGetIntDataStride() ParticleBufferStride
+#include "/Plugin/FX/Niagara/Private/NiagaraParticleAccess.ush"
+
+uint GetPayloadDataFlags()
+{
+	uint Flags = 0;
+	Flags |= NumCustomFloats > 0 ? INSTANCE_SCENE_DATA_FLAG_HAS_CUSTOM_DATA : 0;
+	Flags |= INSTANCE_SCENE_DATA_FLAG_HAS_DYNAMIC_DATA;
+	return Flags;
+}
+
+void CullInstance(uint InstanceId)
+{
+	// This will minimally initialize the instance data such that it will be ignored and culled
+	WriteInstancePrimitiveIdAndFlags(InstanceId, PrimitiveId, INSTANCE_SCENE_DATA_FLAG_HIDDEN);
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void UpdateMeshInstancesCS(uint3 GroupId : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint DispatchId = GetUnWrappedDispatchThreadId(GroupId, GroupIndex, THREAD_GROUP_SIZE);
+	const uint LocalInstanceId = DispatchId.x;
+
+	// Retrieve the primitive data
+	FPrimitiveSceneData PrimitiveData = GetPrimitiveData(PrimitiveId);
+	const uint InstanceId = PrimitiveData.InstanceSceneDataOffset + LocalInstanceId;
+
+	// In instance count bounds?	
+	if ( LocalInstanceId >= NumAllocatedInstances )
+	{
+		return;
+	}
+
+	// Get particle count and cull
+	uint ParticleCount = ParticleCpuCount;
+	if (ParticleGpuCountOffset != uint(-1))
+	{
+		ParticleCount = ParticleCountBuffer[ParticleGpuCountOffset];
+	}
+	
+	if ( LocalInstanceId >= ParticleCount )
+	{
+		CullInstance(InstanceId);
+		return;
+	}
+
+	// Cull on Mesh Index / Renderer Vis
+	if ( NiagaraSafeGetInt(MeshIndexComponentOffset, LocalInstanceId, MeshIndex) != MeshIndex )
+	{
+		CullInstance(InstanceId);
+		return;
+	}
+
+	if ( NiagaraSafeGetInt(RendererVisComponentOffset, LocalInstanceId, RendererVis) != RendererVis )
+	{
+		CullInstance(InstanceId);
+		return;
+	}
+
+	// Get out transforms
+	const FNiagaraTransform SimulationToComponent = MakeTransform(SimulationToComponent_Translation, SimulationToComponent_Rotation, SimulationToComponent_Scale);
+	const FNiagaraTransform PreviousSimulationToComponent = MakeTransform(PreviousSimulationToComponent_Translation, PreviousSimulationToComponent_Rotation, PreviousSimulationToComponent_Scale);
+
+	// Read Data In
+	FNiagaraTransform InstanceTransform = MakeTransform(
+		NiagaraSafeGetVec3(PositionComponentOffset, LocalInstanceId, DefaultPosition),
+		MultiplyQuat(NiagaraSafeGetVec4(RotationComponentOffset, LocalInstanceId, DefaultRotation), MeshRotation),
+		NiagaraSafeGetVec3(ScaleComponentOffset,    LocalInstanceId, DefaultScale) * MeshScale
+	);
+
+	FNiagaraTransform InstancePrevTransform = MakeTransform(
+		NiagaraSafeGetVec3(PrevPositionComponentOffset, LocalInstanceId, DefaultPosition),
+		MultiplyQuat(NiagaraSafeGetVec4(PrevRotationComponentOffset, LocalInstanceId, DefaultRotation), MeshRotation),
+		NiagaraSafeGetVec3(PrevScaleComponentOffset,    LocalInstanceId, DefaultScale) * MeshScale
+	);
+	
+	InstanceTransform = MultiplyTransform(InstanceTransform, SimulationToComponent);
+	InstancePrevTransform = MultiplyTransform(InstancePrevTransform, PreviousSimulationToComponent);
+
+	const float4x4 LocalToWorld = TransformToMatrix44(InstanceTransform);
+	const float4x4 PrevLocalToWorld = TransformToMatrix44(InstancePrevTransform);
+
+	const uint PayloadDataFlags = GetPayloadDataFlags();
+	InitializeInstanceSceneDataWS(
+		InstanceId,
+		PrimitiveId,
+		LocalInstanceId,
+ 		PayloadDataFlags,
+ 		NumCustomFloats,
+ 		0.0f,
+		DFFromTileOffset(MakeLWCMatrix(SimulationLWCTile, LocalToWorld))
+	);
+	
+	FInstancePayloadDataOffsets PayloadOffsets = GetInstancePayloadDataOffsets(PrimitiveId, PayloadDataFlags, LocalInstanceId);
+	WriteInstanceDynamicDataWS(PayloadOffsets, PrimitiveId, DFFromTileOffset(MakeLWCMatrix(SimulationLWCTile, PrevLocalToWorld)));
+
+	for ( uint i=0; i < NumCustomFloat4s; ++i )
+	{
+		float4 CustomFloatData;
+		CustomFloatData.x = NiagaraSafeGetFloat(CustomFloatComponents[i].x, LocalInstanceId, DefaultCustomFloats[i].x);
+		CustomFloatData.y = NiagaraSafeGetFloat(CustomFloatComponents[i].y, LocalInstanceId, DefaultCustomFloats[i].y);
+		CustomFloatData.z = NiagaraSafeGetFloat(CustomFloatComponents[i].z, LocalInstanceId, DefaultCustomFloats[i].z);
+		CustomFloatData.w = NiagaraSafeGetFloat(CustomFloatComponents[i].w, LocalInstanceId, DefaultCustomFloats[i].w);
+		WriteInstanceCustomData(PayloadOffsets, i, CustomFloatData);
+	}
+}

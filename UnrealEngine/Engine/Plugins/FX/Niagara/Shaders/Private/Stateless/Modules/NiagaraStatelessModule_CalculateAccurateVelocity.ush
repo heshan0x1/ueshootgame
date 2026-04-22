@@ -1,0 +1,8 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+void CalculateAccurateVelocity_Simulate(inout FStatelessParticle Particle)
+{  
+	Particle.Velocity			= (Particle.Position - Particle.PreviousPosition) * Particle.InvDeltaTime;
+	Particle.PreviousVelocity	= Particle.Velocity;
+}
+	

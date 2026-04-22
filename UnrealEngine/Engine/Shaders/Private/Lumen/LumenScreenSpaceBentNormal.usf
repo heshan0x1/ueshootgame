@@ -1,0 +1,698 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "LumenMaterial.ush"
+#include "../DeferredShadingCommon.ush"
+#include "../BRDF.ush"
+#include "../MonteCarlo.ush"
+#include "../BlueNoise.ush"
+#include "../ShadingModelsSampling.ush"
+#include "../SceneTextureParameters.ush"
+#include "../HZB.ush"
+#define IS_SSGI_SHADER 1
+#include "LumenScreenTracing.ush"
+#include "LumenHairTracing.ush"
+#include "LumenScreenProbeCommon.ush"
+#include "LumenScreenSpaceBentNormal.ush"
+#include "../ShaderPrint.ush"
+
+#ifndef THREADGROUP_SIZE
+#define THREADGROUP_SIZE 1
+#endif
+
+// "Efficiently building a matrix to rotate one vector to another"
+float3x3 BuildRotationMatrix(float3 FromDirection, float3 ToDirection)
+{
+    const float e = dot(FromDirection, ToDirection);
+    const float f = abs(e);
+
+    if (f > float(1.0f - 0.0003f))
+	{
+		 return float3x3(1, 0, 0, 0, 1, 0, 0, 0, 1);
+	}
+
+    const float3 v = cross(FromDirection, ToDirection);
+    const float h = (1.0) / (1.0 + e);     
+    const float hvx = h * v.x;
+    const float hvz = h * v.z;
+    const float hvxy = hvx * v.y;
+    const float hvxz = hvx * v.z;
+    const float hvyz = hvz * v.y;
+
+    float3x3 mtx;
+    mtx[0][0] = e + hvx * v.x;
+    mtx[0][1] = hvxy - v.z;
+    mtx[0][2] = hvxz + v.y;
+
+    mtx[1][0] = hvxy + v.z;
+    mtx[1][1] = e + h * v.y * v.y;
+    mtx[1][2] = hvyz - v.x;
+
+    mtx[2][0] = hvxz - v.y;
+    mtx[2][1] = hvyz + v.x;
+    mtx[2][2] = e + hvz * v.z;
+
+    return mtx;
+}
+
+// Number of bits in the visibility bitmask
+#define BITMASK_SECTOR_COUNT 32
+
+// Converts a min and max horizon angle into a bitmask
+uint GetOccludedBitmaskFromHorizonAngles(inout FShaderPrintContext Context, float MinHorizon, float MaxHorizon)
+{
+    uint StartHorizonInt = MinHorizon * BITMASK_SECTOR_COUNT;
+	// Note: ceil errs on the side of over-occlusion, the smallest positive angle will still occlude an entire sector
+    uint AngleHorizonInt = ceil((MaxHorizon - MinHorizon) * BITMASK_SECTOR_COUNT);
+    uint AngleHorizonBitfield = AngleHorizonInt > 0u ? (0xFFFFFFFFu >> (BITMASK_SECTOR_COUNT - AngleHorizonInt)) : 0u;
+    uint StepOccludedBitmask = AngleHorizonBitfield << StartHorizonInt;
+    return StepOccludedBitmask;
+}
+
+float HistoryDepthTestRelativeThickness;
+float2 MaxScreenFractionForAO;
+float MaxScreenFractionForGI;
+float MaxRayIntensity;
+
+float3 SampleSceneColor(float3 HitUVz)
+{
+	float3 Lighting = 0;
+
+	// Scene color history is the only one available to us, since ShortRangeAO runs async compute overlapping direct lighting
+#define USE_SCENE_COLOR_HISTORY 1
+#if USE_SCENE_COLOR_HISTORY
+	float2 HitScreenUV = HitUVz.xy;
+	float2 HitScreenPosition = (HitUVz.xy - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+	float HitDeviceZ = HitUVz.z;
+
+	float3 HitHistoryScreenPosition = GetHistoryScreenPosition(HitScreenPosition, HitScreenUV, HitDeviceZ);
+
+	float Vignette = min(ComputeHitVignetteFromScreenPos(HitScreenPosition), ComputeHitVignetteFromScreenPos(HitHistoryScreenPosition.xy));
+	float Noise = InterleavedGradientNoise(HitUVz.xy * View.BufferSizeAndInvSize.xy, ScreenProbeGatherStateFrameIndex % 8);
+
+	bool bHit = true;
+
+	// Skip reporting a hit if near the edge of the screen
+	if (Vignette < Noise)
+	{
+		bHit = false;
+	}
+
+	if (bHit)
+	{
+		// Calculate the expected depth of the pixel last frame
+		float PrevDeviceZ = HitHistoryScreenPosition.z;
+
+		// Lookup the actual depth at the same screen position last frame
+		float2 HitHistoryScreenUVForDepth = HitHistoryScreenPosition.xy * PrevScreenPositionScaleBiasForDepth.xy + PrevScreenPositionScaleBiasForDepth.zw;
+		float HistoryDeviceZ = Texture2DSampleLevel(HistorySceneDepth, GlobalPointClampedSampler, HitHistoryScreenUVForDepth, 0).x;
+
+		bHit = abs(HistoryDeviceZ - PrevDeviceZ) < HistoryDepthTestRelativeThickness * lerp(.5f, 2.0f, Noise);
+	}
+
+	if (bHit)
+	{
+		float2 HitHistoryScreenUV = HitHistoryScreenPosition.xy * PrevScreenPositionScaleBias.xy + PrevScreenPositionScaleBias.zw;
+		HitHistoryScreenUV = clamp(HitHistoryScreenUV, PrevSceneColorBilinearUVMin, PrevSceneColorBilinearUVMax);
+		Lighting = SampleScreenColor(PrevSceneColorTexture, GlobalPointClampedSampler, HitHistoryScreenUV).xyz * PrevSceneColorPreExposureCorrection;
+	}
+#else
+	Lighting = Texture2DSampleLevel(SceneTexturesStruct.SceneColorTexture, GlobalPointClampedSampler, HitUVz.xy, 0).xyz;
+#endif
+	
+	float MaxLighting = max3(Lighting.x, Lighting.y, Lighting.z);
+	if (MaxLighting > MaxRayIntensity)
+	{
+		Lighting *= MaxRayIntensity / MaxLighting;
+	}
+	return Lighting;
+}
+
+float SampleSceneDepth(float2 ScreenUV)
+{
+#if HORIZON_SEARCH_USE_HZB
+	float2 HZBUV = (ScreenUV - HZBUVToScreenUVScaleBias.zw) / HZBUVToScreenUVScaleBias.xy;
+	float DeviceHZB = FurthestHZBTexture.SampleLevel(GlobalPointClampedSampler, HZBUV, 0.0).x;
+	return ConvertFromDeviceZ(DeviceHZB);
+#else
+	return CalcSceneDepth(ScreenUV);
+#endif
+}
+
+void UpdateOccludedBitmaskForStep(
+	inout FShaderPrintContext Context, 
+	float2 SampleScreenPos, 
+	float3 ViewSpacePosition, 
+	float3 ViewVector, 
+	float3 ViewNormal, 
+	float SampleThickness, 
+	float InvForegroundDistance, 
+	float SamplingDirection, 
+	float NormalAngle, 
+	bool bUpdateAO,
+	float FadeForGI,
+	inout uint OccludedBitmask, 
+	inout uint OccludedBitmaskForGI,
+	inout float3 Lighting)
+{
+	float2 SampleScreenPosUV = SampleScreenPos * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+	float SampleDepth = SampleSceneDepth(SampleScreenPosUV);
+	float3 SampleViewPos = ScreenToViewPos(SampleScreenPosUV, SampleDepth);
+    float3 SampleDelta = SampleViewPos - ViewSpacePosition; 
+    float3 SampleDeltaBackface = SampleDelta - ViewVector * SampleThickness;
+	float3 ToSample = normalize(SampleDelta);
+
+	float2 HorizonAngles = acosFast(float2(dot(ToSample, ViewVector), dot(normalize(SampleDeltaBackface), ViewVector)));
+	HorizonAngles = saturate((SamplingDirection * -HorizonAngles + NormalAngle + .5f * PI) / PI);
+	HorizonAngles = select(SamplingDirection > 0, HorizonAngles.yx, HorizonAngles.xy);
+
+	uint StepOccludedBitmask = GetOccludedBitmaskFromHorizonAngles(Context, HorizonAngles.x, HorizonAngles.y);
+
+#if SHORT_RANGE_GI
+	float LightingVisibility = (float)countbits(StepOccludedBitmask & ~OccludedBitmaskForGI) / (float)BITMASK_SECTOR_COUNT
+		* saturate(dot(ViewNormal, ToSample))
+		// Fade out lighting from samples that are in front of the search area
+		* (1.0f - saturate(abs(SampleDelta.z) * InvForegroundDistance * 2.0f - 1.0f));
+
+	if (LightingVisibility > 0.0f)
+	{
+		float3 SampleViewNormal = ViewNormal;
+
+		#if SUBSTRATE_GBUFFER_FORMAT==1
+		const uint2 PixelPos = SampleScreenPosUV.xy * View.BufferSizeAndInvSize.xy - View.ViewRectMin.xy;
+		float3 SampleWorldNormal = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(PixelPos, 0))).WorldNormal;
+		#elif SUBSTRATE_GBUFFER_FORMAT==0 || SUBSTRATE_ENABLED==0
+		float3 SampleWorldNormal = DecodeNormal(Texture2DSampleLevel(GBufferATexture, GlobalPointClampedSampler, SampleScreenPosUV, 0).xyz);
+		#endif
+		SampleViewNormal = mul(float4(SampleWorldNormal, 0), View.TranslatedWorldToView).xyz;  
+
+		float NormalCos = saturate(dot(SampleViewNormal, -ToSample));
+		
+		if (NormalCos > 0.0f)
+		{
+			float3 SceneColor = SampleSceneColor(float3(SampleScreenPosUV, ConvertToDeviceZ(SampleDepth)));
+			Lighting += SceneColor * (NormalCos * LightingVisibility * FadeForGI);
+		}
+	}
+
+	OccludedBitmaskForGI |= StepOccludedBitmask;
+#endif
+
+	if (bUpdateAO)
+	{
+		OccludedBitmask |= StepOccludedBitmask;
+	}
+}
+
+float ForegroundSampleRejectDistanceFraction;
+float ForegroundSampleRejectPower;
+
+void UpdateOccludedHorizonForStep(
+	inout FShaderPrintContext Context, 
+	float2 SampleScreenPos, 
+	float3 ViewSpacePosition, 
+	float3 ViewVector, 
+	float3 ViewNormal, 
+	float InvForegroundDistance, 
+	float LowHorizonCos, 
+	bool bUpdateAO,
+	float FadeForGI,
+	inout float HorizonCos, 
+	inout float HorizonCosForGI, 
+	inout float3 Lighting)
+{
+	float2 SampleScreenPosUV = SampleScreenPos * View.ScreenPositionScaleBias.xy + View.ScreenPositionScaleBias.wz;
+	float SampleDepth = SampleSceneDepth(SampleScreenPosUV);
+	float3 SampleViewPos = ScreenToViewPos(SampleScreenPosUV, SampleDepth);
+    float3 SampleDelta = SampleViewPos - ViewSpacePosition; 
+
+    float SampleDist = length(SampleDelta);
+    float3 ToSample = SampleDelta / SampleDist;
+
+    float NewHorizonCos = dot(ToSample, ViewVector);
+
+#if SHORT_RANGE_GI
+	if (NewHorizonCos > HorizonCosForGI)
+	{
+		float2 HorizonAngles = acosFast(float2(NewHorizonCos, HorizonCosForGI));
+		float LightingVisibility = abs(HorizonAngles.x - HorizonAngles.y) / PI 
+			* saturate(dot(ViewNormal, ToSample))
+			// Fade out lighting from samples that are in front of the search area
+			* (1.0f - saturate(abs(SampleDelta.z) * InvForegroundDistance * 2.0f - 1.0f));
+
+		if (LightingVisibility > 0.0f)
+		{
+			float3 SampleViewNormal = ViewNormal;
+
+			#if SUBSTRATE_GBUFFER_FORMAT==1
+			const uint2 PixelPos = SampleScreenPosUV.xy * View.BufferSizeAndInvSize.xy - View.ViewRectMin.xy;
+			float3 SampleWorldNormal = SubstrateUnpackTopLayerData(Substrate.TopLayerTexture.Load(uint3(PixelPos, 0))).WorldNormal;
+			#elif SUBSTRATE_GBUFFER_FORMAT==0 || SUBSTRATE_ENABLED==0
+			float3 SampleWorldNormal = DecodeNormal(Texture2DSampleLevel(GBufferATexture, GlobalPointClampedSampler, SampleScreenPosUV, 0).xyz);
+			#endif
+			SampleViewNormal = mul(float4(SampleWorldNormal, 0), View.TranslatedWorldToView).xyz;  
+
+			float NormalCos = saturate(dot(SampleViewNormal, -ToSample));
+		
+			if (NormalCos > 0.0f)
+			{
+				float3 SceneColor = SampleSceneColor(float3(SampleScreenPosUV, ConvertToDeviceZ(SampleDepth)));
+				Lighting += SceneColor * (NormalCos * LightingVisibility * FadeForGI);
+			}
+		}
+	}
+
+	HorizonCosForGI = max(HorizonCosForGI, NewHorizonCos);	
+#endif
+	
+	if (bUpdateAO)
+	{
+		// Fade out occlusion from samples that are in front of the search area
+		NewHorizonCos = lerp(NewHorizonCos, LowHorizonCos, saturate(pow(abs(SampleDelta.z) * InvForegroundDistance, ForegroundSampleRejectPower)));
+		HorizonCos = max(HorizonCos, NewHorizonCos);
+	}
+}
+
+float SliceCount;
+float StepsPerSliceForAO;
+float StepsPerSliceForGI;
+
+void CalculateAOHorizonSearch( 
+	FLumenMaterialCoord Coord, 
+	float SceneDepth,
+	float3 WorldNormal,
+	out float OutAO,
+	out float3 OutBentNormal,
+	out float3 OutLighting)
+{
+	const float2 ScreenUV = (Coord.SvPosition + 0.5f) * View.BufferSizeAndInvSize.zw;
+	float2 ScreenPos = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+
+	// Used by horizon angle search to reject samples in the foreground 
+	float InvForegroundDistance = 1.0f / (SceneDepth * ForegroundSampleRejectDistanceFraction);
+	// Used by bitmask search to give thickness to depth buffer samples
+	float SampleThickness = SceneDepth * ForegroundSampleRejectDistanceFraction * .3f;
+
+	float3 ViewSpacePosition = ScreenToViewPos(ScreenUV, SceneDepth);
+	float DistanceToCamera = length(ViewSpacePosition);
+
+    float3 ViewVector = -ViewSpacePosition / DistanceToCamera;
+	float3 ViewNormal = mul(float4(WorldNormal, 0), View.TranslatedWorldToView).xyz;    
+
+	FShaderPrintContext Context = InitShaderPrintContext(all(Coord.SvPosition == int2(floor(View.CursorPosition * View.ViewResolutionFraction))), uint2(50, 100));
+#if 0
+	int2 DebugViewportCoord = floor(ScreenPosToViewportUV(ScreenPos) * View.ViewSizeAndInvSize.xy);
+	Print(Context, TEXT("ShortRangeAO Pixel: "));
+	Print(Context, DebugViewportCoord.x);
+	Print(Context, DebugViewportCoord.y);
+	Newline(Context);
+#endif
+
+	float2 UniformRandom = BlueNoiseVec2(Coord.SvPosition, ScreenProbeGatherStateFrameIndex);
+	float2 ViewportUVToBufferUVScale = View.ViewSizeAndInvSize.xy * View.BufferSizeAndInvSize.zw;
+	
+	float Visibility = 0;
+    float3 ViewBentNormal = 0;
+	float3 Lighting = 0;
+
+	float EffectiveSliceCount = SliceCount;
+
+	// "Algorithm 1" in "Practical Real-Time Strategies for Accurate Indirect Occlusion"
+    for (float SliceIndex = 0; SliceIndex < EffectiveSliceCount; SliceIndex++)
+    {
+        float SliceFraction = (SliceIndex + UniformRandom.x) / EffectiveSliceCount;
+        float Phi = SliceFraction * PI;
+        float CosPhi = cos(Phi);
+        float SinPhi = sin(Phi);
+		float3 SliceDirection = float3(CosPhi, SinPhi, 0);
+			
+        float3 OrthogonalSliceDirection = SliceDirection - (dot(SliceDirection, ViewVector) * ViewVector);
+        float3 AxisVector = normalize( cross(OrthogonalSliceDirection, ViewVector) );
+        float3 ProjectedNormal = ViewNormal - AxisVector * dot(ViewNormal, AxisVector);
+        float SignNorm = sign(dot(OrthogonalSliceDirection, ProjectedNormal));
+        float ProjectedNormalLength = length(ProjectedNormal);
+        float CosNormal = (float)saturate(dot(ProjectedNormal, ViewVector) / ProjectedNormalLength);
+        float NormalAngle = SignNorm * acosFast(CosNormal);
+
+		float StepsPerSlice = SHORT_RANGE_GI ? StepsPerSliceForGI : StepsPerSliceForAO;
+		float FadeMulForGI = 5.0f / MaxScreenFractionForGI;
+		float FadeAddForGI = -4.0f;
+
+		float LowHorizonCos0  = cos(NormalAngle + .5f * PI);
+        float LowHorizonCos1  = cos(NormalAngle - .5f * PI);
+        float HorizonCos0 = LowHorizonCos0; 
+        float HorizonCos1 = LowHorizonCos1; 
+		float HorizonCos0ForGI = LowHorizonCos0; 
+        float HorizonCos1ForGI = LowHorizonCos1; 
+		uint OccludedBitmask = 0;
+		uint OccludedBitmaskForGI = 0;
+
+        for (float StepIndex = 0; StepIndex < StepsPerSlice; StepIndex++)
+        {
+            // R1 sequence
+            float StepBaseNoise = float(SliceIndex + StepIndex * StepsPerSlice) * 0.6180339887498948482f;
+            float StepNoise = frac(UniformRandom.y + StepBaseNoise);
+
+            float StepFraction = (StepIndex + StepNoise) / StepsPerSliceForAO; 
+			// More samples near the start, scale to sample radius as a fraction of the viewport
+            float2 StepRadius = StepFraction * StepFraction * MaxScreenFractionForAO;
+
+			// When calculating GI we will take extra samples to reach the GI distance, skip calculating AO for these samples
+			bool bUpdateAO = SHORT_RANGE_GI ? StepIndex < StepsPerSliceForAO : true;
+			// Offset by a texel to avoid self-occlusion (only happens with HZB disabled), transform to screen space 
+            float2 SampleOffset = 2.0f * (StepRadius + View.ViewSizeAndInvSize.zw) * SliceDirection.xy;
+
+			float2 SampleScreenPos0 = ScreenPos + SampleOffset;
+			float FadeForGI = 1.0f - saturate(StepRadius.x * FadeMulForGI + FadeAddForGI);
+
+			if (all(SampleScreenPos0 > -1) && all(SampleScreenPos0 < 1))
+			{
+				#if HORIZON_SEARCH_VISIBILITY_BITMASK
+					UpdateOccludedBitmaskForStep(Context, SampleScreenPos0, ViewSpacePosition, ViewVector, ViewNormal, SampleThickness, InvForegroundDistance, 1.0f, NormalAngle, bUpdateAO, FadeForGI, OccludedBitmask, OccludedBitmaskForGI, Lighting);
+				#else
+					UpdateOccludedHorizonForStep(Context, SampleScreenPos0, ViewSpacePosition, ViewVector, ViewNormal, InvForegroundDistance, LowHorizonCos0, bUpdateAO, FadeForGI, HorizonCos0, HorizonCos0ForGI, Lighting);
+				#endif
+			}
+
+			float2 SampleScreenPos1 = ScreenPos - SampleOffset;
+
+			if (all(SampleScreenPos1 > -1) && all(SampleScreenPos1 < 1))
+			{
+				#if HORIZON_SEARCH_VISIBILITY_BITMASK
+					UpdateOccludedBitmaskForStep(Context, SampleScreenPos1, ViewSpacePosition, ViewVector, ViewNormal, SampleThickness, InvForegroundDistance, -1.0f, NormalAngle, bUpdateAO, FadeForGI, OccludedBitmask, OccludedBitmaskForGI, Lighting);
+				#else
+					UpdateOccludedHorizonForStep(Context, SampleScreenPos1, ViewSpacePosition, ViewVector, ViewNormal, InvForegroundDistance, LowHorizonCos1, bUpdateAO, FadeForGI, HorizonCos1, HorizonCos1ForGI, Lighting);
+				#endif
+			}
+        }
+
+		float SliceVisibility;
+
+		#if HORIZON_SEARCH_VISIBILITY_BITMASK
+			SliceVisibility = 1.0f - (float)countbits(OccludedBitmask) / (float)BITMASK_SECTOR_COUNT;
+			#if OUTPUT_BENT_NORMAL
+				// Not implemented, visual assert
+				ViewBentNormal = float3(1, 0, 0);
+			#endif
+		#else
+			float H0 = -acosFast(HorizonCos1);
+			float H1 = acosFast(HorizonCos0);
+				
+			// Analytical integral of the cosine weighted visibility between horizon angles
+			float IntegralArc0 = (CosNormal + 2 * H0 * sin(NormalAngle) - cos(2 * H0 - NormalAngle)) / 4.0f;
+			float IntegralArc1 = (CosNormal + 2 * H1 * sin(NormalAngle) - cos(2 * H1 - NormalAngle)) / 4.0f;
+			SliceVisibility = ProjectedNormalLength * (IntegralArc0 + IntegralArc1);
+				
+			#if OUTPUT_BENT_NORMAL
+				// "Algorithm 2" in "Practical Real-Time Strategies for Accurate Indirect Occlusion"
+				float t0 = (6 * sin(H0 - NormalAngle) - sin(3 * H0 - NormalAngle) + 6 * sin(H1 - NormalAngle) - sin(3 * H1 - NormalAngle) + 16 * sin(NormalAngle) - 3 * (sin(H0 + NormalAngle) + sin(H1 + NormalAngle))) / 12.0f;
+				float t1 = (-cos(3 * H0 - NormalAngle) - cos(3 * H1 - NormalAngle) + 8 * cos(NormalAngle) - 3 * (cos(H0 + NormalAngle) + cos(H1 + NormalAngle))) / 12.0f;
+				float3 LocalBentNormal = float3(SliceDirection.x * t0, SliceDirection.y * t0, -t1);
+				LocalBentNormal = mul(BuildRotationMatrix(float3(0, 0, -1), ViewVector), LocalBentNormal) * ProjectedNormalLength;
+				ViewBentNormal += LocalBentNormal;
+			#endif
+		#endif
+
+		Visibility += SliceVisibility;
+    }
+
+    Visibility = max(Visibility / EffectiveSliceCount, 0.03f);
+
+	#if USE_HAIRSTRANDS_VOXEL
+	if (VirtualVoxel.NodeDescCount > 0)
+	{
+		uint NumPixelSamples = NUM_PIXEL_RAYS;
+		//const float2 ScreenUV = (Coord.SvPosition + .5f) * View.BufferSizeAndInvSize.zw;
+		float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+		float TraceDistance = MaxScreenFractionForAO.x * 2.0 * GetScreenRayLengthMultiplierForProjectionType(SceneDepth).x;
+		float3x3 TangentBasis = GetTangentBasis(WorldNormal);
+		float HairVisibility = 1.0f;
+
+		for (uint PixelRayIndex = 0; PixelRayIndex < NumPixelSamples; PixelRayIndex++)
+		{
+			float2 UniformRandom = BlueNoiseVec2(Coord.SvPosition, (ScreenProbeGatherStateFrameIndex * NumPixelSamples + PixelRayIndex));
+
+			//@todo - other shading models
+			float4 HemisphereSample = CosineSampleHemisphere(UniformRandom);
+			float3 RayDirection = mul(HemisphereSample.xyz, TangentBasis);
+			uint2 NoiseCoord = Coord.SvPosition * uint2(NumPixelSamples, 1) + uint2(PixelRayIndex, 0);
+		
+			bool bHairHit;
+			float HairTransparency;
+			float HairHitT;
+
+			TraceHairVoxels(
+				NoiseCoord,
+				SceneDepth,
+				TranslatedWorldPosition,
+				RayDirection,
+				TraceDistance,
+				false,
+				bHairHit,
+				HairTransparency,
+				HairHitT);
+
+			if (bHairHit && HairHitT < TraceDistance)
+			{
+				HairVisibility -= 1.0f / (float)NumPixelSamples;
+			}
+		}
+
+		Visibility *= HairVisibility;
+	}
+	#endif
+
+	#if OUTPUT_BENT_NORMAL
+		// Overwrite the length of the bent normal with AO for consistency
+		OutBentNormal = mul(normalize(ViewBentNormal), (float3x3)View.ViewToTranslatedWorld) * Visibility; 
+	#else
+		OutBentNormal = 0;
+	#endif
+
+    OutAO = Visibility;
+	OutLighting = Lighting * (PI / EffectiveSliceCount);
+}
+
+float SlopeCompareToleranceScale;
+
+void CalculateAOStochasticHemisphere(
+	float2 ScreenUV, 
+	FLumenMaterialCoord Coord, 
+	float SceneDepth, 
+	float3 TranslatedWorldPosition, 
+	float3 WorldNormal, 
+	float TraceDistance, 
+	out float OutAO,
+	out float3 OutBentNormal)
+{
+	float3x3 TangentBasis = GetTangentBasis(WorldNormal);
+	float DepthThresholdScale = GetScreenTraceDepthThresholdScale(ScreenUV);
+	uint NumPixelSamples = NUM_PIXEL_RAYS;
+
+	float3 UnoccludedSum = 0;
+	OutBentNormal = 0;
+	OutAO = 0.0f;
+
+	UNROLL
+	for (uint PixelRayIndex = 0; PixelRayIndex < NumPixelSamples; PixelRayIndex++)
+	{
+		float2 UniformRandom = BlueNoiseVec2(Coord.SvPosition, (ScreenProbeGatherStateFrameIndex * NumPixelSamples + PixelRayIndex));
+
+		//@todo - other shading models
+		float4 HemisphereSample = CosineSampleHemisphere(UniformRandom);
+		float3 RayDirection = mul(HemisphereSample.xyz, TangentBasis);
+		float DirectionVisible = 1;
+
+		#define TRACE_SCREEN 1
+		#if TRACE_SCREEN
+		{
+			uint NumSteps = 4;
+			float StartMipLevel = 0;
+
+			uint2 NoiseCoord = Coord.SvPosition * uint2(NumPixelSamples, 1) + uint2(PixelRayIndex, 0);
+			float StepOffset = InterleavedGradientNoise(NoiseCoord + 0.5f, 0.0f);
+
+			float RayRoughness = .2f;
+		
+			FSSRTCastingSettings CastSettings = CreateDefaultCastSettings();
+			CastSettings.bStopWhenUncertain = true;
+
+			bool bHit = false;
+			float Level;
+			float3 HitUVz;
+			bool bRayWasClipped;
+
+			FSSRTRay Ray = InitScreenSpaceRayFromWorldSpace(
+				TranslatedWorldPosition, RayDirection,
+				/* WorldTMax = */ TraceDistance,
+				/* SceneDepth = */ SceneDepth,
+				/* SlopeCompareToleranceScale */ SlopeCompareToleranceScale * DepthThresholdScale * (float)NumSteps * View.ProjectionDepthThicknessScale,
+				/* bExtendRayToScreenBorder = */ false,
+				/* out */ bRayWasClipped);
+
+			bool bUncertain;
+			float3 DebugOutput;
+
+			CastScreenSpaceRay(
+				FurthestHZBTexture, FurthestHZBTextureSampler,
+				StartMipLevel,
+				CastSettings,
+				Ray, RayRoughness, NumSteps, StepOffset - .9f,
+				HZBUvFactorAndInvFactor, false,
+				/* out */ DebugOutput,
+				/* out */ HitUVz,
+				/* out */ Level,
+				/* out */ bHit,
+				/* out */ bUncertain);
+
+#if USE_HAIRSTRANDS_SCREEN
+			if (!bHit)
+			{
+				float3 Hair_DebugOutput;
+				float3 Hair_HitUVz;
+				float Hair_Level;
+				bool Hair_bHit = false;
+				bool Hair_bUncertain = bUncertain;
+
+				CastScreenSpaceRay(
+					HairStrands.HairOnlyDepthFurthestHZBTexture, FurthestHZBTextureSampler,
+					StartMipLevel,
+					CastSettings,
+					Ray, RayRoughness, NumSteps, StepOffset,
+					HZBUvFactorAndInvFactor, false,
+					/* out */ Hair_DebugOutput,
+					/* out */ Hair_HitUVz,
+					/* out */ Hair_Level,
+					/* out */ Hair_bHit,
+					/* out */ Hair_bUncertain);
+
+				if (Hair_bHit && !Hair_bUncertain)
+				{
+					DebugOutput = Hair_DebugOutput;
+					HitUVz = Hair_HitUVz;
+					bHit = Hair_bHit;
+					bUncertain = Hair_bUncertain;
+				}
+			}
+#endif
+
+			bHit = bHit && !bUncertain;
+
+#if USE_HAIRSTRANDS_VOXEL
+			if (!bHit)
+			{
+				bool bHairHit;
+				float HairTransparency;
+				float HairHitT;
+
+				TraceHairVoxels(
+					NoiseCoord,
+					SceneDepth,
+					TranslatedWorldPosition,
+					RayDirection,
+					TraceDistance,
+					false,
+					bHairHit,
+					HairTransparency,
+					HairHitT);
+
+				bHit = bHairHit && HairHitT < TraceDistance;
+			}
+#endif
+
+			DirectionVisible = bHit ? 0.0f : 1.0f;
+		}
+		#endif
+
+		UnoccludedSum += RayDirection;
+		OutBentNormal += RayDirection * DirectionVisible;
+		OutAO += DirectionVisible;
+	}
+
+	OutAO /= NumPixelSamples;
+
+	float NormalizeFactor = length(OutBentNormal);
+
+	if (NormalizeFactor > 0)
+	{
+		OutBentNormal = OutBentNormal * (OutAO / NormalizeFactor);
+	}
+}
+
+#if OUTPUT_BENT_NORMAL
+	RWTexture2DArray<uint> RWShortRangeAO;
+#else
+	RWTexture2DArray<UNORM float> RWShortRangeAO;
+#endif
+
+RWTexture2DArray<float3> RWShortRangeGI;
+
+Texture2D<float> DownsampledSceneDepth;
+Texture2D<UNORM float3> DownsampledWorldNormal;
+
+uint2 ShortRangeAOViewMin;
+uint2 ShortRangeAOViewSize;
+
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void ScreenSpaceShortRangeAOCS(
+	uint2 GroupId : SV_GroupID,
+	uint2 DispatchThreadId : SV_DispatchThreadID,
+	uint2 GroupThreadId : SV_GroupThreadID)
+{
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoordDownsampled(DispatchThreadId, GroupId, GroupThreadId, DOWNSAMPLE_FACTOR, ShortRangeAOViewMin, ShortRangeAOViewSize);
+	const uint3 ShortRangeAOCoord = Coord.DownsampledCoord;
+
+	if (Coord.bIsValid)
+	{
+		const float2 ScreenUV = (Coord.SvPosition + .5f) * View.BufferSizeAndInvSize.zw;
+		float SceneDepth = -1.0f;
+		float3 WorldNormal = float3(0, 0, 1);
+
+		#if DOWNSAMPLE_FACTOR == 2
+		{
+			SceneDepth = DownsampledSceneDepth[Coord.DownsampledCoord.xy];
+			WorldNormal = normalize(DecodeNormal(DownsampledWorldNormal[Coord.DownsampledCoord.xy]));
+		}
+		#else
+		{
+			const float DummyMaxRoughnessToTrace = 0.5f;
+			const FLumenMaterialData Material = ReadMaterialData(Coord, DummyMaxRoughnessToTrace);
+			if (IsValid(Material))
+			{
+				SceneDepth = Material.SceneDepth;
+				WorldNormal = Material.WorldNormal;
+			}
+		}
+		#endif
+
+		float AmbientOcclusion = 0.0f;
+		float3 BentNormal = WorldNormal;
+		float3 Lighting = 0.0f;
+
+		if (SceneDepth >= 0.0f)
+		{
+			#if HORIZON_SEARCH
+				CalculateAOHorizonSearch(Coord, SceneDepth, WorldNormal, AmbientOcclusion, BentNormal, Lighting);
+			#else
+				float3 TranslatedWorldPosition = GetTranslatedWorldPositionFromScreenUV(ScreenUV, SceneDepth);
+				float TraceDistance = MaxScreenFractionForAO.x * 2.0 * GetScreenRayLengthMultiplierForProjectionType(SceneDepth).x;
+				CalculateAOStochasticHemisphere(ScreenUV, Coord, SceneDepth, TranslatedWorldPosition, WorldNormal, TraceDistance, AmbientOcclusion, BentNormal);
+			#endif
+
+			// Debug passthrough
+			//BentNormal = WorldNormal;
+		}
+
+		#if OUTPUT_BENT_NORMAL
+			RWShortRangeAO[ShortRangeAOCoord] = PackScreenBentNormal(BentNormal);
+		#else
+			RWShortRangeAO[ShortRangeAOCoord] = AmbientOcclusion;
+		#endif
+
+		#if SHORT_RANGE_GI
+			RWShortRangeGI[ShortRangeAOCoord] = Lighting;
+			// Visualize input
+			//RWShortRangeGI[ShortRangeAOCoord] = SampleSceneColor(float3(ScreenUV, ConvertToDeviceZ(SceneDepth)));
+		#endif
+	}
+}

@@ -1,0 +1,70 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "MuCOE/Nodes/CustomizableObjectNodeTextureColourMap.h"
+
+#include "MuCO/CustomizableObjectCustomVersion.h"
+#include "MuCOE/EdGraphSchema_CustomizableObject.h"
+
+#include UE_INLINE_GENERATED_CPP_BY_NAME(CustomizableObjectNodeTextureColourMap)
+
+class UCustomizableObjectNodeRemapPins;
+
+#define LOCTEXT_NAMESPACE "CustomizableObjectEditor"
+
+
+void UCustomizableObjectNodeTextureColourMap::AllocateDefaultPins(UCustomizableObjectNodeRemapPins* RemapPins)
+{
+	const UEdGraphSchema_CustomizableObject* Schema = GetDefault<UEdGraphSchema_CustomizableObject>();
+
+	FString PinName = TEXT("Texture");
+	UEdGraphPin* OutputPin = CustomCreatePin(EGPD_Output, Schema->PC_Texture, FName(*PinName));
+	OutputPin->bDefaultValueIsIgnored = true;
+
+	PinName = TEXT("Base");
+	UEdGraphPin* SourcePin = CustomCreatePin(EGPD_Input, Schema->PC_Texture, FName(*PinName));
+	SourcePin->bDefaultValueIsIgnored = true;
+
+	PinName = TEXT("Mask");
+	UEdGraphPin* MaskPin = CustomCreatePin(EGPD_Input, Schema->PC_Texture, FName(*PinName));
+	MaskPin->bDefaultValueIsIgnored = true;
+
+	PinName = TEXT("Map");
+	UEdGraphPin* GradientPin = CustomCreatePin(EGPD_Input, Schema->PC_Texture, FName(*PinName));
+	GradientPin->bDefaultValueIsIgnored = true;
+}
+
+
+void UCustomizableObjectNodeTextureColourMap::BackwardsCompatibleFixup(int32 CustomizableObjectCustomVersion)
+{
+	Super::BackwardsCompatibleFixup(CustomizableObjectCustomVersion);
+	
+	if (CustomizableObjectCustomVersion == FCustomizableObjectCustomVersion::FixPinsNamesImageToTexture2)
+	{
+		if (UEdGraphPin* TexturePin = FindPin(TEXT("Image")))
+		{
+			TexturePin->PinName = TEXT("Texture");
+			UCustomizableObjectNode::ReconstructNode();
+		}
+	}
+}
+
+
+FText UCustomizableObjectNodeTextureColourMap::GetNodeTitle(ENodeTitleType::Type TitleType) const
+{
+	return LOCTEXT("Texture_Map", "Texture Colour Map");
+}
+
+
+FLinearColor UCustomizableObjectNodeTextureColourMap::GetNodeTitleColor() const
+{
+	return UEdGraphSchema_CustomizableObject::GetPinTypeColor(UEdGraphSchema_CustomizableObject::PC_Texture);
+}
+
+
+FText UCustomizableObjectNodeTextureColourMap::GetTooltipText() const
+{
+	return LOCTEXT("Texture_Gradient_Sample_Tooltip", "Map colours of map using values form image.");
+}
+
+#undef LOCTEXT_NAMESPACE
+

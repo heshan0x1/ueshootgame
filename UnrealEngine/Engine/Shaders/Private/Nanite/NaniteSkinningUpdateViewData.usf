@@ -1,0 +1,177 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../SceneData.ush"
+#include "../ViewData.ush"
+#include "../ComputeShaderUtils.ush"
+#include "../WaveOpUtil.ush"
+#include "../SceneCulling/SceneCulling.ush"
+
+#define NANITE_MULTI_VIEW 1
+
+#include "NaniteDataDecode.ush"
+#include "NaniteSceneCommon.ush"
+
+float DefaultAnimationMinScreenSize;
+
+RWStructuredBuffer<uint2> OutInstanceWorkGroups;
+RWBuffer<uint> OutInstanceWorkArgs;
+
+void EmitChunk(uint ChunkId, uint ViewMask)
+{
+	uint ChunkOutOffset = 0;
+	WaveInterlockedAddScalar_(OutInstanceWorkArgs[0u], 1u, ChunkOutOffset);
+	OutInstanceWorkGroups[ChunkOutOffset] = uint2(ChunkId, ViewMask);
+}
+
+/**
+ * We do this instead of relying on FNaniteView::CullingViewScreenMultipleSq because that has a number of other factors based into it, some which make no sense for Nanite.
+ * This should ideally be cleaned up in the future.
+ */
+float GetScreenMultipleSquared(FNaniteView NaniteView)
+{
+	return Square(max(NaniteView.ViewToClip[0][0], NaniteView.ViewToClip[1][1]));
+}
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NaniteSkinningUpdateChunkCullCS(uint ChunkId : SV_DispatchThreadID)
+{
+	// exit if out of range
+	if (ChunkId >= NumAllocatedChunks)
+	{
+		return;
+	}
+
+	// early out if chunk not allocated / used by any cell
+	if (!IsChunkUsed(ChunkId))
+	{
+		return;
+	}
+	FPackedChunkAttributes PackedChunkAttributes = LoadPackedExplicitChunkBounds(ChunkId);
+
+
+	uint CellId = ExplicitChunkCellIds[ChunkId];
+	FSceneHiearchyCellData CellData = GetSceneHiearchyCellData(CellId);
+
+	const float LevelCellSize = CellData.BlockData.LevelCellSize;
+	FInstanceChunkAttributes ChunkAttributes = UnpackInstanceChunkAttributes(PackedChunkAttributes, LevelCellSize * 2.0f, LevelCellSize * 0.5f);
+
+	// None are skinned
+	if ((ChunkAttributes.AnyFlags & PCAF_ANY_SKINNED_MESH) == 0u)
+	{
+		return;
+	}
+	FAabb CellRelativeBounds = ChunkAttributes.Aabb;
+	float3 ImplicitBoundsMin = float3(CellData.LocalCellCoord) * LevelCellSize - (LevelCellSize * 0.5f).xxx;
+	float3 LocalBoundsCenter = (CellRelativeBounds.Min + CellRelativeBounds.Max) * 0.5f + ImplicitBoundsMin;
+	float3 LocalBoundsExtent = (CellRelativeBounds.Max - CellRelativeBounds.Min) * 0.5f;
+	float MinAnimationMinScreenSize = ChunkAttributes.MinAnimationMinScreenSize;
+	bool bHasDrawDistance = MinAnimationMinScreenSize > 0.0f;
+	float CellRadius = length(LocalBoundsExtent);
+
+	// Infinity, emit the chunk
+	if (ChunkAttributes.MinAnimationMinScreenSize < 0.0f)
+	{
+		// infinite range, mark all views
+		EmitChunk(ChunkId, (1u << NumSceneRendererPrimaryViews) - 1u);
+		return;
+	}
+
+	float AnimationMinScreenSize = ChunkAttributes.MinAnimationMinScreenSize != 0.0f ? ChunkAttributes.MinAnimationMinScreenSize : DefaultAnimationMinScreenSize;
+
+
+	uint ViewMask = 0u;
+	for (uint ViewIndex = 0u; ViewIndex < NumSceneRendererPrimaryViews; ++ViewIndex)
+	{
+		FNaniteView NaniteView = GetNaniteView(ViewIndex);
+		float4x4 LocalToTranslatedWorld = MakeTranslationMatrix(DFFastToTranslatedWorld(CellData.BlockData.WorldPos, NaniteView.PreViewTranslation));
+		const float3 CenterTranslatedWorld = mul( float4( LocalBoundsCenter, 1.0f ), LocalToTranslatedWorld ).xyz;
+
+		// Adjust for cell radius
+		float DrawDist = max(0.0f, length(CenterTranslatedWorld - NaniteView.CullingViewOriginTranslatedWorld) - CellRadius);
+
+		if (GetScreenMultipleSquared(NaniteView) * Square(CellData.MaxInstanceRadius) >= Square(AnimationMinScreenSize) * Square(DrawDist))
+		{
+			ViewMask |= 1u << ViewIndex;
+		}
+	}
+
+	if (ViewMask != 0u)
+	{
+		EmitChunk(ChunkId, ViewMask);
+	}
+}
+
+
+
+StructuredBuffer<uint2> InstanceWorkGroups;
+
+[numthreads(THREAD_GROUP_SIZE, 1, 1)]
+void NaniteSkinningUpdateViewDataCS(uint3 GroupId : SV_GroupID, uint GroupThreadIndex : SV_GroupIndex)
+{
+	uint ChunkId  = InstanceWorkGroups[GroupId.x].x;
+	uint ChunkViewMask = InstanceWorkGroups[GroupId.x].y;
+	uint PackedItemChunkDesc = InstanceHierarchyItemChunks[ChunkId];
+
+	bool bIsRLEPackedChunk = false;
+	uint GroupNumInstances =  UnpackChunkInstanceCount(PackedItemChunkDesc, bIsRLEPackedChunk);
+	if (GroupThreadIndex >= GroupNumInstances)
+	{
+		return;
+	}
+	uint InstanceId = UnpackChunkInstanceId(bIsRLEPackedChunk, PackedItemChunkDesc, GroupThreadIndex);
+	FInstanceSceneData InstanceSceneData = GetInstanceSceneData(InstanceId);
+
+	if (!InstanceSceneData.ValidInstance)
+	{
+		return;
+	}
+	if ((InstanceSceneData.Flags & INSTANCE_SCENE_DATA_FLAG_HIDDEN) != 0u)
+	{
+		return;
+	}
+	if (InstanceSceneData.NaniteRuntimeResourceID == 0xFFFFFFFFu)
+	{
+		// Only process valid Nanite instances
+		return;
+	}
+	FPrimitiveSceneData PrimitiveData = GetPrimitiveData(InstanceSceneData.PrimitiveId);
+	if ((PrimitiveData.Flags & PRIMITIVE_SCENE_DATA_FLAG_SKINNED_MESH) == 0u)
+	{
+		return;
+	}
+
+	if (PrimitiveData.AnimationMinScreenSize < 0.0f)
+	{
+		// infinite range, mark all views
+		MarkInstanceAsDeformingWithViewMask(InstanceId, (1u << NumSceneRendererPrimaryViews) - 1u);
+		return;
+	}
+
+	float AnimationMinScreenSize = PrimitiveData.AnimationMinScreenSize != 0.0f 
+		? PrimitiveData.AnimationMinScreenSize 
+		: DefaultAnimationMinScreenSize;
+
+	const float RadiusSq = length2( InstanceSceneData.LocalBoundsExtent * InstanceSceneData.NonUniformScale.xyz );
+
+	uint ViewMask = 0u;
+	for (uint ViewIndex = 0u; ViewIndex < NumSceneRendererPrimaryViews; ++ViewIndex)
+	{
+		uint CurrentViewMask = 1u << ViewIndex;
+		if ((ChunkViewMask & CurrentViewMask) == 0u)
+		{
+			continue;
+		}
+		FNaniteView NaniteView = GetNaniteView(ViewIndex);
+		FInstanceDynamicData DynamicData = CalculateInstanceDynamicData(NaniteView, InstanceSceneData);
+
+		const float3 CenterTranslatedWorld = mul( float4( InstanceSceneData.LocalBoundsCenter, 1.0f ), DynamicData.LocalToTranslatedWorld ).xyz;
+		float InstanceDrawDistSq = length2(CenterTranslatedWorld - NaniteView.CullingViewOriginTranslatedWorld);
+
+		if (GetScreenMultipleSquared(NaniteView) * RadiusSq >= Square(AnimationMinScreenSize) * InstanceDrawDistSq)
+		{
+			ViewMask |= CurrentViewMask;
+		}
+	}
+	MarkInstanceAsDeformingWithViewMask(InstanceId, ViewMask);
+}

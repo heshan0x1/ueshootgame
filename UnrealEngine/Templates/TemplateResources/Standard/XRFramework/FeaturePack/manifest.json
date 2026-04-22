@@ -1,0 +1,41 @@
+{
+	"Version": 1,
+	"Name": [
+		{
+			"Language": "en",
+			"Text": "XR Framework"
+		}
+	],
+	"Description": [
+		{
+			"Language": "en",
+			"Text": "Feature Pack for the XR Templates"
+		}
+	],
+	"AssetTypes": [
+		{
+			"Language": "en",
+			"Text": ""
+		}
+	],
+	"SearchTags": [
+		{
+			"Language": "en",
+			"Text": ""
+		}
+	],
+	"ClassTypes": " ",
+	"Category": "SharedPack",
+	"Thumbnail": "XRFramework.png",
+	"Screenshots": [
+		"XRFramework_Preview.png"
+	],
+	"Ident": "XRFrameworkStandard",
+	"AdditionalFiles": {
+		"DestinationFilesFolder": "XRFramework",
+		"AdditionalFilesList": [
+			"Templates/TemplateResources/Standard/XRFramework/Content/*.*"
+		]
+	}
+}
+

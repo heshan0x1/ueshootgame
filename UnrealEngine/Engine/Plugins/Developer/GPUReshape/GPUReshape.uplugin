@@ -1,0 +1,22 @@
+{
+	"FileVersion": 1,
+	"Version": 1,
+	"VersionName": "0.1",
+	"FriendlyName": "GPU Reshape Plugin",
+	"Description": "GPU Reshape editor integration",
+	"Category": "Rendering",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"DocsURL": "",
+	"EnabledByDefault": true,
+	"SupportedTargetPlatforms":  [ "Win64" ],
+	"Modules": [
+		{
+			"Name": "GPUReshape",
+			"Type": "DeveloperTool",
+			"LoadingPhase": "PostConfigInit",
+			"PlatformAllowList": [ "Win64" ],
+			"TargetDenyList": [ "Server" ]
+		}
+	]
+}

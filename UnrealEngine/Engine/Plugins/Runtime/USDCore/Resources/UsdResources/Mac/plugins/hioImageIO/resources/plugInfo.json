@@ -1,0 +1,20 @@
+{
+  "Plugins": [
+    {
+      "Info": {
+        "Types": {
+          "HioImageIO_Image" : {
+            "bases": ["HioImage"],
+            "imageTypes": ["tif", "tiff"],
+            "precedence": 15
+          }
+        }
+      },
+      "LibraryPath": "../../../../../Source/ThirdParty/USD/Mac/lib/hioImageIO.dylib",
+      "Name": "hioImageIO",
+      "ResourcePath": "resources",
+      "Root": "..",
+      "Type": "library"
+    }
+  ]
+}

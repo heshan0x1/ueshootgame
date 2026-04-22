@@ -1,0 +1,119 @@
+<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<UserControl x:Class="Studio.Views.Documents.WorkspaceOverviewView"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:vm="using:Studio.ViewModels.Documents"
+             xmlns:controls="clr-namespace:Studio.Views.Controls"
+             xmlns:properties="clr-namespace:Studio.ViewModels.Workspace.Properties;assembly=UIX.Studio.Runtime"
+             xmlns:valueConverters="clr-namespace:Studio.ValueConverters"
+             mc:Ignorable="d"
+             d:DesignWidth="700" d:DesignHeight="400"
+             x:DataType="vm:WorkspaceOverviewViewModel" x:CompileBindings="True">
+    <UserControl.Resources>
+        <ResourceDictionary>
+            <valueConverters:PropertyVisibilityConverter x:Key="PropertyVisibilityConverter" />
+            <valueConverters:EnumFlagConverter x:Key="EnumFlagConverter" />
+        </ResourceDictionary>
+    </UserControl.Resources>
+    
+    <Grid Focusable="True" Background="{DynamicResource DockApplicationAccentBrushLow}">
+        <ScrollViewer>
+            <DockPanel Margin="2.5">
+                <controls:SectionView Title="Workspace" DockPanel.Dock="Top">
+                    <Grid>
+                        <Grid ColumnDefinitions="100,*" HorizontalAlignment="Stretch">
+                            <StackPanel Orientation="Vertical" Grid.Column="0">
+                                <TextBlock Text="Application"/>
+                                <TextBlock Text="Process"/>
+                                <TextBlock Text="Process ID"/>
+                                <TextBlock Text="Local Time"/>
+                                <TextBlock Text="GUID"/>
+                            </StackPanel>
+                            <StackPanel Orientation="Vertical" Grid.Column="1">
+                                <TextBlock Text="{Binding Workspace.Connection.Application.Name, FallbackValue=[Application]}"/>
+                                <TextBlock Text="{Binding Workspace.Connection.Application.Process, FallbackValue=[Process]}"/>
+                                <TextBlock Text="{Binding Workspace.Connection.Application.Pid, FallbackValue=[Process ID]}"/>
+                                <TextBlock Text="{Binding Workspace.Connection.LocalTime, FallbackValue=[LocalTime]}"/>
+                                <TextBlock Text="{Binding Workspace.Connection.Application.Guid, FallbackValue=[GUID]}"/>
+                            </StackPanel>
+                        </Grid>
+                        
+                        <controls:DiagnosticPlot 
+                            x:Name="DiagnosticPlot"
+                            Width="350"
+                            Height="80"
+                            Padding="0"
+                            Margin="0 0 -60 0"
+                            HorizontalAlignment="Right"/>
+                    </Grid>
+                </controls:SectionView>
+                
+                <ItemsControl
+                    VerticalAlignment="Stretch"
+                    HorizontalAlignment="Stretch"
+                    ItemsSource="{Binding Properties}"
+                    DockPanel.Dock="Top">
+                    <ItemsControl.ItemsPanel>
+                        <ItemsPanelTemplate>
+                            <DockPanel LastChildFill="True"/>
+                        </ItemsPanelTemplate>
+                    </ItemsControl.ItemsPanel>
+                    <ItemsControl.Styles>
+                        <Style Selector="ItemsControl > ContentPresenter">
+                            <Setter Property="DockPanel.Dock" Value="Top"/>
+                        </Style>
+                    </ItemsControl.Styles>
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate x:DataType="properties:IPropertyViewModel">
+                            <Grid>
+                                <Separator 
+                                    Background="{DynamicResource BorderColor}" 
+                                    VerticalAlignment="Top"
+                                    HorizontalAlignment="Stretch"
+                                    Height="2" Width="NaN"/>
+                                
+                                <controls:SectionView
+                                    Margin="0 2 0 0"
+                                    Title="{Binding Name, FallbackValue=[PropertyName]}"
+                                    InlineContent="{Binding Visibility, Converter={StaticResource EnumFlagConverter}, ConverterParameter={x:Static properties:PropertyVisibility.InlineSection}}"
+                                    IsExpanded="{Binding Visibility, Mode=OneTime, Converter={StaticResource PropertyVisibilityConverter}}">
+                                    <controls:UniformViewHost VerticalAlignment="Stretch" DataContext="{Binding}" />
+                                </controls:SectionView>
+                            </Grid>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </DockPanel>
+        </ScrollViewer>
+    </Grid>
+</UserControl>

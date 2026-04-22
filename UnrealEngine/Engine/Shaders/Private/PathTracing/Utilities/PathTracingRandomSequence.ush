@@ -1,0 +1,525 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+/*=============================================================================================
+	PathTracingRandomSequence.ush: Reference path tracing
+===============================================================================================*/
+
+#pragma once
+
+#include "../../MortonCode.ush"
+
+#define RANDSEQ_PURERANDOM	0
+#define RANDSEQ_OWENSOBOL	1
+#define RANDSEQ_LATTICE     2
+
+// Select a default if none was specified
+#ifndef RANDSEQ
+#define RANDSEQ			RANDSEQ_OWENSOBOL
+#endif
+
+#ifndef RANDSEQ_RANDOMIZED
+#define RANDSEQ_RANDOMIZED		1 // 1 to randomize per pixel, 0 to share the same sequence in all pixels (useful to benchmark coherent sampling)
+#endif
+
+#ifndef RANDSEQ_ERROR_DIFFUSION
+#define RANDSEQ_ERROR_DIFFUSION 1 // Enabled by default, only works when using RANDSEQ_OWENSOBOL or RANDSEQ_LATTICE
+#endif
+
+#ifndef RANDSEQ_UNROLL_SOBOL
+#define RANDSEQ_UNROLL_SOBOL 1 // Use unrolled Sobol loop such that table can be inline constants.
+#endif
+
+#ifndef RANDSEQ_VERSION
+#define RANDSEQ_VERSION 1 // TODO: Remove code for old version (0) once all testsuite images have been updated
+#endif
+
+#ifndef RANDSEQ_SFC_TEXTURE
+#define RANDSEQ_SFC_TEXTURE 0 // 0 uses a Hilbert curve (ALU heavy) while 1 uses a precomputed texture (must be passed as a shader parameter)
+#endif
+
+// This hash mixes bits at the theoretical bias limit
+uint PerfectIntegerHash(uint x)
+{
+	// https://nullprogram.com/blog/2018/07/31/
+	// exact bias: 0.020888578919738908
+	x ^= x >> 17;
+	x *= 0xed5ad4bbu;
+	x ^= x >> 11;
+	x *= 0xac4c1b51u;
+	x ^= x >> 15;
+	x *= 0x31848babu;
+	x ^= x >> 14;
+	return x;
+}
+
+// High quality integer hash - this mixes bits almost perfectly
+uint StrongIntegerHash(uint x)
+{
+	// From https://github.com/skeeto/hash-prospector
+#if RANDSEQ_VERSION == 1
+	// Current best hash in this form: https://github.com/skeeto/hash-prospector/issues/19#issuecomment-1105792898
+	// bias = 0.10734781817103507
+	x ^= x >> 16;
+	x *= 0x21f0aaad;
+	x ^= x >> 15;
+	x *= 0xf35a2d97;
+	x ^= x >> 15;
+#else
+	// bias = 0.16540778981744320
+	x ^= x >> 16;
+	x *= 0xa812d533;
+	x ^= x >> 15;
+	x *= 0xb278e4ad;
+	x ^= x >> 17;
+#endif
+	return x;
+}
+
+// Base must be a prime number
+float Halton(uint Index, uint Base)
+{
+	float r = 0.0, f = 1.0;
+	float BaseInv = 1.0 / Base;
+	while (Index > 0)
+	{
+		f *= BaseInv;
+		r += f * (Index % Base);
+		Index /= Base;
+	}
+	return r;
+}
+
+uint FastOwenScramblingCore(uint Index, uint Seed)
+{
+#if 0
+	// reference implementation - scramble bits one at a time
+
+	// loop below does not require pre-inverted bits, so undo the inversion assumed in the optimized case below
+	Index = reversebits(Index);
+	for (uint Mask = 1u << 31, Input = Index; Mask; Mask >>= 1) {
+		Seed = PerfectIntegerHash(Seed); // randomize state
+		Index ^= Seed & Mask;  // flip output (depending on state)
+		Seed ^= Input & Mask;  // flip state  (depending on input)
+	}
+	return Index;
+#elif RANDSEQ_VERSION == 1
+	// This simple tweak appears to be nearly as good as the reference, while being cheaper to compute
+	Index ^= Index * 0xe0705d72u;
+	Index += Seed;
+	Seed ^= Seed >> 16;
+	Index *= Seed | 1;
+#elif 1
+	// Laine and Karras / Stratified Sampling for Stochastic Transparency / EGSR 2011
+
+	// The operations below will mix bits toward the left, so temporarily reverse the order
+	// NOTE: This operation has been performed outside this call
+	// Index = reversebits(Index);
+	
+	// This follows the basic construction from the paper above. The error-diffusion sampler which
+	// tiles a single point set across the screen, makes it much easier to visually "see" the impact of the scrambling.
+	// When the scrambling is not good enough, the structure of the space-filling curve is left behind.
+	// Care must be taken to ensure that the scrambling is still unbiased on average though. I found some cases
+	// that seemed to produce lower visual error but were actually biased due to not touching certain bits,
+	// leading to correlations across dimensions.
+
+	// After much experimentation with the hash prospector, I discovered the following two constants which appear to
+	// give results as good (or better) than the original 4 xor-mul constants from the Laine/Karras paper.
+	// It isn't entirely clear to me why some constants work better than others. Some hashes with slightly less
+    // bias produced visibly more error or worse looking power spectra.
+	// Estimates below from hash prospector for all hashes of the form: add,xmul=c0,xmul=c1 (with c0 and c1 being
+	// the constants below).
+	// Ran with score_quality=16 for about ~10000 random hashes
+	// Average bias: ~727.02
+	//   Best  bias: ~723.05
+	//   Worst bias: ~735.19
+	Index += Seed; // randomize the index by our seed (pushes bits toward the left)
+	Index ^= Index * 0x9c117646u;
+	Index ^= Index * 0xe0705d72u;
+#else
+	// This is a higher quality owen-scrambling hash but doesn't appear to make much difference
+	// https://psychopath.io/post/2021_01_30_building_a_better_lk_hash
+	Index ^= Index * 0x3d20adeau;
+	Index += Seed;
+	Index *= (Seed >> 16) | 1;
+	Index ^= Index * 0x05526c56u;
+	Index ^= Index * 0x53a22864u;
+#endif
+	return Index;
+}
+
+uint FastOwenScrambling(uint Index, uint Seed)
+{
+	Index = FastOwenScramblingCore(Index, Seed);
+	// Undo the reverse so that we get left-to-right scrambling
+	// thereby emulating owen-scrambling
+	return reversebits(Index);
+}
+
+#if RANDSEQ_SFC_TEXTURE == 1
+Texture2D<uint> RandomSequenceSpaceFillingCurve;
+// Given a point (X,Y) on the unit square [0,2^B)^2, return the index along a space filling curve in [0,2^2B)
+// The space filling curve index is encoded in a texture which must be passed in as a shader parameter.
+
+uint SFCInverse(uint X, uint Y, int NumBits)
+{
+	const uint Mask = (1u << NumBits) - 1;
+	return RandomSequenceSpaceFillingCurve.Load(uint3(X & Mask, Y & Mask, 0));
+}
+#else
+// Given a point (X,Y) on the unit square [0,2^B)^2, return the index along the hilbert curve in [0,2^2B)
+// Because this function only loops over the bits it uses, there is no need to mask out bits beyond the
+// bit count, the pattern will simply tile. This is meant to be a fallback if you don't want/need to pass in
+// the space filling curve texture.
+uint SFCInverse(uint X, uint Y, int NumBits)
+{
+	// https://github.com/hcs0/Hackers-Delight/blob/master/hilbert/hil_s_from_xy.c.txt
+	uint HilbertIndex = 0, HilbertState = 0;
+	for (int i = NumBits; i--;) {
+		uint xi = (X >> i) & 1;
+		uint yi = (Y >> i) & 1;
+		uint Row = 8 * HilbertState + 4 * xi + 2 * yi;
+		HilbertIndex = HilbertIndex * 4 + ((0x361E9CB4u >> Row) & 3);
+		HilbertState = (0x8FE65831u >> Row) & 3;
+	}
+	return HilbertIndex;
+}
+#endif
+
+#if RANDSEQ_VERSION == 1
+// Matrices handled explicitly in SamplerCore
+#else
+// 32-bit Sobol matrices for dimension 2,3 from:
+// S. Joe and F. Y. Kuo, Constructing Sobol sequences with better two-dimensional projections, SIAM J. Sci. Comput. 30, 2635-2654 (2008)
+//    https://web.maths.unsw.edu.au/~fkuo/sobol/
+// NOTE: we don't bother storing dimension 0 since it is just a bit reversal
+// NOTE2: we don't bother storing dimension 1 either since it has a very simple pattern
+// NOTE3: the matrix elements are reversed to save one reverse in the owen scrambling
+static const uint2 SobolMatrices[32] = {
+	uint2(0x00000001, 0x00000001),
+	uint2(0x00000003, 0x00000003),
+	uint2(0x00000006, 0x00000004),
+	uint2(0x00000009, 0x0000000a),
+	uint2(0x00000017, 0x0000001f),
+	uint2(0x0000003a, 0x0000002e),
+	uint2(0x00000071, 0x00000045),
+	uint2(0x000000a3, 0x000000c9),
+	uint2(0x00000116, 0x0000011b),
+	uint2(0x00000339, 0x000002a4),
+	uint2(0x00000677, 0x0000079a),
+	uint2(0x000009aa, 0x00000b67),
+	uint2(0x00001601, 0x0000101e),
+	uint2(0x00003903, 0x0000302d),
+	uint2(0x00007706, 0x00004041),
+	uint2(0x0000aa09, 0x0000a0c3),
+	uint2(0x00010117, 0x0001f104),
+	uint2(0x0003033a, 0x0002e28a),
+	uint2(0x00060671, 0x000457df),
+	uint2(0x000909a3, 0x000c9bae),
+	uint2(0x00171616, 0x0011a105),
+	uint2(0x003a3939, 0x002a7289),
+	uint2(0x00717777, 0x0079e7db),
+	uint2(0x00a3aaaa, 0x00b6dba4),
+	uint2(0x01170001, 0x0100011a),
+	uint2(0x033a0003, 0x030002a7),
+	uint2(0x06710006, 0x0400079e),
+	uint2(0x09a30009, 0x0a000b6d),
+	uint2(0x16160017, 0x1f001001),
+	uint2(0x3939003a, 0x2e003003),
+	uint2(0x77770071, 0x45004004),
+	uint2(0xaaaa00a3, 0xc900a00a)
+};
+#endif
+
+uint EvolveSobolSeed(inout uint Seed)
+{
+#if RANDSEQ_VERSION == 1
+	// LCG parameters from
+	// "Computationally Easy, Spectrally Good Multipliers for Congruential Pseudorandom Number Generators"
+	//   Guy Steele, Sebastiano Vigna
+	//  Journal of Software: Practice and Experience, Volume 52, Issue 2, Feb 2022
+	return Seed = Seed * 0x915f77f5u + 0x93d765ddu;
+#else
+	// constant from: https://www.pcg-random.org/posts/does-it-beat-the-minimal-standard.html
+	const uint MCG_C = 2739110765;
+	// a slightly weaker hash is ok since this drives FastOwenScrambling which is itself a hash
+	// Note that the Seed evolution is just an integer addition and the hash should optimize away
+	// when a particular dimension is not used
+	uint X = (Seed += MCG_C);
+	// Generated using https://github.com/skeeto/hash-prospector
+	// Estimated Bias ~583
+	X *= 0x92955555u;
+	X ^= X >> 15;
+	return X;
+#endif
+}
+
+#if RANDSEQ == RANDSEQ_PIX_LATTICE
+Texture2D<uint> PixelLatticeShift;
+#endif
+
+uint4 SamplerCore(uint SampleIndex, inout uint Seed)
+{
+#if RANDSEQ == RANDSEQ_PURERANDOM
+	uint4 Result = uint4(StrongIntegerHash(Seed + 0),
+						 StrongIntegerHash(Seed + 1),
+						 StrongIntegerHash(Seed + 2),
+						 StrongIntegerHash(Seed + 3));
+	Seed += 4;
+	return Result;
+#elif RANDSEQ == RANDSEQ_OWENSOBOL
+	// first scramble the index to decorelate from other 4-tuples
+	uint SobolIndex = FastOwenScrambling(SampleIndex, EvolveSobolSeed(Seed));
+	// now get Sobol' point from this index
+	uint4 Result = uint4(SobolIndex, SobolIndex, 0, 0);
+#if RANDSEQ_VERSION == 1
+	// "SZ Sequences: Binary-Based (0,2^q)-Sequences"
+	//  Abdalla G. M. Ahmed, Matt Pharr, Victor Ostromoukhov, Hui Huang
+	// 	  https://arxiv.org/pdf/2505.20434
+	//    Preprint, May 2025
+	// We only need dimension 2 because 3 can be derived via the formula Uy = P * Ux
+	// TODO: The paper suggests a faster method via Equation 42
+	Result.z = SobolIndex & 3;
+	Result.z ^= ((SobolIndex >>  2) & 1) * 6u;
+	Result.z ^= ((SobolIndex >>  3) & 1) * 11u;
+	Result.z ^= ((SobolIndex >>  4) & 1) * 19u;
+	Result.z ^= ((SobolIndex >>  5) & 1) * 33u;
+	Result.z ^= ((SobolIndex >>  6) & 1) * 109u;
+	Result.z ^= ((SobolIndex >>  7) & 1) * 182u;
+	Result.z ^= ((SobolIndex >>  8) & 1) * 258u;
+	Result.z ^= ((SobolIndex >>  9) & 1) * 515u;
+	Result.z ^= ((SobolIndex >> 10) & 1) * 1547u;
+	Result.z ^= ((SobolIndex >> 11) & 1) * 2829u;
+	Result.z ^= ((SobolIndex >> 12) & 1) * 4897u;
+	Result.z ^= ((SobolIndex >> 13) & 1) * 8498u;
+	Result.z ^= ((SobolIndex >> 14) & 1) * 28086u;
+	Result.z ^= ((SobolIndex >> 15) & 1) * 46811u;
+	Result.z ^= ((SobolIndex >> 16) & 1) * 65539u;
+	Result.z ^= ((SobolIndex >> 17) & 1) * 131073u;
+	Result.z ^= ((SobolIndex >> 18) & 1) * 393229u;
+	Result.z ^= ((SobolIndex >> 19) & 1) * 720902u;
+	Result.z ^= ((SobolIndex >> 20) & 1) * 1245234u;
+	Result.z ^= ((SobolIndex >> 21) & 1) * 2162707u;
+	Result.z ^= ((SobolIndex >> 22) & 1) * 7143643u;
+	Result.z ^= ((SobolIndex >> 23) & 1) * 11927661u;
+	Result.z ^= ((SobolIndex >> 24) & 1) * 16909057u;
+	Result.z ^= ((SobolIndex >> 25) & 1) * 33751298u;
+	Result.z ^= ((SobolIndex >> 26) & 1) * 101387526u;
+	Result.z ^= ((SobolIndex >> 27) & 1) * 185402891u;
+	Result.z ^= ((SobolIndex >> 28) & 1) * 320942611u;
+	Result.z ^= ((SobolIndex >> 29) & 1) * 556929825u;
+	Result.z ^= ((SobolIndex >> 30) & 1) * 1840700269u;
+	Result.z ^= ((SobolIndex >> 31) & 1) * 3067833782u;
+   	// y and w component can be computed without iteration by starting with Result.xz
+	// "An Implementation Algorithm of 2D Sobol Sequence Fast, Elegant, and Compact"
+	// Abdalla Ahmed, EGSR 2024
+	// See listing (19) in the paper
+	// The code is different here because we want the output to be bit-reversed, but
+	// the methodology is the same
+	Result.w = Result.z;
+	Result.yw ^=  Result.yw               >> 16;
+	Result.yw ^= (Result.yw & 0xFF00FF00) >>  8;
+	Result.yw ^= (Result.yw & 0xF0F0F0F0) >>  4;
+	Result.yw ^= (Result.yw & 0xCCCCCCCC) >>  2;
+	Result.yw ^= (Result.yw & 0xAAAAAAAA) >>  1;
+#else
+	// y component can be computed without iteration
+	// "An Implementation Algorithm of 2D Sobol Sequence Fast, Elegant, and Compact"
+	// Abdalla Ahmed, EGSR 2024
+	// See listing (19) in the paper
+	// The code is different here because we want the output to be bit-reversed, but
+	// the methodology is the same
+	Result.y ^=  Result.y               >> 16;
+	Result.y ^= (Result.y & 0xFF00FF00) >>  8;
+	Result.y ^= (Result.y & 0xF0F0F0F0) >>  4;
+	Result.y ^= (Result.y & 0xCCCCCCCC) >>  2;
+	Result.y ^= (Result.y & 0xAAAAAAAA) >>  1;
+	// Remaining bits require a bit-vector by matrix multiplication (in F2, so multiplication is 'and' and addition is 'xor')
+#if RANDSEQ_UNROLL_SOBOL // unrolled version seems faster in most cases
+	UNROLL for (uint b = 0; b < 32; b++)
+	{
+		uint IndexBit = (SobolIndex >> b) & 1;		// bitfield extract
+#else // however a loop with early exit seems faster in the path tracing context (possibly due to low occupancy?)
+	for (uint b = 0; SobolIndex; SobolIndex >>= 1, b++)
+	{
+		uint IndexBit = SobolIndex & 1;
+#endif
+		Result.zw ^= IndexBit * SobolMatrices[b];
+	}
+#endif
+	// finally scramble the points to avoid structured artifacts
+	Result.x = FastOwenScrambling(Result.x, EvolveSobolSeed(Seed));
+	Result.y = FastOwenScrambling(Result.y, EvolveSobolSeed(Seed));
+	Result.z = FastOwenScrambling(Result.z, EvolveSobolSeed(Seed));
+	Result.w = FastOwenScrambling(Result.w, EvolveSobolSeed(Seed));
+	return Result;
+#elif RANDSEQ == RANDSEQ_LATTICE
+	// Simplified algorithm using rank-1 lattice sequences. It avoids the extra call to reverse bits
+	// Scrambling the _output_ does not appear to help, so we only need to scramble the index, leading to a very fast algorithm
+	// Unfortunately, the resulting sequence does not have quite as good quality as Sobol in practice
+
+	uint LatticeIndex = FastOwenScramblingCore(SampleIndex, EvolveSobolSeed(Seed));
+
+	// Lattice parameters taken from:
+	// Weighted compound integration rules with higher order convergence for all N
+	// Fred J. Hickernell, Peter Kritzer, Frances Y. Kuo, Dirk Nuyens
+	// Numerical Algorithms - February 2012
+	return LatticeIndex * uint4(1, 364981, 245389, 97823);
+#endif
+}
+
+/// A simple struct that encapsulates a random number sequence (extensible in dimension)
+/// Once you create the struct, you can draw samples in the unit square (as either floats or bits) in any dimension from 1 to 4.
+/// If you need more dimensions, you can repeat the calls, which will be guaranteed to be statistically independent from the previous
+/// However the values from a single call (Get1D(), Get2D(), etc ...) should have nice stratification properties
+/// If you need to draw N samples for a pixel, you need to create the struct N times.
+struct FRandomSequence
+{
+	uint SampleIndex;		// index into the random sequence
+	uint SampleSeed;		// changes as we draw samples to reflect the change in dimension
+
+	// Return a random value in [0,2^32)^d
+	// All functions rely on the 4D variant and we rely on compiler to optimize out the dead code
+	// This also guarantees that the sequence will not "shift" if you change a call from one dimension to another because the seed will be changed in a consistent way in all cases
+	uint  Get1DBits() { return SamplerCore(SampleIndex, SampleSeed).x; }
+	uint2 Get2DBits() { return SamplerCore(SampleIndex, SampleSeed).xy; }
+	uint3 Get3DBits() { return SamplerCore(SampleIndex, SampleSeed).xyz; }
+	uint4 Get4DBits() { return SamplerCore(SampleIndex, SampleSeed); }
+
+	// Convert the random value in [0,2^32)^d to a uniformly distributed float in [0,1)^d,
+	// taking care not to skew the distribution due to the non-uniform spacing of floats.
+	// Use the upper 24 bits to preserve the good properties of low-discrenpancy samplers.
+	// The floating point constant is 2^-24 (would be more nicely expressed with hex-floats which are not yet supported in HLSL)
+	// The implicit int to float cast here is guaranteed to be lossless because float can represent integers up to 2^24 exactly
+	float  Get1D() { return (Get1DBits() >> 8) * 5.96046447754e-08; }
+	float2 Get2D() { return (Get2DBits() >> 8) * 5.96046447754e-08; }
+	float3 Get3D() { return (Get3DBits() >> 8) * 5.96046447754e-08; }
+	float4 Get4D() { return (Get4DBits() >> 8) * 5.96046447754e-08; }
+
+	// Split the path into Num entries. The RandomSequence object returned can be used to keep sampling along the "Index" branch of the split
+	// Index must be a value in [0,Num), Num should be >0
+	FRandomSequence Split(uint Index, uint Num);
+};
+
+// This initializes a multi-dimensional sampler for a particular pixel. The FrameIndex parameter should be set
+// such that it changes per sample. See the function below when you know how many samples you plan on taking
+// for a particular integral.
+FRandomSequence RandomSequenceCreate(uint PositionSeed, uint FrameIndex)
+{
+	// optionally disable randomization per pixel so that all pixels follow the same path in primary sample space
+#if RANDSEQ_RANDOMIZED == 0
+	PositionSeed = 0;
+#endif
+
+	FRandomSequence RandSequence = (FRandomSequence) 0;
+
+#if RANDSEQ == RANDSEQ_PURERANDOM
+	RandSequence.SampleIndex = 0; // not used
+	RandSequence.SampleSeed = StrongIntegerHash(PositionSeed + StrongIntegerHash(FrameIndex));
+#elif RANDSEQ == RANDSEQ_OWENSOBOL || RANDSEQ == RANDSEQ_LATTICE
+	// pre-compute bit reversal needed for FastOwenScrambling since this index doesn't change
+	RandSequence.SampleIndex = reversebits(FrameIndex);
+	// change seed to get a unique sequence per pixel
+	RandSequence.SampleSeed  = StrongIntegerHash(PositionSeed);
+#else
+#error "Unknown random sequence chosen in path tracer"
+#endif
+	return RandSequence;
+}
+
+
+// This is an alternative initialization to the method above when you know how many samples you are planning on taking. This incorporates the 
+// TimeSeed0 (this should usually be the frame number when using all samples in one frame, or should be the frame on which the first sample was
+// taken if taking one sample per frame like the path tracer).
+FRandomSequence RandomSequenceCreate(uint3 PixelCoordAndFrame, uint SampleIndex, uint MaxSamples)
+{
+	FRandomSequence RandSequence = (FRandomSequence) 0;
+
+#if RANDSEQ_ERROR_DIFFUSION == 1 && (RANDSEQ == RANDSEQ_OWENSOBOL || RANDSEQ == RANDSEQ_LATTICE)
+	// The core idea is to use a single sobol pattern across the screen using a space filling curve to correlate nearby pixels
+	// This achieves a much better error diffusion than the random sequence assignment of the method above
+	// This algorithm is covered in the following paper:
+	//   "Screen-Space Blue-Noise Diffusion of Monte Carlo Sampling Error via Hierarchical Ordering of Pixels"
+	//   Siggraph Asia 2020
+	//   http://abdallagafar.com/publications/zsampler/
+	// Improvements made in this version are: 
+	//   - switching the z-order curve for a sierpinski curve
+	//   - switching sobol points for owen-sobol points
+	//   - recognizing that the hierarchical scrambling proposed in the original paper is equivalent to Owen-Scrambling of the index
+	// Downsides of this method:
+	//   - quality does not improve beyond the target sample count, making usage with adaptive sampling difficult
+	//   - error-diffusion property is only achieved at the target sample count, earlier samples look random (sometimes slightly worse than random)
+
+	uint TileID = SFCInverse(PixelCoordAndFrame.x, PixelCoordAndFrame.y, 8);
+
+#if 0
+	// Combine frame/sample index into the spatial index in a way that diffuses the error spatially and temporally
+	// However this appears to be worse overall, averaging successive frames does not converge quickly
+	// instead there are artifacts resulting from the space filling curve being explored in linear order.
+	TileID ^= FastOwenScrambling(reversebits(PixelCoordAndFrame.z), 0xcafef00du);
+#else
+	TileID += PixelCoordAndFrame.z * 65536;
+#endif
+
+	// Combine pixel-level and sample-level bits into the sample index (visible structure will be hidden by owen scrambling of the index)
+	RandSequence.SampleIndex = reversebits(TileID * MaxSamples + SampleIndex);
+
+	// progressive encodings (these kind of work, but quality is much worse)
+	//RandSequence.SampleIndex = reversebits(MortonEncode(uint2(TimeSeed0, TileID)) * MaxSamples + SampleIndex);
+	//RandSequence.SampleIndex = reversebits((MortonCode3(MaxSamples * TimeSeed0 + SampleIndex) * 4) | (MortonCode3(Y) * 2) | MortonCode3(X));
+	//RandSequence.SampleIndex = reversebits(MortonEncode(uint2(MortonEncode(uint2(X, Y)), SampleIndex)));
+
+	RandSequence.SampleSeed = 0; // always use the same sequence
+	return RandSequence;
+#else
+	// Error diffusion sampler is disabled, just use the simple init function instead
+	return RandomSequenceCreate(PixelCoordAndFrame.x + PixelCoordAndFrame.y * 65536, PixelCoordAndFrame.z * MaxSamples + SampleIndex);
+#endif
+}
+
+FRandomSequence FRandomSequence::Split(uint Index, uint Num)
+{
+	FRandomSequence SplitSequence;
+#if RANDSEQ == RANDSEQ_PURERANDOM
+	SplitSequence.SampleIndex = 0;
+	SplitSequence.SampleSeed = StrongIntegerHash(SampleSeed * Num + Index);
+#else
+	// Undo the built-in reversebits, stretch the index and re-apply it
+	SplitSequence.SampleSeed = SampleSeed;
+	SplitSequence.SampleIndex = reversebits(reversebits(SampleIndex) * Num + Index);
+#endif
+	return SplitSequence;
+}
+
+
+// Legacy API - wrappers around the more convenient calls above, but kept for back-compatiblity
+// Deprecated (5.7)
+typedef FRandomSequence RandomSequence;
+void RandomSequence_Initialize(inout RandomSequence RandSequence, uint PositionSeed, uint FrameIndex)
+{
+	RandSequence = RandomSequenceCreate(PositionSeed, FrameIndex);
+}
+
+void RandomSequence_Initialize(inout RandomSequence RandSequence, uint2 PixelCoord, uint SampleIndex, uint FrameIndex, uint MaxSamples)
+{
+	RandSequence = RandomSequenceCreate(uint3(PixelCoord, FrameIndex), SampleIndex, MaxSamples);
+}
+
+float RandomSequence_GenerateSample1D(inout RandomSequence RandSequence)
+{
+	return RandSequence.Get1D();
+}
+
+float2 RandomSequence_GenerateSample2D(inout RandomSequence RandSequence)
+{
+	return RandSequence.Get2D();
+}
+
+float3 RandomSequence_GenerateSample3D(inout RandomSequence RandSequence)
+{
+	return RandSequence.Get3D();
+}
+
+float4 RandomSequence_GenerateSample4D(inout RandomSequence RandSequence)
+{
+	return RandSequence.Get4D();
+}

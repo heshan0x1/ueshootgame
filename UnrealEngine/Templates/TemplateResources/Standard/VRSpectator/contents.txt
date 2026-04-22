@@ -1,0 +1,3 @@
+../../../Templates/TemplateResources/Standard/VRSpectator/FeaturePack/manifest.json
+../../../Templates/TemplateResources/Standard/VRSpectator/Media/VRSpectator.png
+../../../Templates/TemplateResources/Standard/VRSpectator/Media/VRSpectator_Preview.png

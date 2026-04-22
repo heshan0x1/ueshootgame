@@ -1,0 +1,474 @@
+﻿// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "GeometryMaskWriteComponent.h"
+
+#include "Algo/RemoveIf.h"
+#include "BatchedElements.h"
+#include "CanvasTypes.h"
+#include "Components/DynamicMeshComponent.h"
+#include "Components/StaticMeshComponent.h"
+#include "Engine/CanvasRenderTarget2D.h"
+#include "Engine/StaticMesh.h"
+#include "GeometryMaskCanvas.h"
+#include "GlobalRenderResources.h"
+#include "StaticMeshResources.h"
+
+void UGeometryMaskWriteMeshComponent::SetParameters(FGeometryMaskWriteParameters& InParameters)
+{
+	Parameters = InParameters;
+
+	UGeometryMaskCanvas* Canvas = CanvasWeak.Get();
+
+	// We have changed canvas, unregister this writer
+	if (Canvas && Canvas->GetFName() != InParameters.CanvasName)
+	{
+		Canvas->RemoveWriter(this);
+		CanvasWeak.Reset();
+	}
+
+	// Update canvas
+	if (!CanvasWeak.IsValid())
+	{
+		TryResolveCanvas();
+	}
+}
+
+void UGeometryMaskWriteMeshComponent::DrawToCanvas(FCanvas* InCanvas)
+{
+	TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas);
+
+	if (!bWriteWhenHidden)
+	{
+		if (const AActor* Owner = GetOwner())
+		{
+			if (Owner->IsHidden())
+			{
+				return;
+			}
+		}
+	}
+
+	UpdateCachedData();
+
+	FColor Color = UE::GeometryMask::MaskChannelEnumToColor[GetParameters().ColorChannel];
+	ESimpleElementBlendMode ElementBlendMode = SE_BLEND_Additive;
+	if (GetParameters().OperationType == EGeometryMaskCompositeOperation::Subtract)
+	{
+		Color = FColor(255 - Color.R, 255 - Color.G, 255 - Color.B, 255);
+		ElementBlendMode = SE_BLEND_Modulate;
+	}
+
+	// Write to Canvas BatchElements
+	{
+		FHitProxyId CanvasHitProxyId = InCanvas->GetHitProxyId();
+
+		TMap<TWeakObjectPtr<UPrimitiveComponent>, FName> ComponentsToKeep;
+		ComponentsToKeep.Reserve(CachedComponents.Num());
+
+		TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::WriteToCanvas);
+
+		// Flag valid components, can't do async due to UObject access
+		for (const TPair<TWeakObjectPtr<UPrimitiveComponent>, FName>& CachedComponentWeak : CachedComponents)
+		{
+			if (UPrimitiveComponent* CachedComponent = CachedComponentWeak.Key.Get())
+			{
+				if (CachedMeshData.Contains(CachedComponentWeak.Value))
+				{
+					ComponentsToKeep.Emplace(CachedComponent, CachedComponentWeak.Value);
+				}
+			}
+		}
+
+		for (const TPair<TWeakObjectPtr<UPrimitiveComponent>, FName>& ComponentPair : ComponentsToKeep)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::WriteToCanvas::Task);
+
+			const UPrimitiveComponent* PrimitiveComponent = ComponentPair.Key.Get();
+
+			if (!PrimitiveComponent)
+			{
+				continue;
+			}
+
+			const FTransform LocalToWorld = PrimitiveComponent->GetComponentToWorld();
+			const FGeometryMaskBatchElementData& MeshBatchElementData = CachedMeshData[ComponentPair.Value];
+
+			InCanvas->PushAbsoluteTransform(LocalToWorld.ToMatrixWithScale());
+			{
+				FBatchedElements* CanvasTriangleBatchedElements = InCanvas->GetBatchedElements(FCanvas::ET_Triangle);
+
+				CanvasTriangleBatchedElements->AddReserveVertices(MeshBatchElementData.Vertices.Num());
+				CanvasTriangleBatchedElements->AddReserveTriangles(MeshBatchElementData.NumTriangles, GWhiteTexture, ElementBlendMode);
+
+				auto AddVertex = [CanvasTriangleBatchedElements, &MeshBatchElementData, CanvasHitProxyId, &Color](int32 VertexIdx) -> int32
+				{
+					return CanvasTriangleBatchedElements->AddVertexf(
+						MeshBatchElementData.Vertices[VertexIdx],
+						FVector2f::ZeroVector,
+						Color,
+						CanvasHitProxyId);
+				};
+
+				// Store the index of the first vertex to be able to convert the MeshBatchElementData vertex indices to
+				// map to the actual vertices added to the BatchedElements.
+				int32 InitialIndex = 0;
+
+				if (MeshBatchElementData.Vertices.Num() > 0)
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::WriteToCanvas::AddVertices);
+
+					InitialIndex = AddVertex(0);
+					for (int32 VertexIdx = 1; VertexIdx < MeshBatchElementData.Vertices.Num(); ++VertexIdx)
+					{
+						AddVertex(VertexIdx);
+					}
+				}
+
+				{
+					TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::WriteToCanvas::AddTriangles);
+					for (int32 VertexIdx = 0; VertexIdx <= MeshBatchElementData.Indices.Num() - 3; VertexIdx += 3)
+					{
+						// MeshBatchElementData.Indices are 'relative' in the sense that do not consider possible existing 
+						// vertices within BatchedElements prior to its vertices being added.
+						// So these 'local' indices are converted to be the proper indices of the vertices that were added above. 
+						const int32 V0 = InitialIndex + MeshBatchElementData.Indices[VertexIdx];
+						const int32 V1 = InitialIndex + MeshBatchElementData.Indices[VertexIdx + 1];
+						const int32 V2 = InitialIndex + MeshBatchElementData.Indices[VertexIdx + 2];
+
+						CanvasTriangleBatchedElements->AddTriangle(V0, V1, V2, GWhiteTexture, ElementBlendMode);
+					}
+				}
+			}
+			InCanvas->PopTransform();
+		}
+
+		CachedComponents = ComponentsToKeep;
+	}
+}
+
+void UGeometryMaskWriteMeshComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
+{
+	Super::OnComponentDestroyed(bDestroyingHierarchy);
+
+	Cleanup();
+}
+
+void UGeometryMaskWriteMeshComponent::UpdateCachedData()
+{
+	if (const AActor* Owner = GetOwner())
+	{
+		TArray<UPrimitiveComponent*> PrimitiveComponents;
+		Owner->GetComponents<UPrimitiveComponent>(PrimitiveComponents);
+
+		// @todo: better check for cached data state?
+		if (LastPrimitiveComponentCount == PrimitiveComponents.Num())
+		{
+			return;
+		}
+
+		LastPrimitiveComponentCount = PrimitiveComponents.Num();
+		CachedComponents.Reserve(LastPrimitiveComponentCount);
+		CachedMeshData.Reserve(LastPrimitiveComponentCount);
+
+		UpdateCachedStaticMeshData(PrimitiveComponents);
+		UpdateCachedDynamicMeshData(PrimitiveComponents);
+	}
+}
+
+void UGeometryMaskWriteMeshComponent::UpdateCachedStaticMeshData(TConstArrayView<UPrimitiveComponent*> InPrimitiveComponents)
+{
+	TArray<UStaticMeshComponent*> StaticMeshComponents;
+	StaticMeshComponents.Reserve(InPrimitiveComponents.Num());
+	
+	Algo::TransformIf(
+		InPrimitiveComponents,
+		StaticMeshComponents,
+		[](const UPrimitiveComponent* InComponent)
+		{
+			return InComponent->IsA<UStaticMeshComponent>();
+		},
+		[](UPrimitiveComponent* InComponent)
+		{
+			return Cast<UStaticMeshComponent>(InComponent);
+		});
+
+	if (StaticMeshComponents.IsEmpty())
+	{
+		return;
+	}
+
+	// Remove built/already cached
+	StaticMeshComponents.SetNum(Algo::RemoveIf(StaticMeshComponents, [this](const UStaticMeshComponent* InStaticMeshComponent)
+	{
+		const UStaticMesh* StaticMesh = InStaticMeshComponent->GetStaticMesh();
+	
+		if (!StaticMesh || !StaticMesh->HasValidRenderData())
+		{
+			return true;
+		}
+
+		const FName ResourceName = StaticMesh->GetFName();
+		if (CachedComponents.Contains(InStaticMeshComponent) && CachedMeshData.Contains(ResourceName))
+		{
+			return true;
+		}
+
+		return false;
+	}));
+
+	// Subscribe to change events
+#if WITH_EDITOR
+	for (UStaticMeshComponent* StaticMeshComponent : StaticMeshComponents)
+	{
+		StaticMeshComponent->OnStaticMeshChanged().RemoveAll(this);
+		StaticMeshComponent->OnStaticMeshChanged().AddUObject(this, &UGeometryMaskWriteMeshComponent::OnStaticMeshChanged);
+	}
+#endif
+
+	// Used for cache lookup
+	TArray<FName> StaticMeshObjectNames;
+	StaticMeshObjectNames.Reserve(StaticMeshComponents.Num());
+	
+	TArray<FStaticMeshLODResources*> StaticMeshResources;
+	StaticMeshResources.Reserve(StaticMeshComponents.Num());
+
+	// Collect valid mesh resources
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::CollectMeshResources);
+		for (UStaticMeshComponent* StaticMeshComponent : StaticMeshComponents)
+		{
+			if (UStaticMesh* StaticMesh = StaticMeshComponent->GetStaticMesh())
+			{
+				if (!StaticMesh->HasValidRenderData())
+				{
+					continue;
+				}
+			
+				if (FStaticMeshRenderData* RenderData = StaticMesh->GetRenderData())
+				{
+					if (RenderData->LODResources.IsEmpty())
+					{
+						continue;
+					}
+
+					if (RenderData->LODResources[0].GetNumVertices() == 0)
+					{
+						continue;
+					}
+
+					const FName ResourceName = StaticMesh->GetFName();
+					StaticMeshObjectNames.Add(ResourceName);
+					StaticMeshResources.Add(&RenderData->LODResources[0]);
+					CachedComponents.Add(StaticMeshComponent, ResourceName);
+				}
+			}
+		}
+
+		// Convert mesh resources to batch elements
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::ConvertMeshResources);
+			
+			CachedMeshData.Reserve(CachedMeshData.Num() + StaticMeshObjectNames.Num());
+
+			for (int32 MeshIdx = 0; MeshIdx < StaticMeshResources.Num(); ++MeshIdx)
+			{
+				TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::ConvertMeshResources::Task);
+
+				FStaticMeshLODResources* MeshResources = StaticMeshResources[MeshIdx];
+				const int32 NumVertices = MeshResources->GetNumVertices();
+				const int32 NumIndices = MeshResources->IndexBuffer.GetNumIndices();
+				const int32 NumTriangles = MeshResources->GetNumTriangles();
+
+				FGeometryMaskBatchElementData& MeshBatchElementData = CachedMeshData.Emplace(StaticMeshObjectNames[MeshIdx]);
+				MeshBatchElementData.Reserve(NumVertices, NumIndices, NumTriangles);
+				MeshResources->IndexBuffer.GetCopy(MeshBatchElementData.Indices);
+
+				for (int32 VertexIdx = 0; VertexIdx < NumVertices; ++VertexIdx)
+				{
+					MeshBatchElementData.Vertices.Add(FVector4f(MeshResources->VertexBuffers.PositionVertexBuffer.VertexPosition(VertexIdx)));
+				}
+			}
+		}
+	}
+}
+
+void UGeometryMaskWriteMeshComponent::UpdateCachedDynamicMeshData(TConstArrayView<UPrimitiveComponent*> InPrimitiveComponents)
+{
+	TArray<UDynamicMeshComponent*> DynamicMeshComponents;
+	DynamicMeshComponents.Reserve(InPrimitiveComponents.Num());
+	
+	Algo::TransformIf(
+		InPrimitiveComponents,
+		DynamicMeshComponents,
+		[](const UPrimitiveComponent* InComponent)
+		{
+			return InComponent->IsA<UDynamicMeshComponent>();
+		},
+		[](UPrimitiveComponent* InComponent)
+		{
+			return Cast<UDynamicMeshComponent>(InComponent);
+		});
+
+	if (DynamicMeshComponents.IsEmpty())
+	{
+		return;
+	}
+
+	// Remove built/already cached
+	DynamicMeshComponents.SetNum(Algo::RemoveIf(DynamicMeshComponents, [this](UDynamicMeshComponent* InDynamicMeshComponent)
+	{
+		const UDynamicMesh* DynamicMesh = InDynamicMeshComponent->GetDynamicMesh();
+	
+		if (!DynamicMesh || !DynamicMesh->GetMeshPtr())
+		{
+			return true;
+		}
+
+		const FName ResourceName = InDynamicMeshComponent->GetFName();
+		if (CachedComponents.Contains(InDynamicMeshComponent) && CachedMeshData.Contains(ResourceName))
+		{
+			return true;
+		}
+
+		return false;
+	}));
+
+	// Subscribe to change events
+	for (UDynamicMeshComponent* DynamicMeshComponent : DynamicMeshComponents)
+	{
+		if (FDynamicMesh3* DynamicMesh3 = DynamicMeshComponent->GetMesh())
+		{
+			DynamicMesh3->SetShapeChangeStampEnabled(true);
+		}
+
+		DynamicMeshComponent->OnMeshChanged.RemoveAll(this);
+		DynamicMeshComponent->OnMeshChanged.AddUObject(this, &UGeometryMaskWriteMeshComponent::OnDynamicMeshChanged, DynamicMeshComponent);
+	}
+
+	// Used for cache lookup
+	TArray<FName> DynamicMeshObjectNames;
+	DynamicMeshObjectNames.Reserve(DynamicMeshComponents.Num());
+	
+	TArray<FDynamicMesh3*> DynamicMeshes;
+	DynamicMeshes.Reserve(DynamicMeshComponents.Num());
+
+	// Collect valid meshes
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::CollectMeshResources);
+		for (UDynamicMeshComponent* DynamicMeshComponent : DynamicMeshComponents)
+		{
+			if (UDynamicMesh* DynamicMeshObject = DynamicMeshComponent->GetDynamicMesh())
+			{
+				if (FDynamicMesh3* DynamicMesh = DynamicMeshObject->GetMeshPtr())
+				{
+					if (DynamicMesh->TriangleCount() == 0)
+					{
+						continue;
+					}
+
+					const FName ResourceName = DynamicMeshComponent->GetFName();
+					DynamicMeshObjectNames.Add(ResourceName);
+					DynamicMeshes.Add(DynamicMesh);
+					CachedComponents.Add(DynamicMeshComponent, ResourceName);
+				}
+			}
+		}
+	}
+
+	// Convert meshes to batch elements
+	{
+		TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::ConvertMeshResources);
+		
+		CachedMeshData.Reserve(CachedMeshData.Num() + DynamicMeshObjectNames.Num());
+		
+		for (int32 MeshIdx = 0; MeshIdx < DynamicMeshes.Num(); ++MeshIdx)
+		{
+			TRACE_CPUPROFILER_EVENT_SCOPE(UGeometryMaskWriteMeshComponent::DrawToCanvas::ConvertMeshResources::Task);
+
+			FDynamicMesh3 CompactMesh;
+			const FDynamicMesh3* DynamicMesh = DynamicMeshes[MeshIdx];
+			CompactMesh.CompactCopy(*DynamicMesh);
+
+			const int32 NumVertices = CompactMesh.VertexCount();
+			const int32 NumIndices = CompactMesh.TriangleCount() * 3;
+			const int32 NumTriangles = CompactMesh.TriangleCount();
+
+			FGeometryMaskBatchElementData& MeshBatchElementData = CachedMeshData.Emplace(DynamicMeshObjectNames[MeshIdx]);
+			MeshBatchElementData.ChangeStamp = DynamicMesh->GetChangeStamp();
+			MeshBatchElementData.Reserve(NumVertices, NumIndices, NumTriangles);
+
+			for (const int32 VertexIdx : CompactMesh.VertexIndicesItr())
+			{
+				MeshBatchElementData.Vertices.Add(FVector4f(FVector3f(CompactMesh.GetVertex(VertexIdx))));				
+			}
+
+			for (const UE::Geometry::FIndex3i Triangle : CompactMesh.TrianglesItr())
+			{
+				MeshBatchElementData.Indices.Append({
+					static_cast<uint32>(Triangle.A),
+					static_cast<uint32>(Triangle.B),
+					static_cast<uint32>(Triangle.C)});
+			}
+		}
+	}
+}
+
+#if WITH_EDITOR
+void UGeometryMaskWriteMeshComponent::OnStaticMeshChanged(UStaticMeshComponent* InStaticMeshComponent)
+{
+	// Triggers a cache refresh
+	ResetCachedData();
+}
+#endif
+
+void UGeometryMaskWriteMeshComponent::OnDynamicMeshChanged(UDynamicMeshComponent* InDynamicMeshComponent)
+{
+	// Triggers a specific cache refresh
+	if (FGeometryMaskBatchElementData* CachedData = CachedMeshData.Find(InDynamicMeshComponent->GetFName()))
+	{
+		CachedData->ChangeStamp = INDEX_NONE;
+	}
+	
+	// Triggers a general cache refresh
+	ResetCachedData();
+}
+
+bool UGeometryMaskWriteMeshComponent::TryResolveCanvas()
+{
+	if (TryResolveNamedCanvas(Parameters.CanvasName))
+	{
+		if (UGeometryMaskCanvas* Canvas = CanvasWeak.Get())
+		{
+			// Register this writer
+			Parameters.ColorChannel = Canvas->GetColorChannel();
+			Canvas->AddWriter(this);
+			return true;
+		}
+	}
+
+	return false;
+}
+
+bool UGeometryMaskWriteMeshComponent::Cleanup()
+{
+	if (!Super::Cleanup())
+	{
+		return false;
+	}
+
+	if (UGeometryMaskCanvas* Canvas = CanvasWeak.Get())
+	{
+		Canvas->RemoveWriter(this);
+		CanvasWeak.Reset();
+		return true;
+	}
+
+	return false;
+}
+
+void UGeometryMaskWriteMeshComponent::ResetCachedData()
+{
+	LastPrimitiveComponentCount = -1;
+	CachedComponents.Reset();
+	CachedMeshData.Reset();
+}

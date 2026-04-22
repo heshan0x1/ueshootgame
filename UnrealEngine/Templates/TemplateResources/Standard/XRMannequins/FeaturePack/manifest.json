@@ -1,0 +1,41 @@
+{
+	"Version": 1,
+	"Name": [
+		{
+			"Language": "en",
+			"Text": "XR Mannequins"
+		}
+	],
+	"Description": [
+		{
+			"Language": "en",
+			"Text": "Feature Pack for XR Mannequin Hands"
+		}
+	],
+	"AssetTypes": [
+		{
+			"Language": "en",
+			"Text": ""
+		}
+	],
+	"SearchTags": [
+		{
+			"Language": "en",
+			"Text": ""
+		}
+	],
+	"ClassTypes": " ",
+	"Category": "SharedPack",
+	"Thumbnail": "XRMannequins.png",
+	"Screenshots": [
+		"XRMannequins_Preview.png"
+	],
+	"Ident": "XRMannequinsStandard",
+	"AdditionalFiles": {
+		"DestinationFilesFolder": "XRMannequins",
+		"AdditionalFilesList": [
+			"Templates/TemplateResources/Standard/XRMannequins/Content/*.*"
+		]
+	}
+}
+

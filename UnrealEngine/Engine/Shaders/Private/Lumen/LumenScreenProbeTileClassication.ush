@@ -1,0 +1,57 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "LumenReflectionsCombine.ush"
+
+#define LUMEN_TILE_BITMASK_GI_SIMPLE_DIFFUSE			0x01
+#define LUMEN_TILE_BITMASK_GI_IMPORTANCE_SAMPLE_BRDF	0x02
+#define LUMEN_TILE_BITMASK_GI_ALL						0x04
+#define LUMEN_TILE_BITMASK_REFLECTIONS					0x08
+
+// Highest quality and fastest for diffuse
+#define DIFFUSE_INTEGRATION_SPHERICAL_HARMONIC 0
+// Noisy and slow, but handles any shading model and GBuffer bent normal AO
+#define DIFFUSE_INTEGRATION_IMPORTANCE_SAMPLE_BRDF 1
+// Slow reference
+#define DIFFUSE_INTEGRATION_NUMERICAL_INTEGRAL 2
+
+uint DefaultDiffuseIntegrationMethod;
+float MaxRoughnessToEvaluateRoughSpecular;
+float MaxRoughnessToEvaluateRoughSpecularForFoliage;
+
+// Computes the lerp factor to diffuse for rough specular, as an optimization to skip rough specular computations
+// 1 = fully diffuse and rough reflection computation can be skipped
+float RoughReflectionsDiffuseLerp(FLumenMaterialData Material)
+{
+	const bool bHasBackfaceDiffuse = HasBackfaceDiffuse(Material);
+
+	// Can skip rough reflections if this will be anyway handled by the dedicated Lumen reflections
+	const float LumenSpecularRayAlpha = LumenCombineReflectionsAlpha(Material.Roughness, bHasBackfaceDiffuse);
+	if (LumenSpecularRayAlpha >= 1.0f && !NeedsLumenClearCoatRoughReflections(Material.TopLayerRoughness, IsClearCoat(Material)))
+	{
+		return 1.0f;
+	}
+
+	float FadeLength = 0.2f;
+	return saturate((Material.Roughness - (bHasBackfaceDiffuse ? MaxRoughnessToEvaluateRoughSpecularForFoliage : MaxRoughnessToEvaluateRoughSpecular) + FadeLength) / FadeLength);
+}
+
+uint GetDiffuseIntegrationMethod(FLumenMaterialData In)
+{
+	uint DiffuseIntegrationMethod = DefaultDiffuseIntegrationMethod;
+
+	if (In.bRequiresBxDFImportanceSampling)
+	{
+		DiffuseIntegrationMethod = DIFFUSE_INTEGRATION_IMPORTANCE_SAMPLE_BRDF;
+	}
+
+#if GBUFFER_HAS_DIFFUSE_SAMPLE_OCCLUSION
+	if (In.DiffuseIndirectSampleOcclusion != 0)
+	{
+		DiffuseIntegrationMethod = DIFFUSE_INTEGRATION_IMPORTANCE_SAMPLE_BRDF;
+	}
+#endif
+
+	return DiffuseIntegrationMethod;
+}

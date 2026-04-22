@@ -1,0 +1,147 @@
+<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<UserControl x:Class="Studio.Views.Tools.LogView"
+             xmlns="https://github.com/avaloniaui"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+             xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+             xmlns:vm="using:Studio.ViewModels.Tools"
+             mc:Ignorable="d"
+             xmlns:i="clr-namespace:Projektanker.Icons.Avalonia;assembly=Projektanker.Icons.Avalonia"
+             xmlns:logging="clr-namespace:Studio.Models.Logging;assembly=UIX.Studio.Runtime"
+             xmlns:valueConverters="clr-namespace:Studio.ValueConverters"
+             xmlns:search="https://github.com/avaloniaui/avaloniaedit"
+             xmlns:r="clr-namespace:Studio.Resources"
+             d:DesignWidth="300" d:DesignHeight="400"
+             x:DataType="vm:LogViewModel" x:CompileBindings="True">
+    <UserControl.Resources>
+        <ResourceDictionary>
+            <valueConverters:LogSeverityToIconConverter x:Key="LogSeverityToIconConverter" />
+            <valueConverters:NullabilityVisibilityConverter x:Key="NullabilityVisibilityConverter" />
+        </ResourceDictionary>
+    </UserControl.Resources>
+
+    <Grid Focusable="True">
+        <StackPanel Margin="2 0 0 0" Orientation="Vertical" HorizontalAlignment="Left">
+            <Button ToolTip.Tip="{x:Static r:Resources.Log_Filter_Tooltip}" Classes="Icon" Width="20" Height="22">
+                <PathIcon Data="{StaticResource FilterMultiple}" Width="15" />
+
+                <Button.Flyout>
+                    <MenuFlyout Placement="RightEdgeAlignedTop">
+                        <MenuItem Command="{Binding ToggleInfo}">
+                            <MenuItem.Header>
+                                <StackPanel Orientation="Horizontal">
+                                    <PathIcon Data="{StaticResource Check}" Width="15" IsVisible="{Binding IsShowInfo}" />
+                                    <TextBlock Text="Show Info" Margin="5,0,0,0" />
+                                </StackPanel>
+                            </MenuItem.Header>
+                        </MenuItem>
+                        <MenuItem Command="{Binding ToggleWarning}">
+                            <MenuItem.Header>
+                                <StackPanel Orientation="Horizontal">
+                                    <PathIcon Data="{StaticResource Check}" Width="15" IsVisible="{Binding IsShowWarning}" />
+                                    <TextBlock Text="Show Warning" Margin="5,0,0,0" />
+                                </StackPanel>
+                            </MenuItem.Header>
+                        </MenuItem>
+                        <MenuItem Command="{Binding ToggleError}">
+                            <MenuItem.Header>
+                                <StackPanel Orientation="Horizontal">
+                                    <PathIcon Data="{StaticResource Check}" Width="15" IsVisible="{Binding IsShowError}" />
+                                    <TextBlock Text="Show Error" Margin="5,0,0,0" />
+                                </StackPanel>
+                            </MenuItem.Header>
+                        </MenuItem>
+                    </MenuFlyout>
+                </Button.Flyout>
+            </Button>
+
+            <Separator
+                Margin="2,2,2,2"
+                Background="{StaticResource BorderColorHigh}"
+                HorizontalAlignment="Stretch" Height="1" />
+
+            <Button ToolTip.Tip="{x:Static r:Resources.Log_Close_Tooltip}" Classes="Icon" Width="20" Height="22" Command="{Binding Clear}">
+                <PathIcon Data="{StaticResource Close}" Width="12" />
+            </Button>
+        </StackPanel>
+        
+        <StackPanel Orientation="Vertical" VerticalAlignment="Bottom" HorizontalAlignment="Left">
+            <ToggleButton 
+                ToolTip.Tip="{x:Static r:Resources.Log_ScrollToBottom_Tooltip}" 
+                Margin="2 0 0 2"
+                Classes="Icon" 
+                IsChecked="{Binding !IsScrollLock}" 
+                BorderThickness="0"
+                CornerRadius="2.5"
+                Width="20"
+                Height="20">
+                <PathIcon Data="{StaticResource ArrowDown}" Width="12" />
+            </ToggleButton>
+        </StackPanel>
+
+        <ListBox 
+            x:Name="LogListbox"
+            BorderThickness="1 0 0 0"
+            Margin="24 0 0 0" 
+            ItemsSource="{Binding FilteredEvents}">
+            <ListBox.DataTemplates>
+                <DataTemplate DataType="logging:LogEvent">
+                    <Grid ColumnDefinitions="25,*">
+                        <PathIcon 
+                            Data="{Binding Severity, Converter={StaticResource LogSeverityToIconConverter}}"
+                            Foreground="{Binding Severity, Converter={StaticResource LogSeverityToIconConverter}}"
+                            Width="10" />
+                        <StackPanel Orientation="Horizontal" Grid.Column="1">
+                            <TextBlock Text="{Binding Message}" VerticalAlignment="Center" Height="20" Padding="0 2" />
+                            <Separator 
+                                IsVisible="{Binding ViewModel, Converter={StaticResource NullabilityVisibilityConverter}}"
+                                Margin="10 0 0 0" 
+                                Height="10"
+                                Width="1"
+                                Background="{StaticResource BorderColorHigh}"/>
+                            <Button 
+                                ToolTip.Tip="{x:Static r:Resources.Log_Report_Tooltip}"
+                                IsVisible="{Binding ViewModel, Converter={StaticResource NullabilityVisibilityConverter}}"
+                                Classes="Icon"
+                                Margin="5 0 0 0"
+                                Width="20"
+                                Height="22"
+                                Command="{Binding $parent[ListBox].((vm:LogViewModel)DataContext).Open}"
+                                CommandParameter="{Binding}">
+                                <PathIcon Data="{StaticResource OpenInApp}" Width="10" />
+                            </Button>
+                        </StackPanel>
+                    </Grid>
+                </DataTemplate>
+            </ListBox.DataTemplates>
+        </ListBox>
+    </Grid>
+</UserControl>

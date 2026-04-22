@@ -1,0 +1,25 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "Stateless/NiagaraStatelessSpawnInfo.h"
+
+#include UE_INLINE_GENERATED_CPP_BY_NAME(NiagaraStatelessSpawnInfo)
+
+bool FNiagaraStatelessSpawnInfo::IsValid(TOptional<float> LoopDuration) const
+{
+	if (bEnabled)
+	{
+		switch (Type)
+		{
+			case ENiagaraStatelessSpawnInfoType::Burst:
+				return (Amount.Min + Amount.Max) > 0 && SpawnTime >= 0.0f && SpawnTime < LoopDuration.Get(SpawnTime + UE_SMALL_NUMBER);
+
+			case ENiagaraStatelessSpawnInfoType::Rate:
+				return (Rate.Min + Rate.Max) > 0.0f;
+
+			default:
+				checkNoEntry();
+				return false;
+		}
+	}
+	return false;
+}

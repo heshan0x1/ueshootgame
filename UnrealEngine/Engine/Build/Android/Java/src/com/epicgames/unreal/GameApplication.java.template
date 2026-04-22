@@ -1,0 +1,183 @@
+package com.epicgames.unreal;
+
+import android.app.Application;
+import android.content.Context;
+import android.content.res.Configuration;
+import androidx.lifecycle.Lifecycle;
+import androidx.lifecycle.LifecycleObserver;
+import androidx.lifecycle.OnLifecycleEvent;
+import androidx.lifecycle.ProcessLifecycleOwner;
+
+import java.lang.Thread;
+import java.lang.Runnable;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantLock;
+
+import com.epicgames.unreal.network.NetworkChangedManager;
+//$${gameApplicationImportAdditions}$$
+
+public class GameApplication extends Application implements LifecycleObserver //$${gameApplicationImplementsAdditions}$$
+{
+	public static final boolean IS_SHIPPING_CONFIG = $${gameApplicationIsShippingConfig}$$;
+	
+	private static final Logger Log = new Logger("UE", "GameApp");
+
+	private static boolean isForeground = false;
+
+	private static Context context;
+
+	protected static int MainThreadId;
+	protected static int MainThreadPriority;
+
+	private static Thread LoadLibrariesThread = null;
+	private static boolean bLoadedLibraries = false;
+	public static Lock ProcessSystemInfoLock = new ReentrantLock();
+
+//$${gameApplicationClassAdditions}$$
+
+	@Override
+	public void onCreate() {
+		super.onCreate();
+		GameApplication.context = getApplicationContext();
+//$${gameApplicationOnCreateAdditions}$$
+
+		ProcessLifecycleOwner.get().getLifecycle().addObserver(this);
+
+		// get the process name to see if we need network observer
+		String processName = "unknown";
+		if (android.os.Build.VERSION.SDK_INT >= 28)
+		{
+			processName = Application.getProcessName();
+		}
+		else
+		{
+			try
+			{
+				Class<?> activityThread = Class.forName("android.app.ActivityThread");
+				processName = (String)activityThread.getDeclaredMethod("currentProcessName").invoke(null);
+			}
+			catch (Exception e)
+			{
+				// ignore
+			}
+		}
+		
+		if (!processName.contains("psoprogramservice"))
+		{
+			NetworkChangedManager.getInstance().initNetworkCallback(this);
+		}
+	}
+
+	public static Context getAppContext() {
+		return GameApplication.context;
+	}
+
+	@Override
+	public void attachBaseContext(Context base) {
+		super.attachBaseContext(base);
+//$${gameApplicationAttachBaseContextAdditions}$$
+	}
+
+	@Override
+	public void onLowMemory() {
+		super.onLowMemory();
+//$${gameApplicationOnLowMemoryAdditions}$$
+	}
+
+	@Override
+	public void onTrimMemory(int level) {
+		super.onTrimMemory(level);
+//$${gameApplicationOnTrimMemoryAdditions}$$
+	}
+
+	@Override
+	public void onConfigurationChanged (Configuration newConfig) {
+		super.onConfigurationChanged(newConfig);
+//$${gameApplicationOnConfigurationChangedAdditions}$$
+	}
+
+	@OnLifecycleEvent(Lifecycle.Event.ON_START)
+	void onEnterForeground() {
+		Log.verbose("App in foreground");
+		isForeground = true;
+	}
+
+	@OnLifecycleEvent(Lifecycle.Event.ON_STOP)
+	void onEnterBackground() {
+		Log.verbose("App in background");
+		isForeground = false;
+	}
+
+	@SuppressWarnings("unused")
+	public static boolean isAppInForeground() {
+		return isForeground;
+	}
+
+	public static boolean isAppInBackground() {
+		return !isForeground;
+	}
+
+	protected static void LoadLibraries(String CommandLine)
+	{
+		// We need to decide on enabling memory tracing before loading native code.
+		// ignore for now
+		try
+		{
+//$${gameApplicationEarlyLoadAdditions}$$
+		}
+		catch (Exception | UnsatisfiedLinkError e)
+		{
+			Log.debug(e.toString());
+		}
+	}
+
+	public static void startLoadLibraries()
+	{
+		if (bLoadedLibraries)
+		{
+			return;
+		}
+		if (LoadLibrariesThread != null)
+		{
+			return;
+		}
+
+		MainThreadId = android.os.Process.myTid();
+		MainThreadPriority = android.os.Process.getThreadPriority(MainThreadId);
+
+		LoadLibrariesThread = new Thread(new Runnable() {
+			public void run() {
+				ProcessSystemInfoLock.lock();
+				android.os.Process.setThreadPriority(android.os.Process.myTid(), MainThreadPriority);
+Trace.beginSection("EarlyLoadLibraries");
+				LoadLibraries("");
+Trace.endSection();
+			}
+		});
+		LoadLibrariesThread.setName("LoadLibraries");
+		LoadLibrariesThread.start();
+	}
+
+	public static boolean waitLoadLibraries()
+	{
+		if (bLoadedLibraries)
+		{
+			return true;
+		}
+		if (LoadLibrariesThread == null)
+		{
+			return true;
+		}
+
+		try
+		{
+			LoadLibrariesThread.join();
+			bLoadedLibraries = true;
+			return true;
+		}
+		catch (Exception e)
+		{
+			return false;
+		}
+	}
+}

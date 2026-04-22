@@ -1,0 +1,42 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#define ESourceEncoding_None  0
+#define ESourceEncoding_Gamma 1
+#define ESourceEncoding_sRGB  2
+
+float3 Decode(float3 InColor, uint InEncoding)
+{
+    BRANCH
+    if(InEncoding == ESourceEncoding_Gamma)
+    {
+        return pow(InColor, 2.2);
+    }
+    else if(InEncoding == ESourceEncoding_sRGB)
+    {
+        return sRGBToLinear(InColor);
+    }
+    else
+    {
+        return InColor;
+    }
+}
+
+float3 Encode(float3 InColor, uint InEncoding)
+{
+    BRANCH
+    if(InEncoding == ESourceEncoding_Gamma)
+    {
+        return pow(InColor, 1.0 / 2.2);
+    }
+    else if(InEncoding == ESourceEncoding_sRGB)
+    {
+        return LinearToSrgb(InColor);
+    }
+    else
+    {
+        return InColor;
+    }
+}
+

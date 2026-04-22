@@ -1,0 +1,40 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "../Common.ush"
+#include "../ComputeShaderUtils.ush"
+
+#define SCATTER_OPERATION_OR	0
+#define SCATTER_OPERATION_AND	1
+#define SCATTER_OPERATION_WRITE 2
+
+uint NumUpdates;
+StructuredBuffer<uint2> PackedUpdates;
+RWByteAddressBuffer DstBuffer;
+
+[numthreads(64, 1, 1)]
+void ScatterUpdates(uint3 GroupID : SV_GroupID, uint GroupIndex : SV_GroupIndex)
+{
+	const uint DispatchThreadId = GetUnWrappedDispatchThreadId(GroupID, GroupIndex, 64);
+	if (DispatchThreadId >= NumUpdates)
+	{
+		return;
+	}
+
+	const uint2 PackedUpdate	= PackedUpdates[DispatchThreadId];
+	const uint Offset			= PackedUpdate.x & 0xFFFFFFFCu;
+	const uint Operation		= PackedUpdate.x & 3u;
+	const uint Value			= PackedUpdate.y;
+	
+	if(Operation == SCATTER_OPERATION_WRITE)
+	{
+		DstBuffer.Store(Offset, Value);
+	}
+	else if(Operation == SCATTER_OPERATION_OR)
+	{
+		DstBuffer.InterlockedOr(Offset, Value);
+	}
+	else if(Operation == SCATTER_OPERATION_AND)
+	{
+		DstBuffer.InterlockedAnd(Offset, Value);
+	}
+}

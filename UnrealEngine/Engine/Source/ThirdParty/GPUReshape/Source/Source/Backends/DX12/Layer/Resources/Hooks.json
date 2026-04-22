@@ -1,0 +1,351 @@
+{
+  "includes": [
+    "DXGIFactory.h",
+    "Device.h",
+    "Device11On12.h",
+    "Resource.h",
+    "RootSignature.h",
+    "DescriptorHeap.h",
+    "Pipeline.h",
+    "PipelineLibrary.h",
+    "Raytracing.h",
+    "Fence.h",
+    "CommandList.h",
+    "SwapChain.h",
+    "MemoryHeap.h",
+    "QueryHeap.h",
+    "States/DeviceState.h",
+    "States/Device11State.h",
+    "States/Device11On12State.h",
+    "States/ResourceState.h",
+    "States/RootSignatureState.h",
+    "States/DescriptorHeapState.h",
+    "States/PipelineState.h",
+    "States/FenceState.h",
+    "States/CommandListState.h",
+    "States/SwapChainState.h",
+    "States/SwapChainState.h",
+    "States/DXGIFactoryState.h",
+    "States/DXGIAdapterState.h",
+    "States/DXGIOutputState.h",
+    "States/DXGIOutputDuplicationState.h",
+    "States/CommandAllocatorState.h",
+    "States/CommandQueueState.h",
+    "States/CommandSignatureState.h",
+    "States/PipelineLibraryState.h",
+    "States/MemoryHeapState.h",
+    "States/StateObjectState.h",
+    "States/QueryHeapState.h",
+    "States/DeviceFactoryState.h",
+    "States/SDKConfigurationState.h"
+  ],
+  "files": [
+    "AgilitySDK/d3d12.h",
+    "dxgi.h",
+    "dxgi1_2.h",
+    "dxgi1_3.h",
+    "dxgi1_4.h",
+    "dxgi1_5.h",
+    "dxgi1_6.h",
+    "d3d11.h",
+    "d3d11on12.h"
+  ],
+  "objects": {
+    "IDXGIFactory": {
+      "name": "DXGIFactory",
+      "state": "DXGIFactoryState",
+      "hooks": [
+        "CreateSwapChain",
+        "CreateSwapChainForHwnd",
+        "CreateSwapChainForCoreWindow",
+        "CreateSwapChainForComposition",
+        "EnumAdapters",
+        "EnumAdapters1",
+        "EnumAdapterByLuid",
+        "EnumWarpAdapter",
+        "EnumAdapterByGpuPreference",
+        "GetParent"
+      ]
+    },
+    "IDXGIAdapter": {
+      "name": "DXGIAdapter",
+      "state": "DXGIAdapterState",
+      "hooks": [
+        "EnumOutputs",
+        "GetParent"
+      ]
+    },
+    "IDXGIOutput": {
+      "name": "DXGIOutput",
+      "state": "DXGIOutputState",
+      "hooks": [
+        "DuplicateOutput",
+        "GetParent"
+      ]
+    },
+    "IDXGIOutputDuplication": {
+      "name": "DXGIOutputDuplication",
+      "state": "DXGIOutputDuplicationState",
+      "hooks": [
+      ]
+    },
+    "IDXGISwapChain": {
+      "name": "SwapChain",
+      "state": "SwapChainState",
+      "hooks": [
+        "GetBuffer",
+        "ResizeBuffers",
+        "ResizeBuffers1",
+        "Present",
+        "Present1",
+        "GetDevice",
+        "GetParent"
+      ]
+    },
+    "ID3D12Device": {
+      "name": "Device",
+      "state": "DeviceState",
+      "hooks": [
+        "CreateCommittedResource",
+        "CreateCommittedResource1",
+        "CreateCommittedResource2",
+        "CreateCommittedResource3",
+        "CreatePlacedResource",
+        "CreatePlacedResource1",
+        "CreatePlacedResource2",
+        "CreateReservedResource",
+        "CreateReservedResource1",
+        "CreateReservedResource2",
+        "CreateCommandQueue",
+        "CreateCommandAllocator",
+        "CreateCommandList",
+        "CreateCommandList1",
+        "CreateFence",
+        "CreateCommandQueue1",
+        "CreateDescriptorHeap",
+        "CreateRootSignature",
+        "CreateStateObject",
+        "AddToStateObject",
+        "CreatePipelineState",
+        "CreateGraphicsPipelineState",
+        "CreateComputePipelineState",
+        "CreateHeap",
+        "CreateHeap1",
+        "CreateQueryHeap",
+        "CreateShaderResourceView",
+        "CreateUnorderedAccessView",
+        "CreateDepthStencilView",
+        "CreateRenderTargetView",
+        "CreateSampler",
+        "CreateSampler2",
+        "CopyDescriptors",
+        "CopyDescriptorsSimple",
+        "CreateCommandSignature",
+        "CreatePipelineLibrary",
+        "SetEventOnMultipleFenceCompletion",
+        "SetResidencyPriority",
+        "MakeResident",
+        "EnqueueMakeResident",
+        "Evict",
+        "CheckFeatureSupport",
+        "OpenSharedHandle",
+        "OpenExistingHeapFromAddress",
+        "OpenExistingHeapFromAddress1",
+        "OpenExistingHeapFromFileMapping"
+      ]
+    },
+    "ID3D11Device": {
+      "name": "Device11",
+      "state": "Device11State",
+      "wrap": false,
+      "hooks": [
+        "QueryInterface"
+      ]
+    },
+    "ID3D11On12Device": {
+      "name": "Device11On12",
+      "state": "Device11On12State",
+      "hooks": [
+        "ReleaseWrappedResources",
+        "AcquireWrappedResources",
+        "ReturnUnderlyingResource"
+      ]
+    },
+    "ID3D12CommandQueue": {
+      "name": "CommandQueue",
+      "state": "CommandQueueState",
+      "hooks": [
+        "ExecuteCommandLists",
+        "Signal",
+        "Wait",
+        "GetDevice",
+        "CopyTileMappings",
+        "GetDesc"
+      ]
+    },
+    "ID3D12CommandAllocator": {
+      "name": "CommandAllocator",
+      "state": "CommandAllocatorState",
+      "hooks": [
+        "Reset",
+        "GetDevice"
+      ]
+    },
+    "ID3D12GraphicsCommandList": {
+      "name": "CommandList",
+      "state": "CommandListState",
+      "type": "ID3D12CommandList",
+      "hooks": [
+        "Reset",
+        "Close",
+        "SetPipelineState",
+        "SetPipelineState1",
+        "SetDescriptorHeaps",
+        "SetGraphicsRootSignature",
+        "SetComputeRootSignature",
+        "SetComputeRootDescriptorTable",
+        "SetGraphicsRootDescriptorTable",
+        "SetComputeRootShaderResourceView",
+        "SetGraphicsRootShaderResourceView",
+        "SetComputeRootUnorderedAccessView",
+        "SetGraphicsRootUnorderedAccessView",
+        "SetComputeRootConstantBufferView",
+        "SetGraphicsRootConstantBufferView",
+        "SetComputeRoot32BitConstant",
+        "SetGraphicsRoot32BitConstant",
+        "SetComputeRoot32BitConstants",
+        "SetGraphicsRoot32BitConstants",
+        "CopyBufferRegion",
+        "CopyTextureRegion",
+        "ResourceBarrier",
+        "Barrier",
+        "BeginRenderPass",
+        "EndRenderPass",
+        "DrawInstanced",
+        "DrawIndexedInstanced",
+        "Dispatch",
+        "ExecuteIndirect",
+        "CopyTiles",
+        "DispatchMesh",
+        "DispatchRays",
+        "GetDevice",
+        "GetType"
+      ],
+      "proxies": [
+        "DrawInstanced",
+        "DrawIndexedInstanced",
+        "Dispatch",
+        "DispatchMesh",
+        "CopyBufferRegion",
+        "CopyTextureRegion",
+        "CopyResource",
+        "CopyTiles",
+        "ResolveSubresource",
+        "ResolveSubresourceRegion",
+        "ClearDepthStencilView",
+        "ClearRenderTargetView",
+        "ClearUnorderedAccessViewUint",
+        "ClearUnorderedAccessViewFloat",
+        "DiscardResource",
+        "BeginRenderPass",
+        "EndRenderPass",
+        "OMSetRenderTargets"
+      ]
+    },
+    "ID3D12StateObject": {
+      "name": "StateObject",
+      "state": "StateObjectState",
+      "hooks": [
+        "GetDevice"
+      ]
+    },
+    "ID3D12Fence": {
+      "name": "Fence",
+      "state": "FenceState",
+      "hooks": [
+        "GetDevice"
+      ]
+    },
+    "ID3D12PipelineState": {
+      "name": "Pipeline",
+      "state": "PipelineState",
+      "hooks": [
+        "GetDevice",
+        "SetName"
+      ]
+    },
+    "ID3D12Resource": {
+      "name": "Resource",
+      "state": "ResourceState",
+      "hooks": [
+        "Map",
+        "Unmap",
+        "GetDevice",
+        "SetName"
+      ]
+    },
+    "ID3D12RootSignature": {
+      "name": "RootSignature",
+      "state": "RootSignatureState",
+      "hooks": [
+        "GetDevice"
+      ]
+    },
+    "ID3D12Heap": {
+      "name": "MemoryHeap",
+      "state": "MemoryHeapState",
+      "hooks": [
+        "GetDevice"
+      ]
+    },
+    "ID3D12DescriptorHeap": {
+      "name": "DescriptorHeap",
+      "state": "DescriptorHeapState",
+      "hooks": [
+        "GetCPUDescriptorHandleForHeapStart",
+        "GetGPUDescriptorHandleForHeapStart",
+        "GetDevice"
+      ]
+    },
+    "ID3D12QueryHeap": {
+      "name": "QueryHeap",
+      "state": "QueryHeapState",
+      "hooks": [
+        "GetDevice"
+      ]
+    },
+    "ID3D12CommandSignature": {
+      "name": "CommandSignature",
+      "state": "CommandSignatureState",
+      "hooks": [
+        "GetDevice"
+      ]
+    },
+    "ID3D12PipelineLibrary": {
+      "name": "PipelineLibrary",
+      "state": "PipelineLibraryState",
+      "hooks": [
+        "StorePipeline",
+        "LoadGraphicsPipeline",
+        "LoadComputePipeline",
+        "LoadPipeline",
+        "GetDevice"
+      ]
+    },
+    "ID3D12DeviceFactory": {
+      "name": "DeviceFactory",
+      "state": "DeviceFactoryState",
+      "hooks": [
+        "EnableExperimentalFeatures",
+        "CreateDevice"
+      ]
+    },
+    "ID3D12SDKConfiguration": {
+      "name": "SDKConfiguration",
+      "state": "SDKConfigurationState",
+      "hooks": [
+        "CreateDeviceFactory"
+      ]
+    }
+  }
+}

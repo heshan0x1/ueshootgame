@@ -1,0 +1,159 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#include "../Common.ush"
+#include "NaniteDataDecode.ush"
+#include "NaniteHierarchyTraversalCommon.ush"
+
+#define CULLING_PASS_NO_OCCLUSION				0
+#define CULLING_PASS_OCCLUSION_MAIN				1
+#define CULLING_PASS_OCCLUSION_POST				2
+#define CULLING_PASS_EXPLICIT_LIST				3
+
+struct FCandidateNode
+{
+	uint	Flags;
+	uint	ViewId;
+	uint	InstanceId;
+	uint	NodeIndex;
+	uint	AssemblyTransformIndex;
+	uint	EnabledBitmask;
+};
+
+// NOTE: This must match Nanite::FGlobalResources::GetCandidateNodeSize(bPostPass) / 4
+#if NANITE_ASSEMBLY_DATA
+	#define NANITE_CANDIDATE_NODE_SIZE_DWORDS(IS_POSTPASS)	((IS_POSTPASS) ? 4u : 3u)
+#else
+	#define NANITE_CANDIDATE_NODE_SIZE_DWORDS(IS_POSTPASS)	((IS_POSTPASS) ? 3u : 2u)
+#endif
+
+uint GetCandidateNodeDwords(bool bPostPass)		{ return NANITE_CANDIDATE_NODE_SIZE_DWORDS(bPostPass); }
+uint GetVisibleClusterDwords(bool bHasPageData) { return NANITE_CANDIDATE_CLUSTER_SIZE_DWORDS + (bHasPageData ? 1u : 0u); }
+
+uint GetCandidateNodesOffset(bool bPostPass)	{ return bPostPass ? (MaxNodes * GetCandidateNodeDwords(false) * 4u) : 0u; }
+uint GetClusterBatchesOffset(bool bPostPass)	{ return bPostPass ? (GetMaxClusterBatches() * 4u) : 0u; }
+
+#define STORE_COMPONENTS_FUNCTION(BufferType, FunctionName) \
+void FunctionName(BufferType DataBuffer, uint NumComponents, uint OffsetInBytes, uint Index, uint4 Data) \
+{ \
+	const uint Address = OffsetInBytes + Index * (NumComponents * 4u);  \
+	switch (NumComponents)  \
+	{  \
+		case 1: DataBuffer.Store(Address, Data.x); break;  \
+		case 2: DataBuffer.Store2(Address, Data.xy); break;  \
+		case 3: DataBuffer.Store3(Address, Data.xyz); break;  \
+		case 4: DataBuffer.Store4(Address, Data); break;  \
+	} \
+}
+STORE_COMPONENTS_FUNCTION(RWCoherentByteAddressBuffer, StoreComponentsCoherent)
+STORE_COMPONENTS_FUNCTION(RWByteAddressBuffer, StoreComponents)
+
+#define LOAD_COMPONENTS_FUNCTION(BufferType, FunctionName) \
+uint4 FunctionName(BufferType DataBuffer, uint NumComponents, uint OffsetInBytes, uint Index) \
+{ \
+	const uint Address = OffsetInBytes + Index * (NumComponents * 4u); \
+	switch (NumComponents) \
+	{ \
+		case 1: return uint4(DataBuffer.Load(Address), 0, 0, 0); \
+		case 2: return uint4(DataBuffer.Load2(Address), 0, 0); \
+		case 3: return uint4(DataBuffer.Load3(Address), 0); \
+		case 4: return DataBuffer.Load4(Address); \
+		default:return 0; \
+	} \
+}
+LOAD_COMPONENTS_FUNCTION(RWCoherentByteAddressBuffer, LoadComponentsCoherent)
+LOAD_COMPONENTS_FUNCTION(RWByteAddressBuffer, LoadComponents)
+
+uint4 PackCandidateNode(FCandidateNode Node)
+{
+	// Leave at least one bit unused in each of the fields, so 0xFFFFFFFFu is never a valid value.
+	uint4 RawData = 0;
+	RawData.x = (Node.InstanceId << NANITE_NUM_CULLING_FLAG_BITS) | Node.Flags;
+	RawData.y = (Node.ViewId << NANITE_MAX_NODES_PER_PRIMITIVE_BITS) | Node.NodeIndex;
+#if NANITE_ASSEMBLY_DATA
+	RawData.z = Node.AssemblyTransformIndex;
+	RawData.w = Node.EnabledBitmask;
+#else
+	RawData.z = Node.EnabledBitmask;
+#endif
+	
+	checkSlow(RawData.x != 0xFFFFFFFFu && RawData.y != 0xFFFFFFFFu && RawData.z != 0xFFFFFFFFu && RawData.w != 0xFFFFFFFFu);
+
+	return RawData;
+}
+
+FCandidateNode UnpackCandidateNode(uint4 RawData, bool bHasEnabledMask)
+{
+	FCandidateNode Node;
+	Node.Flags					= BitFieldExtractU32(RawData.x, NANITE_NUM_CULLING_FLAG_BITS, 0);
+	Node.InstanceId				= BitFieldExtractU32(RawData.x, NANITE_MAX_INSTANCES_BITS, NANITE_NUM_CULLING_FLAG_BITS);
+	Node.NodeIndex				= BitFieldExtractU32(RawData.y, NANITE_MAX_NODES_PER_PRIMITIVE_BITS, 0);
+	Node.ViewId					= BitFieldExtractU32(RawData.y, NANITE_MAX_VIEWS_PER_CULL_RASTERIZE_PASS_BITS, NANITE_MAX_NODES_PER_PRIMITIVE_BITS);
+#if NANITE_ASSEMBLY_DATA
+	Node.AssemblyTransformIndex	= RawData.z;
+	Node.EnabledBitmask			= bHasEnabledMask ? RawData.w : 0xFFFFFFFFu;
+#else
+	Node.AssemblyTransformIndex = NANITE_MAX_ASSEMBLY_TRANSFORMS;
+	Node.EnabledBitmask			= bHasEnabledMask ? RawData.z : 0xFFFFFFFFu;
+#endif
+	
+	return Node;
+}
+
+// Load/Store/Clear each have globally coherent buffer versions. Fix this with templates.
+uint4 LoadVisibleClusterDataCoherent(RWCoherentByteAddressBuffer DataBuffer, uint ClusterIndex, bool bHasPageData)
+{
+	checkSlow(ClusterIndex < MaxCandidateClusters);
+	return LoadComponentsCoherent(DataBuffer, GetVisibleClusterDwords(bHasPageData), 0u, ClusterIndex);
+}
+
+uint4 LoadVisibleClusterData(RWByteAddressBuffer DataBuffer, uint ClusterIndex, bool bHasPageData)
+{
+	checkSlow(ClusterIndex < MaxCandidateClusters);
+	return LoadComponents(DataBuffer, GetVisibleClusterDwords(bHasPageData), 0u, ClusterIndex);
+}
+
+void StoreVisibleClusterCoherent(RWCoherentByteAddressBuffer DataBuffer, uint ClusterIndex, FVisibleCluster VisibleCluster, bool bHasPageData)
+{
+	const uint4 RawData = PackVisibleCluster(VisibleCluster, bHasPageData);
+	StoreComponentsCoherent(DataBuffer, GetVisibleClusterDwords(bHasPageData), 0, ClusterIndex, RawData);
+}
+
+void StoreVisibleCluster(RWByteAddressBuffer DataBuffer, uint ClusterIndex, FVisibleCluster VisibleCluster, bool bHasPageData)
+{
+	const uint4 RawData = PackVisibleCluster(VisibleCluster, bHasPageData);
+	StoreComponents(DataBuffer, GetVisibleClusterDwords(bHasPageData), 0, ClusterIndex, RawData);
+}
+
+// helper function to work around a shader macro expansion issue (incorrect expansion of self-referential macros) that causes,
+// e.g., #define MaxNodes NaniteRaster.MaxNodes, to expand to things like NaniteRaster.NaniteRaster.NaniteRaster.MaxNodes when used as parameter to a macro.
+void CheckNodeIndexHelper(uint NodeIndex)
+{
+	uint MaxNodesTmp = MaxNodes;
+	checkSlow(NodeIndex < MaxNodesTmp);
+}
+
+uint4 LoadCandidateNodeDataCoherent(RWCoherentByteAddressBuffer DataBuffer, uint NodeIndex, bool bPostPass)
+{
+	CheckNodeIndexHelper(NodeIndex);
+	return LoadComponentsCoherent(DataBuffer, GetCandidateNodeDwords(bPostPass), GetCandidateNodesOffset(bPostPass), NodeIndex);
+}
+
+uint4 LoadCandidateNodeData(RWByteAddressBuffer DataBuffer, uint NodeIndex, bool bPostPass)
+{
+	CheckNodeIndexHelper(NodeIndex);
+	return LoadComponents(DataBuffer, GetCandidateNodeDwords(bPostPass), GetCandidateNodesOffset(bPostPass), NodeIndex);
+}
+
+void StoreCandidateNodeDataCoherent(RWCoherentByteAddressBuffer DataBuffer, uint NodeIndex, uint4 RawData, bool bPostPass)
+{
+	CheckNodeIndexHelper(NodeIndex);
+	StoreComponentsCoherent(DataBuffer, GetCandidateNodeDwords(bPostPass), GetCandidateNodesOffset(bPostPass), NodeIndex, RawData);
+}
+
+void StoreCandidateNodeData(RWByteAddressBuffer DataBuffer, uint NodeIndex, uint4 RawData, bool bPostPass)
+{
+	CheckNodeIndexHelper(NodeIndex);
+	StoreComponents(DataBuffer, GetCandidateNodeDwords(bPostPass), GetCandidateNodesOffset(bPostPass), NodeIndex, RawData);
+}

@@ -1,0 +1,965 @@
+// 
+// The MIT License (MIT)
+// 
+// Copyright (c) 2024 Advanced Micro Devices, Inc.,
+// Fatalist Development AB (Avalanche Studio Group),
+// and Miguel Petersen.
+// 
+// All Rights Reserved.
+// 
+// Permission is hereby granted, free of charge, to any person obtaining a copy 
+// of this software and associated documentation files (the "Software"), to deal 
+// in the Software without restriction, including without limitation the rights 
+// to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+// of the Software, and to permit persons to whom the Software is furnished to do so, 
+// subject to the following conditions:
+// 
+// The above copyright notice and this permission notice shall be included in all 
+// copies or substantial portions of the Software.
+// 
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+// INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+// PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+// FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+// ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+// 
+
+#pragma once
+
+// Layer
+#include <Backends/DX12/DX12.h>
+
+// Common
+#include <Common/Enum.h>
+
+// Std
+#include <cstdint>
+
+// MSVC tight packing
+#ifdef _MSC_VER
+#pragma pack(push, 1)
+#endif // _MSC_VER
+
+/// Shader header
+struct DXBCHeader {
+    uint32_t identifier;
+    uint8_t privateChecksum[16];
+    uint32_t reserved;
+    uint32_t byteCount;
+    uint32_t chunkCount;
+};
+
+/// Post header chunk entry header
+struct DXBCChunkEntryHeader {
+    uint32_t offset;
+};
+
+/// Chunk header at offset specified
+struct DXBCChunkHeader {
+    uint32_t type;
+    uint32_t size;
+};
+
+/// Shader header
+struct DXBCShaderHeader : public DXBCChunkHeader {
+    uint8_t minor: 4;
+    uint8_t major: 4;
+    uint8_t type;
+    uint32_t dwordCount;
+};
+
+enum class DXBCPSVBindInfoType : uint32_t {
+    Invalid = 0,
+    Sampler = 1,
+    CBuffer = 2,
+    ShaderResourceView = 3,
+    ShaderResourceViewByte = 4,
+    ShaderResourceViewStructured = 5,
+    UnorderedAccessView = 6,
+    UnorderedAccessViewByte = 7,
+    UnorderedAccessViewStructured = 8,
+    UnorderedAccessViewCounter = 9
+};
+
+enum class DXBCPSVBindInfoKind : uint32_t {
+    Invalid = 0,
+    Texture1D = 1,
+    Texture2D = 2,
+    Texture2DMS = 3,
+    Texture3D = 4,
+    TextureCube = 5,
+    Texture1DArray = 6,
+    Texture2DArray = 7,
+    Texture2DMSArray = 8,
+    TextureCubeArray = 9,
+    TypedBuffer = 10,
+    RawBuffer = 11,
+    StructuredBuffer = 12,
+    CBuffer = 13,
+    Sampler = 14,
+    TBuffer = 15,
+    RTAccelerationStructure = 16,
+    FeedbackTexture2D = 17,
+    FeedbackTexture2DArray = 18
+};
+
+enum class DXBCShaderFeature {
+    UseDouble = 1 << 0,
+    ComputeShadersPlusRawAndStructuredBuffersViaShader4X = 1 << 1,
+    UAVsAtEveryStage = 1 << 2,
+    Use64UAVs = 1 << 3,
+    MinimumPrecision = 1 << 4,
+    Use11_1_DoubleExtensions = 1 << 5,
+    Use11_1_ShaderExtensions = 1 << 6,
+    LEVEL9ComparisonFiltering = 1 << 7,
+    TiledResources = 1 << 8,
+    StencilRef = 1 << 9,
+    InnerCoverage = 1 << 10,
+    TypedUAVLoadAdditionalFormats = 1 << 11,
+    ROVs = 1 << 12,
+    ViewportAndRTArrayIndexFromAnyShaderFeedingRasterizer = 1 << 13,
+    WaveOps = 1 << 14,
+    Int64Ops = 1 << 15,
+    ViewID = 1 << 16,
+    Barycentrics = 1 << 17,
+    NativeLowPrecision = 1 << 18,
+    ShadingRate = 1 << 19,
+    Raytracing_Tier_1_1 = 1 << 20,
+    SamplerFeedback = 1 << 21,
+    AtomicInt64OnTypedResource = 1 << 22,
+    AtomicInt64OnGroupShared = 1 << 23,
+    DerivativesInMeshAndAmpShaders = 1 << 24,
+    ResourceDescriptorHeapIndexing = 1 << 25,
+    SamplerDescriptorHeapIndexing = 1 << 26,
+    AtomicInt64OnHeapResource = 1 << 27,
+    AdvancedTextureOps = 1 << 28,
+    WriteableMSAATextures = 1 << 29
+};
+
+BIT_SET(DXBCShaderFeature);
+
+enum class DXBCPSVBindInfoFlag {
+    None = 0,
+    Atomic64 = 1,
+};
+
+struct DXBCPSVBindInfo0 {
+    DXBCPSVBindInfoType type;
+    uint32_t space;
+    uint32_t low;
+    uint32_t high;
+};
+
+struct DXBCPSVBindInfo1 {
+    DXBCPSVBindInfoKind kind;
+    uint32_t flags;
+};
+
+struct DXBCPSVBindInfoRevision0 {
+    DXBCPSVBindInfo0 info0;
+};
+
+struct DXBCPSVBindInfoRevision1 {
+    DXBCPSVBindInfo0 info0;
+    DXBCPSVBindInfo1 info1;
+};
+
+struct DXBCPSVVSInfo {
+    char hasOutputPosition;
+};
+
+struct DXBCPSVHSInfo {
+    uint32_t inputControlCount;
+    uint32_t outputControlCount;
+    uint32_t tessellatorDomain;
+    uint32_t tessellatorOutputPrimitive;
+};
+
+struct DXBCPSVDSInfo {
+    uint32_t inputControlCount;
+    char hasOutputPosition;
+    uint32_t tessellatorDomain;
+};
+
+struct DXBCPSVGSInfo {
+    uint32_t inputPrimitive;
+    uint32_t outputTopology;
+    uint32_t outputStreamMask;
+    char hasOutputPosition;
+};
+
+struct DXBCPSVPSInfo {
+    char hasDepthOutput;
+    char sampleFrequency;
+};
+
+struct DXBCPSVMSInfo {
+    uint32_t groupSharedByteCount;
+    uint32_t groupSharedDependentByteCount;
+    uint32_t payloadByteCount;
+    uint16_t maxVertexCount;
+    uint16_t maxPrimitiveCount;
+};
+
+struct DXBCPSVASInfo {
+    uint32_t payloadByteCount;
+};
+
+struct DXBCPSVMSInfo1 {
+    uint8_t primVectors;
+    uint8_t topology;
+};
+
+struct DXBCPSVRuntimeInfo0 {
+    union {
+        DXBCPSVVSInfo vs;
+        DXBCPSVHSInfo hs;
+        DXBCPSVDSInfo ds;
+        DXBCPSVGSInfo gs;
+        DXBCPSVPSInfo ps;
+        DXBCPSVMSInfo ms;
+        DXBCPSVASInfo as;
+    };
+
+    uint32_t minWaveCount;
+    uint32_t maxWaveCount;
+};
+
+struct DXBCPSVRuntimeInfo1 {
+    uint8_t stage;
+    uint8_t hasViewID;
+
+    union {
+        uint16_t maxVertexCount;
+        uint8_t patchConstOrPrimVectors;
+        DXBCPSVMSInfo1 ms1;
+    };
+
+    uint8_t inputElements;
+    uint8_t outputElements;
+    uint8_t patchConstOrPrimElements;
+    uint8_t inputVectors;
+    uint8_t outputVectors[4];
+};
+
+struct DXBCPSVRuntimeInfo2 {
+    uint32_t threadCountX;
+    uint32_t threadCountY;
+    uint32_t threadCountZ;
+};
+
+struct DXBCPSVRuntimeInfo3 {
+    uint32_t entryFunctionName;
+};
+
+struct DXBCPSVRuntimeInfoRevision0 {
+    DXBCPSVRuntimeInfo0 info0;
+};
+
+struct DXBCPSVRuntimeInfoRevision1 {
+    DXBCPSVRuntimeInfo0 info0;
+    DXBCPSVRuntimeInfo1 info1;
+};
+
+struct DXBCPSVRuntimeInfoRevision2 {
+    DXBCPSVRuntimeInfo0 info0;
+    DXBCPSVRuntimeInfo1 info1;
+    DXBCPSVRuntimeInfo2 info2;
+};
+
+struct DXBCPSVRuntimeInfoRevision3 {
+    DXBCPSVRuntimeInfo0 info0;
+    DXBCPSVRuntimeInfo1 info1;
+    DXBCPSVRuntimeInfo2 info2;
+    DXBCPSVRuntimeInfo3 info3;
+};
+
+enum class DXBCRootSignatureVersion : uint32_t {
+    Version0 = 1,
+    Version1 = 2
+};
+
+enum class DXBCRootSignatureFlags : uint32_t {
+    None = 0,
+    AllowInputAssemblerInputLayout = 1,
+    DenyVertexShaderRootAccess = 2,
+    DenyHullShaderRootAccess = 4,
+    DenyDomainShaderRootAccess = 8,
+    DenyGeometryShaderRootAccess = 16,
+    DenyPixelShaderRootAccess = 32,
+    AllowStreamOutput = 64,
+    LocalRootSignature = 128,
+    DenyAmplificationShaderRootAccess = 256,
+    DenyMeshShaderRootAccess = 512,
+    CBVSRVUAVHeapDirectlyIndexed = 1024,
+    SamplerHeapDirectlyIndexed = 2048,
+    AllowLowTierReservedHwCbLimit = 2147483648
+};
+
+struct DXBCRootSignatureHeader {
+    DXBCRootSignatureVersion version;
+    uint32_t parameterCount;
+    uint32_t rootParameterOffset;
+    uint32_t staticSamplerCount;
+    uint32_t staticSamplerOffset;
+    uint32_t flags;
+};
+
+struct DXBCRootSignatureParameter1 {
+    uint32_t _register;
+    uint32_t space;
+    uint32_t flags;
+};
+
+struct DXBCRootSignatureConstant {
+    uint32_t _register;
+    uint32_t space;
+    uint32_t dwordCount;
+};
+
+enum class DXBCRootSignatureRangeType : uint32_t {
+    SRV = 0,
+    UAV = 1,
+    CBV = 2,
+    Sampler = 3
+};
+
+enum class DXBCRootSignatureParameterType : uint32_t {
+    DescriptorTable = 0,
+    Constant32 = 1,
+    CBV = 2,
+    SRV = 3,
+    UAV = 4
+};
+
+enum class DXBCRootSignatureVisibility : uint32_t {
+    All = 0,
+    Vertex = 1,
+    Hull = 2,
+    Domain = 32,
+    Geometry = 4,
+    Pixel = 5,
+    Amplification = 6,
+    Mesh = 7
+};
+
+struct DXBCRootSignatureDescriptorRange {
+    DXBCRootSignatureRangeType type;
+    uint32_t descriptorCount;
+    uint32_t _register;
+    uint32_t space;
+    uint32_t offsetFromTableStart;
+};
+
+struct DXBCRootSignatureDescriptorRange1 {
+    DXBCRootSignatureRangeType type;
+    uint32_t descriptorCount;
+    uint32_t _register;
+    uint32_t space;
+    uint32_t flags;
+    uint32_t offsetFromTableStart;
+};
+
+struct DXBCRootSignatureDescriptorTable {
+    uint32_t rangeCount;
+    uint32_t rangeOffset;
+};
+
+struct DXILRootSignatureParameter {
+    DXBCRootSignatureParameterType type;
+    DXBCRootSignatureVisibility visibility;
+    uint32_t payloadOffset;
+};
+
+struct DXBCRootSignatureSamplerStub {
+    uint32_t filter;
+    uint32_t addressU;
+    uint32_t addressV;
+    uint32_t addressW;
+    float mipLODBias;
+    uint32_t maxAnisotropy;
+    uint32_t comparisonFunc;
+    uint32_t borderColor;
+    float minLOD;
+    float maxLOD;
+    uint32_t _register;
+    uint32_t space;
+    uint32_t visibility;
+};
+
+enum class DXILSignatureElementSemantic : uint32_t {
+    Undefined = 0,
+    Position = 1,
+    ClipDistance = 2,
+    CullDistance = 3,
+    RenderTargetArrayIndex = 4,
+    ViewPortArrayIndex = 5,
+    VertexID = 6,
+    PrimitiveID = 7,
+    InstanceID = 8,
+    IsFrontFace = 9,
+    SampleIndex = 10,
+    FinalQuadEdgeTessFactor = 11,
+    FinalQuadInsideTessFactor = 12,
+    FinalTriEdgeTessFactor = 13,
+    FinalTriInsideTessFactor = 14,
+    FinalLineDetailTessFactor = 15,
+    FinalLineDensityTessFactor = 16,
+    Barycentrics = 23,
+    ShadingRate = 24,
+    CullPrimitive = 25,
+    Target = 64,
+    Depth = 65,
+    Coverage = 66,
+    DepthGreaterEqual = 67,
+    DepthLessEqual = 68,
+    StencilRef = 69,
+    InnerCoverage = 70,
+};
+
+enum class DXILSignatureElementComponentType : uint32_t {
+    Unknown = 0,
+    UInt32 = 1,
+    Int32 = 2,
+    Float32 = 3,
+    UInt16 = 4,
+    Int16 = 5,
+    Float16 = 6,
+    UInt64 = 7,
+    Int64 = 8,
+    Float64 = 9,
+};
+
+enum class DXILSignatureElementPrecision : uint32_t {
+    Default = 0,
+    Float16 = 1,
+    Float2_8 = 2,
+    Reserved = 3,
+    Int16 = 4,
+    UInt16 = 5,
+    Any16 = 0xf0,
+    Any10 = 0xf1
+};
+
+struct DXILInputSignature {
+    uint32_t count;
+    uint32_t offset;
+};
+
+struct DXILSignatureElement {
+    uint32_t streamIndex;
+    uint32_t semanticNameOffset;
+    uint32_t semanticIndex;
+    DXILSignatureElementSemantic semantic;
+    DXILSignatureElementComponentType componentType;
+    uint32_t _register;
+    uint8_t mask;
+    uint8_t writeMask;
+    uint16_t pad;
+    DXILSignatureElementPrecision precision;
+};
+
+struct DXILShaderDebugName {
+    uint16_t flags;
+    uint16_t nameLength;
+};
+
+struct DXILDigest {
+    uint8_t digest[16];
+};
+
+struct DXILShaderHash {
+    uint32_t flags;
+    DXILDigest digest;
+};
+
+enum class DXILPDBVersion : uint32_t {
+
+};
+
+struct DXILPDBHeader {
+    DXILPDBVersion version;
+    uint32_t signature;
+    uint32_t age;
+    DXILDigest digest;
+    uint32_t ignore[7];
+};
+
+struct DXILSourceInfo {
+    uint32_t alignedByteSize;
+    uint16_t reserved;
+    uint16_t sectionCount;
+};
+
+enum class DXILSourceInfoSectionType : uint16_t {
+    SourceContents = 0,
+    SourceNames = 1,
+    Args = 2
+};
+
+struct DXILSourceInfoSection {
+    uint32_t alignedByteSize;
+    uint16_t reserved;
+    DXILSourceInfoSectionType type;
+};
+
+struct DXILSourceInfoArgs {
+    uint32_t flags;
+    uint32_t byteSize;
+    uint32_t count;
+};
+
+struct DXILSourceInfoSourceNames {
+    uint32_t flags;
+    uint32_t count;
+    uint16_t entriesByteSize;
+};
+
+struct DXILSourceInfoSourceNamesEntry {
+    uint32_t alignedByteSize;
+    uint32_t flags;
+    uint32_t nameByteSize;
+    uint32_t contentByteSize;
+};
+
+enum class DXILSourceInfoSourceContentsCompressType : uint16_t {
+    None = 0,
+    ZLib = 1
+};
+
+struct DXILSourceInfoSourceContents {
+    uint32_t alignedByteSize;
+    uint16_t reserved;
+    DXILSourceInfoSourceContentsCompressType compressType;
+    uint32_t entriesByteSize;
+    uint32_t uncompressedEntriesByteSize;
+    uint32_t count;
+};
+
+struct DXILSourceInfoSourceContentsEntry {
+    uint32_t alignedByteSize;
+    uint32_t reserved;
+    uint32_t contentByteSize;
+};
+
+struct DXBCRuntimeDataHeader {
+    uint32_t version;
+    uint32_t partCount;
+};
+
+enum class DXBCRuntimeDataPartType : uint32_t {
+    None = 0,
+    String = 1,
+    IndexArray = 2,
+    ResourceTable = 3,
+    FunctionTable = 4,
+    RawBytes = 5,
+    SubObjectTable = 6,
+    NodeIDTable = 7,
+    NodeShaderIOAttribTable = 8,
+    NodeShaderFuncAttribTable = 9,
+    IONodeTable = 10,
+    NodeShaderInfoTable = 11,
+    MeshNodesPreviewInfoTable = 12,
+    SignatureElementTable = 13,
+    VSInfoTable = 14,
+    PSInfoTable = 15,
+    HSInfoTable = 16,
+    DSInfoTable = 17,
+    GSInfoTable = 18,
+    CSInfoTable = 19,
+    MSInfoTable = 20,
+    ASInfoTable = 21
+};
+
+struct DXBCRuntimeDataPartHeader {
+    DXBCRuntimeDataPartType type;
+    uint32_t size;
+};
+
+struct DXBCRuntimeDataTableHeader {
+    uint32_t recordCount;
+    uint32_t recordStride;
+};
+
+enum class DXBCRuntimeDataResourceFlag : uint32_t {
+    GloballyCoherent = BIT(0),
+    Counter = BIT(1),
+    ROV = BIT(2),
+    DynamicIndexing = BIT(3),
+    Atomic64 = BIT(4)
+};
+
+struct DXBCRuntimeDataResourceRecord {
+    uint32_t _class;
+    uint32_t shape;
+    uint32_t id;
+    uint32_t space;
+    uint32_t lower;
+    uint32_t upper;
+    uint32_t nameOffset;
+    uint32_t flags;
+};
+
+enum class DXBCRuntimeDataShaderKind : uint32_t {
+    Pixel = 0,
+    Vertex = 1,
+    Geometry = 2,
+    Hull = 3,
+    Domain = 4,
+    Compute = 5,
+    Library = 6,
+    RayGeneration = 7,
+    Intersection = 8,
+    AnyHit = 9,
+    ClosestHit = 10,
+    Miss = 11,
+    Callable = 12,
+    Mesh = 13,
+    Amplification = 14,
+    Node = 15
+};
+
+struct DXBCRuntimeDataFunctionRecord {
+    uint32_t nameOffset;
+    uint32_t unmangledNameOffset;
+    uint32_t resourceRecordIndex;
+    uint32_t dependenciesStringIndex;
+    DXBCRuntimeDataShaderKind shaderKind;
+    uint32_t payloadByteSize;
+    uint32_t attributeByteSize;
+    uint32_t featureInfo1;
+    uint32_t featureInfo2;
+    uint32_t shaderStageFlags;
+    uint32_t minShaderTarget;
+};
+
+struct DXBCRuntimeDataNodeShaderInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::NodeShaderInfoTable;
+    
+    uint32_t launchType;
+    uint32_t groupSharedBytesUsed;
+    uint32_t attributesOffset;
+    uint32_t outputsOffset;
+    uint32_t inputsOffset;
+};
+
+struct DXBCRuntimeDataSignatureElement {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::SignatureElementTable;
+    
+    uint32_t semanticNameOffset;
+    uint32_t semanticIndicesOffset;
+    uint8_t semanticKind;
+    uint8_t componentType;
+    uint8_t interpolationMode;
+    uint8_t startRow;
+    uint8_t colsAndStream;
+    uint8_t usageAndDynIndexMasks;
+};
+
+struct DXBCRuntimeDataNodeID {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::NodeIDTable;
+    
+    uint32_t nameOffset;
+    uint32_t index;
+};
+
+enum class DXBCRuntimeDataNodeAttribKind : uint32_t {
+    None = 0,
+    OutputID = 1,
+    MaxRecords = 2,
+    MaxRecordsSharedWith = 3,
+    RecordSizeInBytes = 4,
+    RecordDispatchGrid = 5,
+    OutputArraySize = 6,
+    AllowSparseNodes = 7,
+    RecordAlignmentInBytes = 8
+};
+
+struct DXBCRuntimeDataNodeShaderIOAttrib {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::NodeShaderIOAttribTable;
+    
+    DXBCRuntimeDataNodeAttribKind attributeKind;
+    union {
+        uint32_t outputNodeIdOffset;
+        uint32_t recordDispatchGridOffset;
+        uint32_t rawData;
+    } payload;
+};
+
+enum class DXBCRuntimeDataNodeFuncAttribKind : uint32_t {
+    None = 0,
+    ID = 1,
+    ThreadCount = 2,
+    ShareInputOf = 3,
+    DispatchGrid = 4,
+    MaxRecursionDepth = 5,
+    LocalRootArgumentsTableIndex = 6,
+    MaxDispatchGrid = 7,
+    MeshNodePreview1 = 8,
+    MeshNodePreview2 = 9
+};
+
+struct DXBCRuntimeDataNodeShaderFuncAttrib {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::NodeShaderFuncAttribTable;
+    
+    DXBCRuntimeDataNodeFuncAttribKind attributeKind;
+    union {
+        uint32_t nodeIdOffset;
+        uint32_t threadCountOffset;
+        uint32_t shareInputOfOffset;
+        uint32_t dispatchGridOffset;
+        uint32_t maxRecursionDepth;
+        uint32_t localRootArugmentsTableIndex;
+        uint32_t maxDispatchGridOffset;
+    } payload;
+};
+
+struct DXBCRuntimeDataIONode {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::IONodeTable;
+    
+    uint32_t ioFlagsAndKind;
+    uint32_t attributeArrayOffset;
+};
+
+struct DXBCRuntimeDataVSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::VSInfoTable;
+    
+    uint32_t signatureInputsOffset;
+    uint32_t signatureOutputsOffset;
+    uint32_t viewIdOutputMaskOffset;
+    uint32_t viewIdOutputMaskSize;
+};
+
+struct DXBCRuntimeDataPSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::PSInfoTable;
+    
+    uint32_t signatureInputsOffset;
+    uint32_t signatureOutputsOffset;
+};
+
+struct DXBCRuntimeDataHSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::HSInfoTable;
+    
+    uint32_t signatureInputsOffset;
+    uint32_t signatureOutputsOffset;
+    uint32_t signaturePatchOutputsOffset;
+    uint32_t viewIdOutputMaskOffset;
+    uint32_t viewIdOutputMaskSize;
+    uint32_t viewIdPatchOutputMaskOffset;
+    uint32_t viewIdPatchOutputMaskSize;
+    uint32_t inputToOutputsOffset;
+    uint32_t inputToOutputsSize;
+    uint32_t inputToPatchOutputMaskOffset;
+    uint32_t inputToPatchOutputMaskSize;
+    uint8_t inputControlPointCount;
+    uint8_t outputControlPointCount;
+    uint8_t tessellatorDomain;
+    uint8_t tessellatorOutputPrimitive;
+};
+
+struct DXBCRuntimeDataDSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::DSInfoTable;
+    
+    uint32_t signatureInputsOffset;
+    uint32_t signatureOutputsOffset;
+    uint32_t signaturePatchInputsOffset;
+    uint32_t viewIdOutputMaskOffset;
+    uint32_t viewIdOutputMaskSize;
+    uint32_t inputToOutputsOffset;
+    uint32_t inputToOutputsSize;
+    uint32_t patchInputToOutputsOffset;
+    uint32_t patchInputToOutputsSize;
+    uint8_t inputControlPointCount;
+    uint8_t tessellatorDomain;
+};
+
+struct DXBCRuntimeDataGSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::GSInfoTable;
+    
+    uint32_t signatureInputsOffset;
+    uint32_t signatureOutputsOffset;
+    uint32_t viewIdOutputMaskOffset;
+    uint32_t viewIdOutputMaskSize;
+    uint32_t inputToOutputsOffset;
+    uint32_t inputToOutputsSize;
+    uint8_t inputPrimitive;
+    uint8_t outputTopology;
+    uint8_t maxVertexCount;
+    uint8_t outputStreamMask;
+};
+
+struct DXBCRuntimeDataCSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::CSInfoTable;
+    
+    uint32_t threadCountOffset;
+    uint32_t groupSharedBytesUsed;
+};
+
+struct DXBCRuntimeDataMSInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::MSInfoTable;
+    
+    uint32_t signatureOutputsOffset;
+    uint32_t signaturePrimitiveOutputElementsOffset;
+    uint32_t viewIdOutputMaskOffset;
+    uint32_t viewIdOutputMaskSize;
+    uint32_t viewIdPrimitiveOutputMaskOffset;
+    uint32_t viewIdPrimitiveOutputMaskSize;
+    uint32_t numThreadsOffset;
+    uint32_t groupSharedBytesUsed;
+    uint32_t groupSharedBytesDependentOnViewID;
+    uint32_t payloadSizeInBytes;
+    uint16_t maxOutputVertices;
+    uint16_t maxOutputPrimitives;
+    uint8_t meshOutputTopology;
+};
+
+struct DXBCRuntimeDataASInfo {
+    static constexpr DXBCRuntimeDataPartType kPartType = DXBCRuntimeDataPartType::ASInfoTable;
+    
+    uint32_t threadCountOffset;
+    uint32_t groupSharedBytesUsed;
+    uint32_t payloadSizeInBytes;
+};
+
+struct DXBCRuntimeDataFunctionRecord2 : DXBCRuntimeDataFunctionRecord {
+    uint8_t minExpectedWaveLaneCount;
+    uint8_t maxExpectedWaveLaneCount;
+    uint16_t shaderFlags;
+    union {
+        uint32_t rawShaderRef;
+        uint32_t nodeOffset;
+    } payload;
+};
+
+enum class DXBCRuntimeDataSubObjectKind : uint32_t {
+    StateObjectConfig = 0,
+    GlobalRootSignature = 1,
+    LocalRootSignature = 2,
+    SubObjectToExportsAssociation = 8,
+    RaytracingShaderConfig = 9,
+    RaytracingPipelineConfig = 10,
+    HitGroup = 11,
+    RaytracingPipelineConfig1 = 12
+};
+
+struct DXBCRuntimeDataSubObjectRecord {
+    DXBCRuntimeDataSubObjectKind subObjectKind;
+    uint32_t nameOffset;
+    union {
+        struct {
+            uint32_t flags;
+        } stateObjectConfig;
+
+        struct {
+            uint32_t dataOffset;
+            uint32_t dataSize;
+        } rootSignature;
+
+        struct {
+            uint32_t subObjectStringOffset;
+            uint32_t exportsStringOffset;
+        } subObjectToExportsAssociation;
+
+        struct {
+            uint32_t maxPayloadByteSize;
+            uint32_t maxAttributeByteSize;
+        } raytracingShaderConfig;
+        
+        struct {
+            uint32_t maxTraceDepth;
+        } raytracingPipelineConfig;
+
+        struct {
+            uint32_t maxTraceDepth;
+            uint32_t flags;
+        } raytracingPipelineConfig1;
+
+        struct {
+            uint32_t type;
+            uint32_t anyHitStringOffset;
+            uint32_t closestHitStringOffset;
+            uint32_t intersectionStringOffset;
+        } hitGroup;
+    };
+};
+
+enum class DXBCRDATRootSignatureVersion : uint32_t {
+    Version1_0 = 1,
+    Version1_1 = 2
+};
+
+struct DXBCRDATRootSignatureHeader {
+    DXBCRDATRootSignatureVersion version;
+    uint32_t parameterCount;
+    uint32_t parameterOffset;
+    uint32_t staticSamplerCount;
+    uint32_t staticSamplerOffset;
+    uint32_t flags;
+};
+
+struct DXBCRDATRootSignatureRootConstant {
+    uint32_t shaderRegister;
+    uint32_t registerSpace;
+    uint32_t dwordCount;
+};
+
+struct DXBCRDATRootSignatureRootParameter {
+    uint32_t type;
+    uint32_t shaderVisibility;
+    uint32_t payloadOffset;
+};
+
+struct DXBCRDATRootSignatureRootDescriptor {
+    uint32_t shaderRegister;
+    uint32_t registerSpace;
+};
+
+struct DXBCRDATRootSignatureRootDescriptor1 {
+    uint32_t shaderRegister;
+    uint32_t registerSpace;
+    uint32_t flags;
+};
+
+struct DXBCRDATRootSignatureDescriptorRange {
+    uint32_t rangeType;
+    uint32_t descriptorCount;
+    uint32_t baseShaderRegister;
+    uint32_t registerSpace;
+    uint32_t offsetInTable;
+};
+
+struct DXBCRDATRootSignatureDescriptorRange1 {
+    uint32_t rangeType;
+    uint32_t descriptorCount;
+    uint32_t baseShaderRegister;
+    uint32_t registerSpace;
+    uint32_t flags;
+    uint32_t offsetInTable;
+};
+
+struct DXBCRDATRootSignatureRootDescriptorTable {
+    uint32_t rangeCount;
+    uint32_t rangeOffset;
+};
+
+struct DXBCRDATRootSignatureStaticSampler {
+    D3D12_FILTER filter;
+    D3D12_TEXTURE_ADDRESS_MODE addressU;
+    D3D12_TEXTURE_ADDRESS_MODE addressV;
+    D3D12_TEXTURE_ADDRESS_MODE addressW;
+    float mipLODBias;
+    uint32_t maxAnisotropy;
+    D3D12_COMPARISON_FUNC comparisonFunc;
+    D3D12_STATIC_BORDER_COLOR borderColor;
+    float minLOD;
+    float maxLOD;
+    uint32_t shaderRegister;
+    uint32_t registerSpace;
+    D3D12_SHADER_VISIBILITY shaderVisibility;
+};
+
+// MSVC tight packing
+#ifdef _MSC_VER
+#pragma pack(pop)
+#endif // _MSC_VER

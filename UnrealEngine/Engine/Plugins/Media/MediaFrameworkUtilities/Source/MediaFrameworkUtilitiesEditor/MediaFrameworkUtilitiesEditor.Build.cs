@@ -1,0 +1,46 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+namespace UnrealBuildTool.Rules
+{
+	public class MediaFrameworkUtilitiesEditor : ModuleRules
+	{
+		public MediaFrameworkUtilitiesEditor(ReadOnlyTargetRules Target) : base(Target)
+		{
+			PrivateDependencyModuleNames.AddRange(
+				new string[]
+				{
+					"ApplicationCore",
+					"AssetRegistry",
+					"AssetTools",
+					"ClassViewer",
+					"CommonMenuExtensions",
+					"Core",
+					"CoreUObject",
+					"EditorFramework",
+					"EditorStyle",
+					"EditorWidgets",
+					"Engine",
+					"RenderCore",
+					"InputCore",
+					"LevelEditor",
+					"MainFrame",
+					"MaterialEditor",
+					"MediaAssets",
+					"MediaFrameworkUtilities",
+					"MediaIOCore",
+                    "MediaPlayerEditor",
+                    "MediaUtils",
+					"PlacementMode",
+					"PropertyEditor",
+					"SharedSettingsWidgets",
+					"Slate",
+					"SlateCore",
+					"TimeManagement",
+					"ToolMenus",
+					"ToolWidgets",
+					"UnrealEd",
+					"WorkspaceMenuStructure",
+				});
+		}
+	}
+}

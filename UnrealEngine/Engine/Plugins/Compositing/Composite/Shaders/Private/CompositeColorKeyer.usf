@@ -1,0 +1,140 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+#include "/Engine/Private/ScreenPass.ush"
+
+#include "CompositeColorKeyerCommon.ush"
+
+#ifndef TILE_SIZE
+    #error TILE_SIZE must be defined
+#endif
+
+Texture2D InputTexture;
+SamplerState InputSampler;
+
+Texture2D CleanPlateTexture;
+SamplerState CleanPlateSampler;
+
+RWTexture2D<float4> RWOutputTexture;
+
+SCREEN_PASS_TEXTURE_VIEWPORT(Input)
+SCREEN_PASS_TEXTURE_VIEWPORT(Output)
+
+float3 KeyColor;
+float4 Params0;
+float4 Params1;
+uint ScreenType;
+uint Visualization;
+uint bInvertAlpha;
+uint bPreserveVignetteAfterKey;
+
+float2 UVToScreenPos(float2 UV, float2 Extent)
+{
+	return (UV * Extent - Input_ScreenPosToViewportBias) / Input_ScreenPosToViewportScale;
+}
+
+// Output color function with debug convenience
+float4 Output(float4 Color)
+{
+	// Saturate and optionally invert alpha
+	Color.a = saturate(select(bInvertAlpha > 0, 1.0f - Color.a, Color.a));
+
+	if(Visualization == 1)
+	{
+		// Opaque to show fill
+		Color.a = 1.0f;
+	}
+	else if(Visualization == 2)
+	{
+		// Optionally show the alpha key matte
+		Color.rgb = sRGBToLinear(Color.a);
+		Color.a = 1.0f;
+	}
+
+	// Keyed output colors should always be premultiplied
+	return Premultiply(Color);
+}
+
+[numthreads(TILE_SIZE, TILE_SIZE, 1)]
+void MainCS(
+    uint2 GroupId : SV_GroupID,
+    uint2 GroupThreadId : SV_GroupThreadID,
+    uint GroupThreadIndex : SV_GroupIndex,
+    uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	float4 SvPosition = float4((float2)DispatchThreadId + Output_ViewportMin + 0.5f, 0.0f, 1.0f);
+	float2 UV = (SvPosition.xy) * Output_ExtentInverse;
+
+	if (IsComputeUVOutOfBounds(UV))
+	{
+		return;
+	}
+
+	// Input parameters
+	const float3 ChannelWeights = Params0.xyz;
+	const float DespillStrength = Params0.w;
+	const float AlphaMin = Params1.x;
+	const float AlphaMax = Params1.y;
+	const float DevignetteStrength = Params1.z;
+	
+	float4 Foreground = InputTexture.SampleLevel(InputSampler, UV, 0);
+#if USE_CLEAN_PLATE
+	float3 Background = CleanPlateTexture.SampleLevel(CleanPlateSampler, UV, 0).rgb;
+#else
+	float3 Background = KeyColor;
+#endif
+
+	float4 Result = Foreground;
+
+	float2 ScreenPos = UVToScreenPos(UV, Input_Extent);
+	float AspectRatio = Output_ViewportSize.y * Output_ViewportSizeInverse.x;
+	float VignetteMask = Vignette(ScreenPos, AspectRatio, DevignetteStrength);
+
+	if(DevignetteStrength > ZeroEpsilon)
+	{
+		Result.rgb *= rcp(VignetteMask);
+	}
+
+	BRANCH
+	if(ScreenType == 0)
+	{
+		Result = RedScreenKeyer(Result.rgb, Background, ChannelWeights[1], ChannelWeights[2]);
+	}
+	else if(ScreenType == 1)
+	{
+		Result = GreenScreenKeyer(Result.rgb, Background, ChannelWeights[0], ChannelWeights[2]);
+	}
+	else if(ScreenType == 2)
+	{
+		Result = BlueScreenKeyer(Result.rgb, Background, ChannelWeights[0], ChannelWeights[1]);
+	}
+
+	BRANCH
+	if(DespillStrength > 0.0f)
+	{
+		// Map the source color onto what we call the "foreground".
+		// Convert both to Luv color space
+		float3 Foreground_Luv = RGB_to_Luv(Result.rgb);
+		float3 Background_Luv = RGB_to_Luv(Background);
+
+		// Project the foreground color onto the background in uv-space
+		float2 ProjectedDiff = ProjectClamped(Foreground_Luv.yz, Background_Luv.yz);
+
+		// Despill the foreground
+		Foreground_Luv.yz -= DespillStrength * ProjectedDiff;
+
+    	// Convert back to RGB
+		Result.rgb = Luv_to_RGB(Foreground_Luv);
+	}
+
+	if(bPreserveVignetteAfterKey > 0 && DevignetteStrength > ZeroEpsilon)
+	{
+		Result.rgb *= VignetteMask;
+	}
+
+	// Apply final alpha threshold
+	Result.a = Linearstep(AlphaMin, AlphaMax, Result.a);
+	
+	const uint2 PixelPos = DispatchThreadId + Output_ViewportMin;
+	RWOutputTexture[PixelPos] = Output(Result);
+}

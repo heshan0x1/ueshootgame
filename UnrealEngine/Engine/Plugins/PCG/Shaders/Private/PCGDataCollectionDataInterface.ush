@@ -1,0 +1,751 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// Buffer format:
+//
+// -- START HEADER --
+// PackedExecutionFlagAndNumData (4B)
+// For each data (1036B when MAX_NUM_ATTR=128):
+//   TypeId (4B)
+//   Attribute Count (4B)
+//   Element Count (4B)
+//   For attribute ID in [0, MAX_NUM_ATTR-1]:
+//     PackedAttributeInfo (4B)
+//         Stride (8b)
+//         Id (23b)
+//         Allocated (1b - MSB)
+//     AttributeElementStartAddress (4B)
+// -- END HEADER --
+// For each data:
+//   For each present attribute:
+//     <Packed element data> (element count * stride bytes) - Note: element count may be 1 if the attribute is not 'Allocated' (that is, uses a single value for the entire range).
+
+// @todo_pcg: Support having a non-RW byte address buffer for input data.
+RWByteAddressBuffer {DataInterfaceName}_DataCollectionBuffer;
+
+// Multiplier that can be configured on output pins.
+uint {DataInterfaceName}_ElementCountMultiplier;
+
+StructuredBuffer<int> {DataInterfaceName}_GraphToBufferAttributeId;
+
+int {DataInterfaceName}_FirstRemappedAttributeId;
+
+StructuredBuffer<int> {DataInterfaceName}_BufferToGraphStringKey;
+
+int {DataInterfaceName}_NumRemappedStringKeys;
+
+struct FPCGAttributeHeader_{DataInterfaceName}
+{
+	/** Absolute address of this attribute's first data element in the buffer. */
+	uint FirstElementAddress;
+
+	/** Stride (in bytes) of this attribute. */
+	uint Stride;
+
+	/** Whether or not this attribute is full-width allocated. */
+	bool bAllocated;
+};
+
+// #################### SHADER PARAM GETTERS ##########################
+
+// @todo_pcg: This parameter is broader than this data interface. Needs to be shared in some way (e.g. with TextureDataInterface).
+uint GetElementCountMultiplier_{DataInterfaceName}()
+{
+	return {DataInterfaceName}_ElementCountMultiplier;
+}
+
+// #################### HEADER READERS ##########################
+
+uint GetNumData_{DataInterfaceName}()
+{
+	// We use the most significant bit of NumData to store the KernelExecuted flag.
+	return {DataInterfaceName}_DataCollectionBuffer.Load(0) & ~PCG_KERNEL_EXECUTED_FLAG;
+}
+
+uint GetNumElements_{DataInterfaceName}(uint InDataIndex)
+{
+	const uint ReadAddress =
+		PCG_DATA_COLLECTION_HEADER_SIZE_BYTES +
+		InDataIndex * PCG_DATA_HEADER_SIZE_BYTES +
+		/*TypeId*/4 + /*Attribute Count*/4;
+
+	return {DataInterfaceName}_DataCollectionBuffer.Load(ReadAddress);
+}
+
+bool GetThreadData_{DataInterfaceName}(uint InThreadIndex, out uint OutDataIndex, out uint OutElementIndex)
+{
+	int ElementIndex = (int)InThreadIndex;
+
+	const uint NumData = GetNumData_{DataInterfaceName}();
+	for (uint DataIndex = 0; DataIndex < NumData; ++DataIndex)
+	{
+		const int ElemCount = (int)GetNumElements_{DataInterfaceName}(DataIndex);
+
+		if (ElementIndex < ElemCount)
+		{
+			OutDataIndex = DataIndex;
+			OutElementIndex = (uint)ElementIndex;
+			return true;
+		}
+
+		ElementIndex -= ElemCount;
+	}
+
+	OutDataIndex = (uint)-1;
+	OutElementIndex = (uint)-1;
+	return false;
+}
+
+uint GetNumElements_{DataInterfaceName}()
+{
+	uint NumElements = 0;
+
+	const uint NumData = GetNumData_{DataInterfaceName}();
+	for (uint DataIndex = 0; DataIndex < NumData; ++DataIndex)
+	{
+		NumElements += GetNumElements_{DataInterfaceName}(DataIndex);
+	}
+
+	return NumElements;
+}
+
+// #################### INTERNAL HELPERS ##########################
+
+uint LoadBufferInternal_{DataInterfaceName}(uint InAddress)
+{
+	return {DataInterfaceName}_DataCollectionBuffer.Load(InAddress);
+}
+
+void StoreBufferInternal_{DataInterfaceName}(uint InAddress, uint InValue)
+{
+	{DataInterfaceName}_DataCollectionBuffer.Store(InAddress, InValue);
+}
+
+int GetRemappedAttributeIdInternal_{DataInterfaceName}(int InGraphAttributeId)
+{
+	if (InGraphAttributeId >= {DataInterfaceName}_FirstRemappedAttributeId)
+	{
+		// Convert from current compute graph attribute ID present in buffer (required if buffer came from a different upstream compute graph).
+		// Note: InGraphAttributeId should always be >= PCG_NUM_RESERVED_ATTRS, but max() added to appease compilers.
+		return PCG_NUM_RESERVED_ATTRS + {DataInterfaceName}_GraphToBufferAttributeId[max(0, InGraphAttributeId - PCG_NUM_RESERVED_ATTRS)];
+	}
+	else
+	{
+		return InGraphAttributeId;
+	}
+}
+
+FPCGAttributeHeader_{DataInterfaceName} GetAttributeHeaderInternal_{DataInterfaceName}(uint InDataIndex, int InAttributeId)
+{
+	const int AttributeId = GetRemappedAttributeIdInternal_{DataInterfaceName}(InAttributeId);
+
+	const uint ReadAddress =
+		PCG_DATA_COLLECTION_HEADER_SIZE_BYTES +
+		InDataIndex * PCG_DATA_HEADER_SIZE_BYTES +
+		/*TypeId*/4 + /*Attribute Count*/4 + /*Element Count*/4 +
+		AttributeId * PCG_ATTRIBUTE_HEADER_SIZE_BYTES;
+
+	const uint2 PackedAttributeHeader = {DataInterfaceName}_DataCollectionBuffer.Load2(ReadAddress);
+
+	FPCGAttributeHeader_{DataInterfaceName} AttributeHeader;
+	AttributeHeader.FirstElementAddress = PackedAttributeHeader.y;
+	AttributeHeader.Stride = PackedAttributeHeader.x & PCG_ATTRIBUTE_STRIDE_MASK;
+	AttributeHeader.bAllocated = (PackedAttributeHeader.x & PCG_ATTRIBUTE_ALLOCATED_MASK) != 0;
+
+	return AttributeHeader;
+}
+
+uint2 GetElementAddressAndStrideInternal_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	const FPCGAttributeHeader_{DataInterfaceName} AttributeHeader = GetAttributeHeaderInternal_{DataInterfaceName}(InDataIndex, InAttributeId);
+	const uint ElementIndex = AttributeHeader.bAllocated ? InElementIndex : 0u;
+
+	return uint2(ElementIndex * AttributeHeader.Stride + AttributeHeader.FirstElementAddress, AttributeHeader.Stride);
+}
+
+uint GetElementAddressInternal_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	return GetElementAddressAndStrideInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId).x;
+}
+
+uint GetFirstValidAttributeElementInternal_{DataInterfaceName}()
+{
+	for (int AttributeId = 0; AttributeId < PCG_MAX_NUM_ATTRS; ++AttributeId)
+	{
+		const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(/*DataIndex=*/0, /*ElementIndex=*/0, AttributeId);
+
+		if (ElementAddress > 0)
+		{
+			return ElementAddress;
+		}
+	}
+
+	return 0;
+}
+
+uint GetDataNumAttributesInternal_{DataInterfaceName}(uint InDataIndex)
+{
+	const uint ReadAddress =
+		PCG_DATA_COLLECTION_HEADER_SIZE_BYTES +
+		InDataIndex * PCG_DATA_HEADER_SIZE_BYTES +
+		/*TypeId*/4;
+
+	return {DataInterfaceName}_DataCollectionBuffer.Load(ReadAddress);
+}
+
+void SetAsExecutedInternal_{DataInterfaceName}()
+{
+	// We use the most significant bit of NumData to store the KernelExecuted flag
+	const uint NumData = GetNumData_{DataInterfaceName}();
+	{DataInterfaceName}_DataCollectionBuffer.Store(0, NumData | PCG_KERNEL_EXECUTED_FLAG);
+}
+
+// #################### ATTRIBUTE GETTERS ##########################
+
+uint GetUint_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		return {DataInterfaceName}_DataCollectionBuffer.Load(ElementAddress);
+	}
+	else
+	{
+		return 0u;
+	}
+}
+
+bool GetBool_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	return GetUint_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId) != 0;
+}
+
+int GetInt_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	return asint(GetUint_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId));
+}
+
+float GetFloat_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	return asfloat(GetUint_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId));
+}
+
+float2 GetFloat2_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		return asfloat({DataInterfaceName}_DataCollectionBuffer.Load2(ElementAddress));
+	}
+	else
+	{
+		return (float2)0;
+	}
+}
+
+float3 GetFloat3_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		return asfloat({DataInterfaceName}_DataCollectionBuffer.Load3(ElementAddress));
+	}
+	else
+	{
+		return (float3)0;
+	}
+}
+
+float4 GetFloat4_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		return asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(ElementAddress));
+	}
+	else
+	{
+		return (float4)0;
+	}
+}
+
+float3 GetRotator_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	return GetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+}
+
+float4 GetQuat_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	return GetFloat4_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+}
+
+float4x4 GetTransform_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		return float4x4(
+			asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(ElementAddress)),
+			asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(ElementAddress + 4 * 4)),
+			asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(ElementAddress + 8 * 4)),
+			asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(ElementAddress + 12 * 4)));
+	}
+	else
+	{
+		return (float4x4)0;
+	}
+}
+
+int GetStringKey_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	// String keys are represented as ints.
+	const int StringKey = GetInt_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+	if (StringKey < {DataInterfaceName}_NumRemappedStringKeys)
+	{
+		return {DataInterfaceName}_BufferToGraphStringKey[StringKey];
+	}
+	else
+	{
+		return StringKey;
+	}
+}
+
+int GetName_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId)
+{
+	// Names are currently put in the string table.
+	return GetStringKey_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+}
+
+// #################### ATTRIBUTE SETTERS ##########################
+
+void SetBool_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, bool InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store(ElementAddress, InValue ? 1u : 0u);
+	}
+}
+
+void SetInt_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, int InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetUint_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, uint InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store(ElementAddress, InValue);
+	}
+}
+
+void SetFloat_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetFloat2_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float2 InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store2(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetFloat3_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float3 InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store3(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetFloat4_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float4 InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store4(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetRotator_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float3 InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store3(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetQuat_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float4 InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store4(ElementAddress, asuint(InValue));
+	}
+}
+
+void SetTransform_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, float4x4 InValue)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		{DataInterfaceName}_DataCollectionBuffer.Store4(ElementAddress, asuint(InValue[0]));
+		{DataInterfaceName}_DataCollectionBuffer.Store4(ElementAddress + 4 * 4, asuint(InValue[1]));
+		{DataInterfaceName}_DataCollectionBuffer.Store4(ElementAddress + 8 * 4, asuint(InValue[2]));
+		{DataInterfaceName}_DataCollectionBuffer.Store4(ElementAddress + 12 * 4, asuint(InValue[3]));
+	}
+}
+
+void SetStringKey_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, int InValue)
+{
+	// String keys are represented as ints.
+	SetInt_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId, InValue);
+}
+
+void SetName_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, int InValue)
+{
+	// Names are represented as ints.
+	SetInt_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId, InValue);
+}
+
+// #################### FIRST ATTRIBUTE GETTERS ##########################
+
+uint GetFirstAttributeAsUint_{DataInterfaceName}()
+{
+	const uint AttributeAddress = GetFirstValidAttributeElementInternal_{DataInterfaceName}();
+
+	if (AttributeAddress > 0)
+	{
+		return {DataInterfaceName}_DataCollectionBuffer.Load(AttributeAddress);
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+bool GetFirstAttributeAsBool_{DataInterfaceName}()
+{
+	return GetFirstAttributeAsUint_{DataInterfaceName}() != 0;
+}
+
+int GetFirstAttributeAsInt_{DataInterfaceName}()
+{
+	return asint(GetFirstAttributeAsUint_{DataInterfaceName}());
+}
+
+float GetFirstAttributeAsFloat_{DataInterfaceName}()
+{
+	return asfloat(GetFirstAttributeAsUint_{DataInterfaceName}());
+}
+
+float2 GetFirstAttributeAsFloat2_{DataInterfaceName}()
+{
+	const uint AttributeAddress = GetFirstValidAttributeElementInternal_{DataInterfaceName}();
+
+	if (AttributeAddress > 0)
+	{
+		return asfloat({DataInterfaceName}_DataCollectionBuffer.Load2(AttributeAddress));
+	}
+	else
+	{
+		return (float2)0;
+	}
+}
+
+float3 GetFirstAttributeAsFloat3_{DataInterfaceName}()
+{
+	const uint AttributeAddress = GetFirstValidAttributeElementInternal_{DataInterfaceName}();
+
+	if (AttributeAddress > 0)
+	{
+		return asfloat({DataInterfaceName}_DataCollectionBuffer.Load3(AttributeAddress));
+	}
+	else
+	{
+		return (float3)0;
+	}
+}
+
+float4 GetFirstAttributeAsFloat4_{DataInterfaceName}()
+{
+	const uint AttributeAddress = GetFirstValidAttributeElementInternal_{DataInterfaceName}();
+
+	if (AttributeAddress > 0)
+	{
+		return asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(AttributeAddress));
+	}
+	else
+	{
+		return (float4)0;
+	}
+}
+
+float3 GetFirstAttributeAsRotator_{DataInterfaceName}()
+{
+	return GetFirstAttributeAsFloat3_{DataInterfaceName}();
+}
+
+float4 GetFirstAttributeAsQuat_{DataInterfaceName}()
+{
+	return GetFirstAttributeAsFloat4_{DataInterfaceName}();
+}
+
+float4x4 GetFirstAttributeAsTransform_{DataInterfaceName}()
+{
+	const uint AttributeAddress = GetFirstValidAttributeElementInternal_{DataInterfaceName}();
+	if (AttributeAddress == 0)
+	{
+		return (float4x4)0;
+	}
+
+	return float4x4(
+		asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(AttributeAddress)),
+		asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(AttributeAddress + 4 * 4)),
+		asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(AttributeAddress + 8 * 4)),
+		asfloat({DataInterfaceName}_DataCollectionBuffer.Load4(AttributeAddress + 12 * 4))
+	);
+}
+
+int GetFirstAttributeAsStringKey_{DataInterfaceName}()
+{
+	// String keys are represented as ints.
+	return GetFirstAttributeAsInt_{DataInterfaceName}();
+}
+
+int GetFirstAttributeAsName_{DataInterfaceName}()
+{
+	// Names are represented as ints.
+	return GetFirstAttributeAsInt_{DataInterfaceName}();
+}
+
+// #################### ATOMICS ##########################
+
+// Returns value of attribute before incrementing.
+int AtomicAddInt_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, int InAttributeId, int InValueToAdd)
+{
+	const uint ElementAddress = GetElementAddressInternal_{DataInterfaceName}(InDataIndex, InElementIndex, InAttributeId);
+
+	if (ElementAddress > 0)
+	{
+		uint OriginalValue;
+		{DataInterfaceName}_DataCollectionBuffer.InterlockedAdd(ElementAddress, (uint)InValueToAdd, OriginalValue);
+
+		return (int)OriginalValue;
+	}
+	else
+	{
+		return 0;
+	}
+}
+
+// #################### POINT ATTRIBUTE GETTERS ##########################
+
+float3 GetPosition_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_POSITION_ID);
+}
+
+float4 GetRotation_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat4_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_ROTATION_ID);
+}
+
+float3 GetScale_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_SCALE_ID);
+}
+
+float3 GetBoundsMin_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_BOUNDS_MIN_ID);
+}
+
+float3 GetBoundsMax_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_BOUNDS_MAX_ID);
+}
+
+float4 GetColor_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat4_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_COLOR_ID);
+}
+
+float GetDensity_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_DENSITY_ID);
+}
+
+float GetSteepness_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetFloat_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_STEEPNESS_ID);
+}
+
+uint GetSeed_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetUint_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_SEED_ID);
+}
+
+float4x4 GetPointTransform_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	const FQuat Rotation = GetRotation_{DataInterfaceName}(InDataIndex, InElementIndex);
+	const half3x3 RotationMatrix = QuatToMatrix(Rotation);
+	const float3 Position = GetPosition_{DataInterfaceName}(InDataIndex, InElementIndex);
+	const float3 Scale = GetScale_{DataInterfaceName}(InDataIndex, InElementIndex);
+	
+	const float3 Axis0 = Scale.x * RotationMatrix[0];
+	const float3 Axis1 = Scale.y * RotationMatrix[1];
+	const float3 Axis2 = Scale.z * RotationMatrix[2];
+
+	return float4x4(
+		Axis0.x, Axis1.x, Axis2.x, Position.x,
+		Axis0.y, Axis1.y, Axis2.y, Position.y,
+		Axis0.z, Axis1.z, Axis2.z, Position.z,
+		(float3)0.0, 1.0);
+}
+
+bool IsPointRemoved_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	return GetDensity_{DataInterfaceName}(InDataIndex, InElementIndex) == PCG_INVALID_DENSITY;
+}
+
+// #################### POINT ATTRIBUTE SETTERS ##########################
+
+void SetPosition_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float3 Position)
+{
+	SetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_POSITION_ID, Position);
+}
+
+void SetRotation_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float4 Rotation)
+{
+	SetFloat4_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_ROTATION_ID, Rotation);
+}
+
+void SetScale_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float3 Scale)
+{
+	SetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_SCALE_ID, Scale);
+}
+
+void SetBoundsMin_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float3 BoundsMin)
+{
+	SetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_BOUNDS_MIN_ID, BoundsMin);
+}
+
+void SetBoundsMax_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float3 BoundsMax)
+{
+	SetFloat3_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_BOUNDS_MAX_ID, BoundsMax);
+}
+
+void SetColor_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float4 Color)
+{
+	SetFloat4_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_COLOR_ID, Color);
+}
+
+void SetDensity_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float Density)
+{
+	SetFloat_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_DENSITY_ID, Density);
+}
+
+void SetSteepness_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float Steepness)
+{
+	SetFloat_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_STEEPNESS_ID, Steepness);
+}
+
+void SetSeed_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, uint Seed)
+{
+	SetUint_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_POINT_SEED_ID, Seed);
+}
+
+void SetPointTransform_{DataInterfaceName}(uint InDataIndex, uint InElementIndex, float4x4 Transform)
+{
+	const float3 Scale = float3(length(Transform._m00_m10_m20), length(Transform._m01_m11_m21), length(Transform._m02_m12_m22));
+	SetScale_{DataInterfaceName}(InDataIndex, InElementIndex, Scale);
+
+	// Assumes Transform axes have the correct handedness. We could do more work to fix this up too if required.
+	float3x3 RotationMatix = (float3x3)transpose(Transform);
+	// Required unfortunately, QuatFromMatrix expects orthonormalized.
+	RotationMatix[0] /= Scale.x;
+	RotationMatix[1] /= Scale.y;
+	RotationMatix[2] /= Scale.z;
+	const FQuat Rotation = QuatFromMatrix(RotationMatix);
+	SetRotation_{DataInterfaceName}(InDataIndex, InElementIndex, Rotation);
+
+	const float3 Position = Transform._m03_m13_m23;
+	SetPosition_{DataInterfaceName}(InDataIndex, InElementIndex, Position);
+}
+
+void RemovePoint_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	SetDensity_{DataInterfaceName}(InDataIndex, InElementIndex, PCG_INVALID_DENSITY);
+}
+
+// Initialize a single point with default values.
+void InitializePoint_{DataInterfaceName}(uint InDataIndex, uint InElementIndex)
+{
+	SetPosition_{DataInterfaceName}(InDataIndex, InElementIndex, 0.0f);
+	SetRotation_{DataInterfaceName}(InDataIndex, InElementIndex, float4(0.0f, 0.0f, 0.0f, 1.0f));
+	SetScale_{DataInterfaceName}(InDataIndex, InElementIndex, 1.0f);
+	SetBoundsMin_{DataInterfaceName}(InDataIndex, InElementIndex, -50.0f);
+	SetBoundsMax_{DataInterfaceName}(InDataIndex, InElementIndex, 50.0f);
+	SetColor_{DataInterfaceName}(InDataIndex, InElementIndex, 1.0f);
+	SetDensity_{DataInterfaceName}(InDataIndex, InElementIndex, 1.0f);
+	SetSeed_{DataInterfaceName}(InDataIndex, InElementIndex, 42);
+	SetSteepness_{DataInterfaceName}(InDataIndex, InElementIndex, 1.0f);
+	
+	int NumAttributesRemaining = (int)GetDataNumAttributesInternal_{DataInterfaceName}(InDataIndex);
+
+	for (int AttributeId = PCG_NUM_RESERVED_ATTRS; AttributeId < PCG_MAX_NUM_ATTRS; ++AttributeId)
+	{
+		const uint2 ElementAddressAndStride = GetElementAddressAndStrideInternal_{DataInterfaceName}(InDataIndex, InElementIndex, AttributeId);
+		const uint ElementAddress = ElementAddressAndStride.x;
+		const uint Stride = ElementAddressAndStride.y;
+
+		if (Stride == 0)
+		{
+			// No output attribute to write to.
+			continue;
+		}
+
+		// We don't bother checking element address is nonzero as we already check Stride above.
+		for (uint Offset = 0; Offset < Stride; Offset += 4)
+		{
+			// TODO: In future could upload actual default values for attributes rather than 0-initializing.
+			StoreBufferInternal_{DataInterfaceName}(ElementAddress + Offset, 0u);
+		}
+
+		if (--NumAttributesRemaining <= 0)
+		{
+			// Early-out when we've looked at all the possible attributes
+			break;
+		}
+	}
+}

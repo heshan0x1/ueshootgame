@@ -1,0 +1,31 @@
+{
+	"FileVersion": 3,
+	"FriendlyName": "PlainPropsEngine",
+	"Description": "New Serialization Stack Prototype - Engine Bindings",
+	"Category": "Experimental",
+	"CreatedBy": "Epic Games, Inc.",
+	"CreatedByURL": "https://epicgames.com",
+	"EnabledByDefault": false,
+	"IsExperimentalVersion": true,
+	"SupportedTargetPlatforms": [
+		"Win64"
+	],
+	"Modules": [
+		{
+			"Name": "PlainPropsEngine",
+			"Type": "Runtime",
+			"LoadingPhase": "PreLoadingScreen",
+			"PlatformAllowList": [ "Win64" ],
+		}
+	],
+	"Plugins": [
+		{
+			"Name": "PlainProps",
+			"Enabled": true
+		},
+		{
+			"Name": "PlainPropsUObject",
+			"Enabled": true
+		}
+	]
+}

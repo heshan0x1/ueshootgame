@@ -1,0 +1,12 @@
+<?xml version='1.0' ?>
+<BuildGraph xmlns="http://www.epicgames.com/BuildGraph" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.epicgames.com/BuildGraph ../../../../../Build/Graph/Schema.xsd" >
+
+	<Include Script="../../../../../Build/Graph/Tasks/Inc/TestConfigs.xml"/>
+
+	<Macro Name="AddPerfTestConfig" Arguments="TestConfigName;TestPlatform" OptionalArguments="AgentType;AppArguments">
+		<Property Name="AdditionalTestArguments" Value="-AutomatedPerfTest.TestConfigName=&quot;$(TestConfigName)&quot;"/>
+		<StringOp Input="$(TestConfigName)" Method="Replace" Arguments=" ;_" Output="ArtifactPostfix"/>
+		<Property Name="TestConfigList" Value="$(TestConfigList)^$(TestConfigName)|$(TestPlatform)|$(ArtifactPostfix)|$(AdditionalTestArguments)|$(AppArguments)|$(AgentType)"/>
+	</Macro>
+
+</BuildGraph>

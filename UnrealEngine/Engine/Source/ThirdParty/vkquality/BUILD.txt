@@ -1,0 +1,3 @@
+gradlew assembleRelease 
+
+That should result in a .aar in vkq_libraryvkquality/build/outputs/aar/

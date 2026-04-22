@@ -1,0 +1,421 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+// When loading SSS checkerboard pixel, do not adjust DiffuseColor/SpecularColor to preserve specular and diffuse lighting values for each pixel
+#define ALLOW_SSS_MATERIAL_OVERRIDE 0
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "MegaLights.ush"
+#include "MegaLightsVolume.ush"
+#include "MegaLightsRayTracing.ush"
+#include "MegaLightsSampling.ush"
+
+uint VolumeDebugMode;
+float3 VolumeFrameJitterOffset;
+uint3 NumSamplesPerVoxel;
+float VolumeMinSampleWeight;
+uint3 DownsampledVolumeViewSize;
+float VolumeInverseSquaredLightDistanceBiasScale;
+uint DebugLightId;
+
+float LightHiddenPDFWeight;
+float LightHiddenPDFWeightForHistoryMiss;
+
+uint IsUnifiedVolume;
+
+uint3 VolumeVisibleLightHashTileSize;
+uint3 HistoryVolumeVisibleLightHashViewSizeInTiles;
+StructuredBuffer<uint> VolumeVisibleLightHashHistory;
+
+RWTexture3D<uint> RWVolumeLightSamples;
+RWTexture3D<uint> RWVolumeLightSampleRays;
+
+uint3 GetSampleCoord(uint3 DownsampledVolumeCoord, uint LightSampleIndex)
+{
+	return DownsampledVolumeCoord * NumSamplesPerVoxel + uint3(LightSampleIndex % NUM_SAMPLES_PER_VOXEL_3D_X, LightSampleIndex / NUM_SAMPLES_PER_VOXEL_3D_X, 0);
+}
+
+void SampleLight(
+	float3 TranslatedWorldPosition,
+	float3 CameraVector,
+	float DistanceBiasSqr,
+	float LightVolumetricSoftFadeDistance,
+	uint VisibleLightHash[VISIBLE_LIGHT_HASH_SIZE],
+	bool bHasValidHistory, 
+	uint ForwardLightIndex,
+	uint LightSceneId,
+	FDeferredLightData LightData,
+	float VolumetricScatteringIntensity,
+	uint PrevForwardLightIndex,
+	inout FLightSampler LightSampler,
+    inout FShaderPrintContext DebugContext)
+{
+	float3 L;
+	float3 LightScattering = GetMegaLightsVolumeLighting(TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, LightData, VolumetricScatteringIntensity, IsUnifiedVolume > 0, L) * View.PreExposure;
+	float SampleWeight = log2(Luminance(LightScattering) + 1.0f);
+
+	bool bWasVisibleInLastFrame = true;
+
+#if GUIDE_BY_HISTORY
+	if (SampleWeight > VolumeMinSampleWeight && PrevForwardLightIndex >= 0)
+	{
+		bWasVisibleInLastFrame = GetLightVisibility(VisibleLightHash, PrevForwardLightIndex);
+	}
+	else
+	{
+		bWasVisibleInLastFrame = false;
+	}
+#endif
+				
+	if (DebugContext.bIsActive)
+	{
+		Newline(DebugContext);
+		Print(DebugContext, LightSceneId, Select(LightSceneId == DebugLightId, FontSelected, FontValue));
+		Print(DebugContext, ForwardLightIndex, Select(LightSceneId == DebugLightId, FontSelected, FontValue));
+		Print(DebugContext, SampleWeight, Select(SampleWeight > VolumeMinSampleWeight, FontWhite, FontGrey));
+		Print(DebugContext, bWasVisibleInLastFrame ? 1u : 0u, Select(bWasVisibleInLastFrame, FontWhite, FontGrey));
+	}
+
+	if (SampleWeight > VolumeMinSampleWeight)
+	{
+		if (!bWasVisibleInLastFrame)
+		{
+			SampleWeight *= bHasValidHistory ? LightHiddenPDFWeight : LightHiddenPDFWeightForHistoryMiss;
+		}
+
+		AddLightSample(LightSampler, SampleWeight, ForwardLightIndex, bWasVisibleInLastFrame, LightData.bRadialLight);
+	}
+}
+
+void SampleLight(
+	float3 TranslatedWorldPosition,
+	float3 CameraVector,
+	float DistanceBiasSqr,
+	float LightVolumetricSoftFadeDistance,
+	uint VisibleLightHash[VISIBLE_LIGHT_HASH_SIZE],
+	bool bHasValidHistory, 
+	uint LocalLightIndex,
+	inout FLightSampler LightSampler,
+	inout FShaderPrintContext DebugContext)
+{
+	const FLocalLightData LocalLightData = GetLocalLightData(LocalLightIndex, 0);	
+	checkSlow(UnpackIsHandledByMegaLights(LocalLightData));
+	
+#if TRANSLUCENCY_LIGHTING_VOLUME
+	if (!UnpackAffectsTranslucentLighting(LocalLightData))
+	{
+		return;
+	}
+#endif
+
+	const FDeferredLightData LightData = ConvertToDeferredLight(LocalLightData);
+
+	const float VolumetricScatteringIntensity = UnpackVolumetricScatteringIntensity(LocalLightData);
+
+	SampleLight(
+		TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, 
+		VisibleLightHash, bHasValidHistory, LocalLightIndex, LocalLightData.Internal.LightSceneId, LightData, VolumetricScatteringIntensity, LocalLightData.Internal.PrevLocalLightIndex,
+		LightSampler,
+		DebugContext);
+}
+
+void SampleDirectionalLight(
+	uint DirectionalLightIndex,
+	float3 TranslatedWorldPosition,
+	float3 CameraVector,
+	float DistanceBiasSqr,
+	float LightVolumetricSoftFadeDistance,
+	uint VisibleLightHash[VISIBLE_LIGHT_HASH_SIZE],
+	bool bHasValidHistory, 
+	inout FLightSampler LightSampler,
+	inout FShaderPrintContext DebugContext)
+{
+	uint LightIndex = ForwardLightStruct.DirectionalLightIndices[DirectionalLightIndex];
+	FForwardLightData ForwardLightData = GetForwardLightData(LightIndex, 0);
+	checkSlow(UnpackIsHandledByMegaLights(ForwardLightData));
+	
+#if TRANSLUCENCY_LIGHTING_VOLUME
+	if (!UnpackAffectsTranslucentLighting(ForwardLightData))
+	{
+		return;
+	}
+#endif
+
+	FDeferredLightData LightData = ConvertToDeferredLight(ForwardLightData);
+	LightData.bRadialLight = false;
+	LightData.bInverseSquared = false;
+
+	const float VolumetricScatteringIntensity = UnpackVolumetricScatteringIntensity(ForwardLightData);
+
+	SampleLight(
+		TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, 
+		VisibleLightHash, bHasValidHistory, LightIndex, ForwardLightData.LightSceneId, LightData, VolumetricScatteringIntensity, ForwardLightData.PrevLocalLightIndex,
+		LightSampler,
+		DebugContext);
+}
+
+/**
+ * Run one thread per sample and generate new light samples for tracing
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, THREADGROUP_SIZE)]
+void VolumeGenerateLightSamplesCS(
+	uint3 GroupId : SV_GroupID,
+	uint3 GroupThreadId : SV_GroupThreadID,
+	uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	const uint3 DownsampledVolumeCoord = DispatchThreadId.xyz;
+	if (all(DownsampledVolumeCoord < DownsampledVolumeViewSize))
+	{
+		FShaderPrintContext DebugContext = InitVolumeDebugContext(DownsampledVolumeCoord, /*bDownsampled*/ true, float2(0.05, 0.05));
+
+		const uint3 VolumeCoord = DownsampledVolumeCoordToVolumeCoord(DownsampledVolumeCoord);
+#if !TRANSLUCENCY_LIGHTING_VOLUME
+		// #ml_todo: FroxelFootprintMargin should be calculated based on DownsampleFactor
+		const float FroxelFootprintMargin = 3.0f; // Sampling is done at half res, so we need a 3 froxel margin to cover all neighbors during the shading pass
+		if (IsFroxelVisible(VolumeCoord, FroxelFootprintMargin))
+#endif // !TRANSLUCENCY_LIGHTING_VOLUME
+		{
+			float SceneDepth;
+			const float3 TranslatedWorldPosition = ComputeCellTranslatedWorldPosition(VolumeCoord, VolumeFrameJitterOffset, SceneDepth);
+			const float3 CameraVector = normalize(TranslatedWorldPosition - View.TranslatedWorldCameraOrigin);
+
+#if TRANSLUCENCY_LIGHTING_VOLUME
+			float DistanceBiasSqr = 0.0f;
+			float LightVolumetricSoftFadeDistance = 0.0f;
+#else
+			float SceneDepth2 = 0.0f;
+			float SceneDepth3 = 0.0f;
+			float CellRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(VolumeCoord + uint3(1, 1, 1), VolumeFrameJitterOffset, SceneDepth2));
+			float Cell2DRadius = length(TranslatedWorldPosition - ComputeCellTranslatedWorldPosition(VolumeCoord + uint3(1, 1, 0), VolumeFrameJitterOffset, SceneDepth3));
+			float LightVolumetricSoftFadeDistance = LightSoftFading * Cell2DRadius;
+			// Bias the inverse squared light falloff based on voxel size to prevent aliasing near the light source
+			float DistanceBiasSqr = max(CellRadius * VolumeInverseSquaredLightDistanceBiasScale, 1);
+			DistanceBiasSqr *= DistanceBiasSqr;
+#endif
+
+			bool bHasValidHistory = true;
+			uint3 PrevVolumeCoord = VolumeCoord;
+
+#define REPROJECT_HISTORY_FOR_GUIDING (!TRANSLUCENCY_LIGHTING_VOLUME)
+#if GUIDE_BY_HISTORY && REPROJECT_HISTORY_FOR_GUIDING
+			{
+				float4 NDCPosition = mul(float4(TranslatedWorldPosition, 1), UnjitteredPrevTranslatedWorldToClip);
+				NDCPosition.xy /= NDCPosition.w;
+
+				float3 HistoryUV = float3(NDCPosition.xy * float2(.5f, -.5f) + .5f, ComputeMegaLightsNormalizedZSliceFromDepth(NDCPosition.w));
+				bHasValidHistory = all(HistoryUV >= 0.0f) && all(HistoryUV <= 1.0f);
+				PrevVolumeCoord = floor(saturate(HistoryUV) * VolumeViewSize);
+			}
+#endif // GUIDE_BY_HISTORY && REPROJECT_HISTORY_FOR_GUIDING
+
+			uint3 PrevVisibilityTileCoord = 0;
+#if GUIDE_BY_HISTORY
+			// #ml_todo: disabled as due to a low number of samples results are worse than simple filtering
+			// Bilinear filtering approximation using stochastic offset
+			/*{
+				uint3 Rand32Bits = Rand4DPCG32(int4(DownsampledVolumeCoord, MegaLightsStateFrameIndex)).xyz;
+				float3 RandomVec3 = (float3(Rand32Bits) / float(uint(0xffffffff)));
+				PrevVolumeCoord += (RandomVec3 - 0.5f) * VolumeVisibleLightHashTileSize;
+			}*/
+
+			PrevVisibilityTileCoord = clamp(PrevVolumeCoord / VolumeVisibleLightHashTileSize, 0u, HistoryVolumeVisibleLightHashViewSizeInTiles - 1);
+			const uint HistoryBufferBase = VISIBLE_LIGHT_HASH_SIZE * ((PrevVisibilityTileCoord.z * HistoryVolumeVisibleLightHashViewSizeInTiles.y + PrevVisibilityTileCoord.y) * HistoryVolumeVisibleLightHashViewSizeInTiles.x + PrevVisibilityTileCoord.x);
+#endif
+
+			uint VisibleLightHash[VISIBLE_LIGHT_HASH_SIZE];
+			for (uint IndexInHash = 0; IndexInHash < VISIBLE_LIGHT_HASH_SIZE; ++IndexInHash)
+			{
+				VisibleLightHash[IndexInHash] = 0xFFFFFFFF;
+
+				#if GUIDE_BY_HISTORY
+				{
+					VisibleLightHash[IndexInHash] = VolumeVisibleLightHashHistory[HistoryBufferBase + IndexInHash];
+				}
+				#endif
+			}
+
+			if (DebugContext.bIsActive)
+			{
+				Print(DebugContext, TEXT("VolumeGenerateLightSamples"), FontTitle);
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("Coord             : "));
+				Print(DebugContext, DownsampledVolumeCoord, FontValue);
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("TWS               : "));
+				Print(DebugContext, TranslatedWorldPosition, FontValue);
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("PrevVisibilityTileCoord : "));
+				Print(DebugContext, PrevVisibilityTileCoord, FontValue, 4);
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("NoiseCoord        : "));
+				Print(DebugContext, VolumeCoordToNoiseCoord(DownsampledVolumeCoord), FontValue);
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("ValidGuideHistory : "));
+				Print(DebugContext, bHasValidHistory, FontValue);
+
+				AddCrossTWS(DebugContext, TranslatedWorldPosition, 5.0f, float4(1, 0, 0, 1));
+
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("LightId | LocalLightId | Weight  | History"), FontSilver);
+			}
+
+			uint3 CellIndex = DownsampledVolumeCoord % 2;
+			uint LinearIndex = CellIndex.x + CellIndex.y * 2 + CellIndex.z * 4;
+			LinearIndex = (LinearIndex + MegaLightsStateFrameIndex) % 8;
+
+		#if REFERENCE_MODE
+			FLightSampler LightSampler;
+			InitLightSamplerFromSequence(LightSampler, VolumeCoordToNoiseCoord(DownsampledVolumeCoord), MegaLightsStateFrameIndex);
+		#else
+			const float RandomScalar0 = BlueNoiseScalar(VolumeCoordToNoiseCoord(DownsampledVolumeCoord), MegaLightsStateFrameIndex);
+			FLightSampler LightSampler = InitLightSamplerStratified(RandomScalar0);
+		#endif
+
+			const uint EyeIndex = 0;
+#if TRANSLUCENCY_LIGHTING_VOLUME
+			const float4 FroxelClipSpacePosition = mul(float4(TranslatedWorldPosition, 1), View.TranslatedWorldToClip);
+			const float2 SvPosition = (FroxelClipSpacePosition.xy / FroxelClipSpacePosition.w * float2(.5f, -.5f) + .5f) * View.ViewSizeAndInvSize.xy;
+
+			const uint GridIndex = ComputeLightGridCellIndex((uint2)(SvPosition * View.LightProbeSizeRatioAndInvSizeRatio.zw - View.ViewRectMin.xy), FroxelClipSpacePosition.w, EyeIndex);
+#else
+			const uint GridIndex = ComputeLightGridCellIndex(VolumeCoord.xy * MegaLightsVolumePixelSize, SceneDepth, EyeIndex);
+#endif
+			const FCulledLightsGridHeader CulledLightsGridHeader = GetCulledLightsGridHeader(GridIndex);
+			const uint NumLightsInGridCell = min(CulledLightsGridHeader.NumMegaLights, GetMaxLightsPerCell());
+
+			const uint ScalarGridIndex = WaveReadLaneFirst(GridIndex);
+			const bool bScalarGridCell = WaveActiveAllTrue(ScalarGridIndex == GridIndex);
+
+			if (bScalarGridCell)
+			{
+				const FCulledLightsGridHeader CulledLightsGridHeader = GetCulledLightsGridHeader(ScalarGridIndex);
+				const uint NumLightsInGridCell = min(CulledLightsGridHeader.NumMegaLights, GetMaxLightsPerCell());
+
+				uint GridLightIndex = 0;
+				while(GridLightIndex < NumLightsInGridCell)
+				{
+					uint LocalLightIndex = GetCulledLightDataGrid(CulledLightsGridHeader.MegaLightsDataStartIndex + GridLightIndex);
+					if (LocalLightIndex >= MAX_LOCAL_LIGHT_INDEX)
+					{
+						break;
+					}
+						
+					++GridLightIndex;
+					SampleLight(TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, VisibleLightHash, bHasValidHistory, LocalLightIndex, LightSampler, DebugContext);
+				}
+			}
+			else
+			{
+				uint GridLightIndex = 0;
+				while(GridLightIndex < NumLightsInGridCell)
+				{
+					const uint VectorLocalLightIndex = GetCulledLightDataGrid(CulledLightsGridHeader.MegaLightsDataStartIndex + GridLightIndex);
+					if (VectorLocalLightIndex >= MAX_LOCAL_LIGHT_INDEX)
+					{
+						break;
+					}
+
+					uint LocalLightIndex = WaveActiveMin(VectorLocalLightIndex);
+					if (LocalLightIndex == VectorLocalLightIndex)
+					{
+						++GridLightIndex;
+						SampleLight(TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, VisibleLightHash, bHasValidHistory, LocalLightIndex, LightSampler, DebugContext);
+					}
+				}
+			}
+
+			// sample directional lights
+			for (uint Index = ForwardLightStruct.DirectionalMegaLightsSupportedStartIndex; Index < ForwardLightStruct.NumDirectionalLights; ++Index)
+			{
+				SampleDirectionalLight(Index, TranslatedWorldPosition, CameraVector, DistanceBiasSqr, LightVolumetricSoftFadeDistance, VisibleLightHash, bHasValidHistory, LightSampler, DebugContext);
+			}
+
+			if (DebugContext.bIsActive)
+			{
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("Weight sum : "));
+				Print(DebugContext, LightSampler.WeightSum, FontValue);
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("Selected	: "));
+				Newline(DebugContext);
+				Print(DebugContext, TEXT("LightId    | Weight"), FontSilver);
+
+				for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_VOXEL_1D; ++LightSampleIndex)
+				{
+					FCandidateLightSample LightSample = UnpackCandidateLightSample(LightSampler.PackedSamples[LightSampleIndex]);
+
+					if (VolumeDebugMode == DEBUG_MODE_VISUALIZE_SAMPLING)
+					{
+						const uint3 SampleCoord = GetSampleCoord(DownsampledVolumeCoord, LightSampleIndex);
+
+						const FForwardLightData ForwardLightData = GetForwardLightData(LightSample.LocalLightIndex, 0);
+						const FDeferredLightData LightData = ConvertToDeferredLight(ForwardLightData);
+						const float2 LightSampleUV = BlueNoiseVec2(VolumeCoordToNoiseCoord(SampleCoord), MegaLightsStateFrameIndex);
+						const FLightSampleTrace LightSampleTrace = GetLightSampleTrace(TranslatedWorldPosition, LightSample.LocalLightIndex, LightSampleUV);
+						float4 RayColor = float4(LightData.Color.xyz / Luminance(LightData.Color.xyz), 1.0f);
+						AddLineTWS(DebugContext, TranslatedWorldPosition, TranslatedWorldPosition + LightSampleTrace.Direction * LightSampleTrace.Distance, RayColor);
+					}
+				}
+			}
+
+			// Finalize samples
+			for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_VOXEL_1D; ++LightSampleIndex)
+			{
+				FCandidateLightSample CandidateLightSample = UnpackCandidateLightSample(LightSampler.PackedSamples[LightSampleIndex]);
+
+				FLightSample LightSample = InitLightSample();
+				LightSample.bVisible = true;
+				LightSample.LocalLightIndex = CandidateLightSample.LocalLightIndex;
+				LightSample.Weight = CandidateLightSample.Weight;
+
+				FVolumeLightSampleRay VolumeLightSampleRay = InitVolumeLightSampleRay();
+				VolumeLightSampleRay.bCompleted = false;
+
+				if (LightSample.LocalLightIndex != MAX_LOCAL_LIGHT_INDEX)
+				{
+					LightSample.Weight = LightSampler.WeightSum / (NUM_SAMPLES_PER_VOXEL_1D * LightSample.Weight);
+
+					const FForwardLightData ForwardLightData = GetForwardLightData(LightSample.LocalLightIndex, 0);
+
+#if TRANSLUCENCY_LIGHTING_VOLUME
+					const bool bCastShadow = UnpackCastShadow(ForwardLightData) && UnpackAffectsTranslucentLighting(ForwardLightData);
+#else
+					const bool bCastShadow = UnpackCastShadow(ForwardLightData) && ((IsUnifiedVolume > 0 && UnpackAffectsTranslucentLighting(ForwardLightData)) || UnpackCastVolumetricShadow(ForwardLightData));
+#endif
+
+					VolumeLightSampleRay.bCompleted = bCastShadow ? false : true;
+
+					// Temporarily reuse bGuidedAsVisible as bCastVolumetricShadow since it's not currently used for volumes
+					LightSample.bGuidedAsVisible = UnpackCastVolumetricShadow(ForwardLightData);
+				}
+
+				if (DebugContext.bIsActive)
+				{
+					const FForwardLightData ForwardLightData = GetForwardLightData(LightSample.LocalLightIndex, 0);
+
+					Newline(DebugContext);
+					Print(DebugContext, ForwardLightData.LightSceneId, Select(ForwardLightData.LightSceneId == DebugLightId, FontSelected, FontValue));
+					Print(DebugContext, LightSample.Weight, FontValue);
+				}
+
+				RWVolumeLightSamples[GetSampleCoord(DownsampledVolumeCoord, LightSampleIndex)] = PackLightSample(LightSample);
+				RWVolumeLightSampleRays[GetSampleCoord(DownsampledVolumeCoord, LightSampleIndex)] = PackVolumeLightSampleRay(VolumeLightSampleRay);
+			}
+		}
+#if !TRANSLUCENCY_LIGHTING_VOLUME
+		else
+		{
+			for (uint LightSampleIndex = 0; LightSampleIndex < NUM_SAMPLES_PER_VOXEL_1D; ++LightSampleIndex)
+			{
+				RWVolumeLightSamples[GetSampleCoord(DownsampledVolumeCoord, LightSampleIndex)] = PackLightSample(InitLightSample());
+				RWVolumeLightSampleRays[GetSampleCoord(DownsampledVolumeCoord, LightSampleIndex)] = PackVolumeLightSampleRay(InitVolumeLightSampleRay());
+			}
+		}
+#endif
+
+		if (DebugContext.bIsActive)
+		{
+			AddTextBackground(DebugContext, FontBackground);
+		}
+	}
+}

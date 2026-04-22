@@ -1,0 +1,111 @@
+<!--
+
+  The MIT License (MIT)
+  
+  Copyright (c) 2024 Advanced Micro Devices, Inc.,
+  Fatalist Development AB (Avalanche Studio Group),
+  and Miguel Petersen.
+  
+  All Rights Reserved.
+  
+  Permission is hereby granted, free of charge, to any person obtaining a copy 
+  of this software and associated documentation files (the "Software"), to deal 
+  in the Software without restriction, including without limitation the rights 
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies 
+  of the Software, and to permit persons to whom the Software is furnished to do so, 
+  subject to the following conditions:
+  
+  The above copyright notice and this permission notice shall be included in all 
+  copies or substantial portions of the Software.
+  
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, 
+  INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR 
+  PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE 
+  FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, 
+  ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+  
+-->
+
+
+<schema>
+    <struct name="ShaderLocation">
+        <field name="offset" type="uint32"/>
+        <field name="line"   type="uint32"/>
+        <field name="column" type="uint32"/>
+    </struct>
+
+    <message name="GetShaderName">
+        <field name="shaderUID" type="uint64"/>
+    </message>
+
+    <message name="GetShaderCode">
+        <field name="shaderUID" type="uint64"/>
+        <field name="poolCode" type="bool"/>
+    </message>
+
+    <message name="GetShaderIL">
+        <field name="shaderUID" type="uint64"/>
+    </message>
+
+    <message name="GetShaderBlockGraph">
+        <field name="shaderUID" type="uint64"/>
+    </message>
+
+    <message name="SetUseShaderExternalReference">
+        <field name="enabled" type="bool"/>
+    </message>
+
+    <message name="ReleaseShader">
+        <field name="shaderUID" type="uint64"/>
+    </message>
+
+    <message name="ShaderName">
+        <field name="shaderUID" type="uint64"/>
+        <field name="language"  type="string"/>
+        <field name="found"     type="bool"/>
+        <field name="name"      type="string"/>
+    </message>
+
+    <message name="ShaderCode">
+        <field name="shaderUID" type="uint64"/>
+        <field name="language"  type="string"/>
+        <field name="found"     type="bool"/>
+        <field name="native"    type="bool"/>
+        <field name="fileCount" type="uint32"/>
+        <field name="poolCode"  type="bool"/>
+    </message>
+
+    <message name="ShaderCodeFile">
+        <field name="shaderUID" type="uint64"/>
+        <field name="fileUID"   type="uint32"/>
+        <field name="filename"  type="string"/>
+        <field name="code"      type="string"/>
+        <field name="poolCode"  type="bool"/>
+    </message>
+
+    <message name="ShaderIL">
+        <field name="shaderUID" type="uint64"/>
+        <field name="found"     type="bool"/>
+        <field name="program"   type="string"/>
+    </message>
+
+    <message name="ShaderBlockGraph">
+        <field name="shaderUID" type="uint64"/>
+        <field name="found"     type="bool"/>
+        <field name="nodes"     type="string"/>
+    </message>
+
+    <message name="GetShaderStatus">
+        <field name="shaderUIDs" type="array" element="uint64"/>
+    </message>
+
+    <message name="ShaderStatus">
+        <field name="shaderUID" type="uint64"/>
+        <field name="active" type="bool"/>
+        <field name="instrumented" type="bool"/>
+    </message>
+
+    <message name="ShaderStatusCollection">
+        <field name="status" type="stream"/>
+    </message>
+</schema>

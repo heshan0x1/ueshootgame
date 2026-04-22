@@ -1,0 +1,100 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#define NUM_VIRTUALTEXTURE_SAMPLES 1
+#include "../VirtualTextureCommon.ush"
+
+float4 SampleVirtualTextureLayer(
+	float2 InSampleUV,
+	Texture2D InTexture,
+	SamplerState InSampler,
+	Texture2D<uint4> InPageTable,
+	Texture2D<uint> InPageTableIndirection,
+	uint InAdaptive,
+	uint4 InUniforms,
+	uint4 PageTableUniform0,
+	uint4 PageTableUniform1,
+	out uint OutSampledMipLevel)
+{
+	VTPageTableResult PageTable;
+
+	if (InAdaptive == 0)
+	{
+		PageTable = TextureLoadVirtualPageTableLevel(
+			InPageTable,
+			VTPageTableUniform_Unpack(PageTableUniform0, PageTableUniform1),
+			InSampleUV,
+			VTADDRESSMODE_CLAMP,
+			VTADDRESSMODE_CLAMP,
+			0.0f);
+	}
+	else
+	{
+		PageTable = TextureLoadVirtualPageTableAdaptiveLevel(
+			InPageTable,
+			InPageTableIndirection,
+			VTPageTableUniform_Unpack(PageTableUniform0, PageTableUniform1),
+			InSampleUV,
+			VTADDRESSMODE_CLAMP,
+			VTADDRESSMODE_CLAMP,
+			0.0f);
+	}
+
+	OutSampledMipLevel = IsValid(PageTable, 0) ? PageTable.PageTableValue[0].x & 0xf : 0xffffffff;
+
+	return TextureVirtualSample(InTexture, InSampler, PageTable, 0, VTUniform_Unpack(InUniforms));
+}
+
+Texture2D HeightVirtualTexture;
+Texture2D<uint4> HeightVirtualTexturePageTable;
+Texture2D<uint> HeightVirtualTexturePageTableIndirection;
+uint HeightVirtualTextureAdaptive;
+SamplerState HeightVirtualTextureSampler;
+float3 HeightVirtualTextureLWCTile;
+float4x4 HeightVirtualTextureWorldToUVTransform;
+uint HeightVirtualTextureEnabled;
+uint4 HeightVirtualTexturePackedUniform0;
+uint4 HeightVirtualTexturePackedUniform1;
+uint4 HeightVirtualTextureUniforms;
+
+void SampleHeightVirtualTexture(
+	float3 InWorldPos,
+	out bool bOutInsideVolume,
+	out uint OutSampledMipLevel,
+	out float OutWorldHeight)
+{
+	bOutInsideVolume = false;
+	OutWorldHeight = 0.0f;
+
+	// Get sample location.
+	const float4x4 WorldToUVTransform = HeightVirtualTextureWorldToUVTransform;
+	const float3 UnpackOrigin = WorldToUVTransform[0].xyz;
+	const float3 UnpackU = WorldToUVTransform[1].xyz;
+	const float3 UnpackV = WorldToUVTransform[2].xyz;
+	const float3 LWCTile = (float3)0;
+
+	const FDFVector3 LWCWorldPos = DFFromTileOffset_Hack(MakeLWCVector3(LWCTile, InWorldPos));
+	const FDFVector3 LWCUVOrigin = DFFromTileOffset_Hack(MakeLWCVector3(HeightVirtualTextureLWCTile, UnpackOrigin));
+	const float2 SampleUV = VirtualTextureWorldToUV(LWCWorldPos, LWCUVOrigin, UnpackU, UnpackV);
+
+	// Test to see if we are inside the volume, but still take the samples as it will clamp to the edge.
+	bOutInsideVolume = all(SampleUV > 0.0f) && all(SampleUV < 1.0f);
+
+	// Sample RVT.
+	float4 LayerSample = SampleVirtualTextureLayer(
+			SampleUV,
+			HeightVirtualTexture,
+			HeightVirtualTextureSampler,
+			HeightVirtualTexturePageTable,
+			HeightVirtualTexturePageTableIndirection,
+			HeightVirtualTextureAdaptive,
+			HeightVirtualTextureUniforms,
+			HeightVirtualTexturePackedUniform0,
+			HeightVirtualTexturePackedUniform1,
+			OutSampledMipLevel);
+
+	// Unpack layer sample.
+	const float2 UnpackScaleBias = WorldToUVTransform[3].xy;
+	OutWorldHeight = VirtualTextureUnpackHeight(LayerSample, UnpackScaleBias);
+}

@@ -1,0 +1,18 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "/Engine/Private/Common.ush"
+
+Texture2D TextureOverlay;
+Texture2D TextureBase;
+SamplerState Sampler;
+
+float4 DrawOverlay_PS(float2 uv : TEXCOORD) : SV_Target
+{
+	float4 srcColor = TextureOverlay.Sample(Sampler, uv);
+	float4 dstColor = TextureBase.Sample(Sampler, uv);
+
+	// Source-over blending (source color is already alpha-premultiplied)
+	float3 outColor = dstColor.rgb * (1 - srcColor.a) + srcColor.rgb;
+
+	return float4(outColor, 1);
+}

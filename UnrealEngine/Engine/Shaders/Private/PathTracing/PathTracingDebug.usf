@@ -1,0 +1,1192 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define RANDSEQ_VERSION 1
+#define RANDSEQ_SFC_TEXTURE 1
+
+#define LIGHT_LOOP_METHOD 	2 // 0: stochastic (like ref PT) 1: loop over all lights 2: RIS (take N samples but trace a single shadow ray)
+
+#define USE_BSDF_SAMPLING 1 // 0: light sampling only (no MIS) 1: light sampling and BSDF sampling (with MIS)
+
+#define USE_PATH_TRACING_LIGHT_GRID	1
+#define USE_RAY_TRACING_DECAL_GRID	1
+
+#ifndef PATH_TRACER_PRIMARY_RAYS // Should be set by permutation
+#define PATH_TRACER_PRIMARY_RAYS 0
+#endif
+
+#ifndef PATH_TRACER_INCLUDE_TRANSLUCENT // Should be set by permutation
+#define PATH_TRACER_INCLUDE_TRANSLUCENT   0 // include objects tagged as TRANSLUCENT when tracing rays?
+#endif
+
+
+#include "../Common.ush"
+#include "../BlueNoise.ush"
+#include "../RayTracing/RayTracingCommon.ush"
+#include "../RayTracing/RayTracingDecalGrid.ush"
+#include "PathTracingCommon.ush"
+#include "Material/PathTracingMaterialSampling.ush"
+#include "Utilities/PathTracingRandomSequence.ush"
+#include "Utilities/PathTracingRIS.ush"
+#include "Light/PathTracingLightSampling.ush"
+#include "Light/PathTracingLightGrid.ush"
+
+#if PATH_TRACER_USE_SER
+
+#define NV_HITOBJECT_USE_MACRO_API
+#include "/Engine/Shared/ThirdParty/NVIDIA/nvHLSLExtns.h"
+
+#endif
+
+RWTexture2D<float4> RWSceneColor;
+RWTexture2D<float4> RWSceneDiffuseColor;
+RWTexture2D<float4> RWSceneSpecularColor;
+RWTexture2D<float4> RWSceneNormal;
+RWTexture2D<float>  RWSceneRoughness;
+RWTexture2D<float>  RWSceneLinearDepth;
+RWTexture2D<float>  RWSceneDepth;
+RaytracingAccelerationStructure TLAS;
+
+RWStructuredBuffer<FMarkovChainState> MarkovChainStateGrid;
+uint MarkovChainStateGridSize;
+uint UsePathGuiding;
+
+int DebugMode;
+int SamplesPerPixel;
+int SampleIndex;
+float SampleBlendFactor;
+int MaxBounces;
+int EnableEmissive;
+
+uint4 GridHash(uint4 P)
+{
+	const uint4 S = uint4(16, 17, 18, 19);
+	const uint K = 1159349557u;
+	P ^= P >> S; P *= K; P ^= P.yzwx ^ P.zwxy;
+	P ^= P >> S; P *= K; P ^= P.yzwx ^ P.zwxy;
+	P ^= P >> S; P *= K; P ^= P.yzwx ^ P.zwxy;
+	return P;
+}
+
+float3 TraceShadowRay(FRayDesc Ray, float PathRoughness, float PreviousPathRoughness, uint MissShaderIndex, bool bCastShadows)
+{
+	if (!bCastShadows && MissShaderIndex == 0)
+	{
+		// no work to do
+		return 1.0;
+	}
+
+	FPackedPathTracingPayload PackedPayload = InitPathTracingVisibilityPayload(PathRoughness);
+
+	if (!bCastShadows)
+	{
+		// ray should not cast shadows, make it degenerate so we can still run the miss shader
+		Ray.TMin = POSITIVE_INFINITY;
+		Ray.TMax = POSITIVE_INFINITY;
+	}
+	TraceRay(
+		TLAS,
+		RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER,
+		PATHTRACER_MASK_SHADOW,
+		RAY_TRACING_SHADER_SLOT_SHADOW,
+		RAY_TRACING_NUM_SHADER_SLOTS,
+		MissShaderIndex,
+		Ray.GetNativeDesc(),
+		PackedPayload);
+
+	if (PackedPayload.IsHit())
+	{
+		// We didn't run the miss shader, therefore we must have hit something opaque (or reached full opacity)
+		return 0.0;
+	}
+	return PackedPayload.GetRayThroughput() * exp(-max(PackedPayload.GetTau(), 0.0));
+}
+
+struct FPathTracingResult {
+	float4 Radiance;
+	float3 DiffuseColor;
+	float3 SpecularColor;
+	float3 WorldNormal;
+	float Roughness;
+	float LinearDepth;
+	float Z;
+};
+
+FPathTracingResult MakeResult(float3 Radiance, float Alpha, float Z)
+{
+	FPathTracingResult Result = (FPathTracingResult) 0;
+	Result.Radiance.rgb = Radiance;
+	Result.Radiance.a = Alpha;
+	Result.Z = Z;
+	return Result;
+}
+
+float3 GetLightingChannelMaskDebugColor(int LightingChannelMask)
+{
+	float r = LightingChannelMask & 1 ? 1.0 : 0.1;
+	float g = LightingChannelMask & 2 ? 1.0 : 0.1;
+	float b = LightingChannelMask & 4 ? 1.0 : 0.1;
+	return float3(r, g, b);
+}
+
+float3 AnisoDebugColor(float InAniso)
+{
+	// Follow same mapping than raster buffer visualization (BP located in Engine/Contents/Anisotropy)
+	float AniG = saturate( InAniso);
+	float AniB = saturate(-InAniso);
+	return float3(0.0, pow(AniG, 2.2), pow(AniB, 2.2));
+}
+
+float3 StateGetPos(FMarkovChainState State)
+{
+	return State.WeightSum > 0.0 ? State.WeightedTarget / State.WeightSum : State.WeightedTarget;
+}
+
+float StateGetCos(FMarkovChainState State)
+{
+	return State.WeightSum > 0 ? State.WeightedCosine / State.WeightSum : 0.0;
+}
+
+float3 StateGetDir(FMarkovChainState State, float3 AbsoluteWorldPos)
+{
+	return normalize(StateGetPos(State) - AbsoluteWorldPos);
+}
+
+float4 StateGetVMFLobe(FMarkovChainState State, float3 AbsoluteWorldPos)
+{
+	float3 StateP = StateGetPos(State);
+	float  StateR = StateGetCos(State);
+	float Np = 0.2 / length2(AbsoluteWorldPos - StateP); // Prior (see Section 4, step 2)
+	float r = MISWeightBalanced(State.N * State.N, Np) * StateR;
+	r = min(r, 0.99999994); // clamp to avoid singularity at r=1
+    float Kappa = r * (3.0 - r * r) / (1.0 - r * r); // Banerjee et al. 2005 - eq 4.4
+	return float4(normalize(StateP - AbsoluteWorldPos), Kappa);
+}
+
+// Based on Yusuke Tokuyoshi, A Numerically Stable Implementation of the von Mises–Fisher Distribution on S2
+float log1p(const float x)
+{
+	return abs(x) < 0.01 ? sign(x) * mad(-0.5f * x, x, x) : log(1 + x);
+}
+float expm1(const float x)
+{
+	return abs(x) < 0.03 ? sign(x) * mad(0.5f * x, x, x) : exp(x) - 1;
+}
+
+float x_over_expm1(const float x)
+{
+	return abs(x) < 0.03 ? rcp(0.5 * x + 1) : x * rcp(exp(x) - 1);
+}
+
+float VMFPdf(const float3 W, const float4 LobeData) {
+	const float3 Mu = LobeData.xyz;
+	const float Kappa = LobeData.w;
+	const float3 D = W - Mu;
+	return exp(-0.5f * Kappa * dot(D, D)) * x_over_expm1(-2.0f * Kappa) * (1.0 / (4.0 * PI));
+}
+
+float3 VMFSample(const float4 LobeData, const float2 Rand) {
+	const float3 Mu = LobeData.xyz;
+	const float Kappa = LobeData.w;
+	const float Phi = (2 * PI) * Rand.x;
+    const float r = Kappa > ( 1.192092896e-07F / 4.0f) ? log1p(Rand.y * expm1(-2.0f * Kappa)) / Kappa : -2.0f * Rand.y;
+    const float SinTheta = sqrt(-mad(r, r, 2.0f * r));
+	const float CosTheta = 1 + r;
+    const float3 Dir = float3(cos(Phi) * SinTheta, sin(Phi) * SinTheta, CosTheta);
+	return TangentToWorld(Dir, Mu);
+}
+
+int GetDominantSide(float3 N)
+{
+	if (abs(N.x) > abs(N.y) && abs(N.x) > abs(N.z))
+		return (N.x < 0);
+	if (abs(N.y) > abs(N.z))
+		return 2 + (N.y < 0);
+	return 4 + (N.z < 0);
+}
+
+
+#if PATH_TRACER_PRIMARY_RAYS
+
+FPackedPathTracingPayload TraceTransparentRay(FRayDesc Ray, int ScatterType, int Bounce, float PathRoughness, float3 SigmaT, inout float3 PathThroughput, inout FRandomSequence RandSequence, inout FPathTracingResult Result, inout float3 LocalRadiance)
+{
+	const uint RayFlags = Bounce == 0 ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : 0;
+	const uint MissShaderIndex = 0;
+	uint InstanceInclusionMask = (ScatterType == PATHTRACER_SCATTER_CAMERA || ScatterType == PATHTRACER_SCATTER_REFRACT) ? PATHTRACER_MASK_CAMERA : PATHTRACER_MASK_INDIRECT;
+
+	const float2 RandSample = RandSequence.Get2D();
+
+	FRISContext HitSample = InitRISContext(RandSample.x);
+
+	float3 ResultThroughput = 0;
+	FPackedPathTracingPayload ResultPayload = (FPackedPathTracingPayload) 0;
+	FPackedPathTracingPayload OpaquePackedPayload = InitPathTracingPayload(ScatterType, PathRoughness);
+	OpaquePackedPayload.SetDBufferA(float4(0, 0, 0, 1));
+	OpaquePackedPayload.SetDBufferB(float4(0, 0, 0, 1));
+	OpaquePackedPayload.SetDBufferC(float4(0, 0, 0, 1));
+	OpaquePackedPayload.SetStochasticSlabRand(RandSample.y);
+	OpaquePackedPayload.SetFlag(PATH_TRACING_PAYLOAD_INPUT_FLAG_IGNORE_TRANSLUCENT);
+
+#if PATH_TRACER_USE_SER 
+	{
+		NvHitObject Hit;
+		NvTraceRayHitObject(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			RAY_TRACING_SHADER_SLOT_MATERIAL,
+			RAY_TRACING_NUM_SHADER_SLOTS,
+			MissShaderIndex,
+			Ray.GetNativeDesc(),
+			OpaquePackedPayload,
+			Hit);
+		if (Bounce > 0)
+		{
+			NvReorderThread(Hit);
+		}
+		NvInvokeHitObject(TLAS, Hit, OpaquePackedPayload);
+	}
+#else
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RAY_TRACING_SHADER_SLOT_MATERIAL,
+		RAY_TRACING_NUM_SHADER_SLOTS,
+		MissShaderIndex,
+		Ray.GetNativeDesc(),
+		OpaquePackedPayload);
+#endif
+	if (OpaquePackedPayload.IsHit())
+	{
+		// TODO: If hit, also process decals, etc ...
+
+		// Now that we know where the opaque hit is, trace the remaining portion of the ray prior to this
+		Ray.TMax = asfloat(asuint(OpaquePackedPayload.HitT) - 1);
+	}
+
+	InstanceInclusionMask = (ScatterType == PATHTRACER_SCATTER_CAMERA || ScatterType == PATHTRACER_SCATTER_REFRACT) ? PATHTRACER_MASK_CAMERA_TRANSLUCENT : PATHTRACER_MASK_INDIRECT_TRANSLUCENT;
+
+	for (;;)
+	{
+#if PATH_TRACER_INCLUDE_TRANSLUCENT
+		FPackedPathTracingPayload PackedPayload = InitPathTracingPayload(ScatterType, PathRoughness);
+		PackedPayload.SetDBufferA(float4(0, 0, 0, 1));
+		PackedPayload.SetDBufferB(float4(0, 0, 0, 1));
+		PackedPayload.SetDBufferC(float4(0, 0, 0, 1));
+		PackedPayload.SetStochasticSlabRand(RandSample.y);
+		if (OpaquePackedPayload.IsHit())
+		{
+			const float3 ViewZ = View.ViewToTranslatedWorld[2].xyz;
+			const float3 TranslatedWorldPos = Ray.Origin + OpaquePackedPayload.HitT * Ray.Direction;
+			PackedPayload.SetFlag(PATH_TRACING_PAYLOAD_INPUT_FLAG_HAS_SCENE_DEPTH);
+			PackedPayload.SetSceneDepth(dot(TranslatedWorldPos, ViewZ));
+		}
+
+#if PATH_TRACER_USE_SER 
+		{
+			NvHitObject Hit;
+			NvTraceRayHitObject(
+				TLAS,
+				RayFlags,
+				InstanceInclusionMask,
+				RAY_TRACING_SHADER_SLOT_MATERIAL,
+				RAY_TRACING_NUM_SHADER_SLOTS,
+				MissShaderIndex,
+				Ray.GetNativeDesc(),
+				PackedPayload,
+				Hit);
+			if (Bounce > 0)
+			{
+				NvReorderThread(Hit);
+			}
+			NvInvokeHitObject(TLAS, Hit, PackedPayload);
+		}
+#else
+		// Trace the ray
+		TraceRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			RAY_TRACING_SHADER_SLOT_MATERIAL,
+			RAY_TRACING_NUM_SHADER_SLOTS,
+			MissShaderIndex,
+			Ray.GetNativeDesc(),
+			PackedPayload);
+#endif
+		if (PackedPayload.IsMiss())
+		{
+			// If we miss the translucent geometry, the next hit is the opaque one
+			PackedPayload = OpaquePackedPayload;
+		}
+#else // PATH_TRACER_INCLUDE_TRANSLUCENT
+
+#define PackedPayload OpaquePackedPayload
+
+#endif // PATH_TRACER_INCLUDE_TRANSLUCENT
+		// If miss - exit
+		if (PackedPayload.IsMiss())
+		{
+			// still no hit -- the ray must have escaped to the background, we are done
+			// TODO: could add background Alpha here
+			break;
+		}
+
+		if (Bounce == 0 && !PackedPayload.IsHoldout())
+		{
+			Result.Radiance.a += Luminance(PathThroughput * (1.0 - PackedPayload.UnpackTransparencyColor()));
+		}
+
+		// Apply Beer's law
+		PathThroughput *= select(SigmaT > 0.0, exp(-SigmaT * (PackedPayload.HitT - Ray.TMin)), 1.0);
+
+		if (Bounce == 0 || EnableEmissive)
+		{
+			LocalRadiance += PathThroughput * PackedPayload.UnpackRadiance();
+		}
+
+		if (Bounce == 0 && PackedPayload.ShouldOutputDepth() && Result.Z == 0.0)
+		{
+			const float3 ViewZ = View.ViewToTranslatedWorld[2].xyz;
+			const float3 TranslatedWorldPos = Ray.Origin + PackedPayload.HitT * Ray.Direction;
+			Result.LinearDepth = dot(TranslatedWorldPos, ViewZ);
+			Result.Z = ConvertToDeviceZ(Result.LinearDepth);
+			Result.WorldNormal = PackedPayload.UnpackWorldNormal();
+		}
+
+		if (Bounce < MaxBounces)
+		{
+			FPathTracingPayload HitPayload = UnpackPathTracingPayload(PackedPayload, Ray);
+			AdjustPayloadAfterUnpack(HitPayload, true);
+			float3 Contrib = PathThroughput * EstimateMaterialAlbedo(HitPayload);
+
+			// only allow albedo tracking through a very narrow range of roughness values
+			const float DenoiserMinRoughness = 0.000;
+			const float DenoiserMaxRoughness = 0.004;
+			float DenoiserContrib = 1 - saturate((PathRoughness - DenoiserMinRoughness) / (DenoiserMaxRoughness - DenoiserMinRoughness));
+			if (DenoiserContrib > 0 && Bounce == 0)
+			{
+				float3 DenoiserThroughput = PathThroughput * DenoiserContrib * HitPayload.BSDFOpacity;
+
+				// TEMP: If the material has a valid SSS lobe, just merge it into diffuse for now
+				FSSSRandomWalkInfo SSS = GetMaterialSSSInfo(HitPayload, Ray.Direction);
+				if (any(SSS.Weight > 0))
+				{
+					HitPayload.DiffuseColor += SSS.Color;
+				}
+
+				// Accumulate G-Buffer like data for the denoiser
+#if PATHTRACING_SUBSTRATE_PAYLOAD
+				float3 RoughnessData = HitPayload.RoughnessData;
+				float Roughness = lerp(RoughnessData.x, RoughnessData.y, RoughnessData.z); // mix both lobes to get an average value
+				DenoiserThroughput *= HitPayload.WeightV * HitPayload.BSDFOpacity * lerp(1.0, HitPayload.TransmittanceN, HitPayload.CoverageAboveAlongN);
+#else
+				float Roughness = HitPayload.Roughness;
+#endif
+				float NormThroughput = Luminance(DenoiserThroughput);
+				float3 DiffuseColor = HitPayload.DiffuseColor;
+				float3 SpecularColor = HitPayload.SpecularColor;
+
+				float MinRoughness = max(DenoiserMinRoughness, PathRoughness);
+				float DenoiserRoughnessWeight = saturate((Roughness - MinRoughness) / (DenoiserMaxRoughness - MinRoughness));
+#if 1
+				// Remapping of NoV seems to be required by DLSS
+				// TODO: Could use the energy conservation routines and tweak diffuse as well
+				float NoV = saturate(dot(-Ray.Direction, HitPayload.WorldNormal));
+				float x = NoV * NoV;
+				NoV = 0.75 * x / (x + (1 - NoV) * (1 - NoV));
+				float3 F = EnvBRDF(HitPayload.SpecularColor, Roughness, NoV);
+#else
+				float3 F = HitPayload.SpecularColor;
+#endif
+				Result.DiffuseColor += DenoiserThroughput * HitPayload.DiffuseColor;
+				Result.SpecularColor += DenoiserThroughput * F * DenoiserRoughnessWeight;
+				Result.Roughness += NormThroughput * Roughness;
+				//Result.WorldNormal += NormThroughput * HitPayload.WorldNormal;
+			}
+
+			float SelectionWeight = max3(Contrib.x, Contrib.y, Contrib.z);
+			if (HitSample.Accept(SelectionWeight))
+			{
+				// stash this hit as a candidate return value
+				ResultPayload = PackedPayload;
+				ResultThroughput = PathThroughput / SelectionWeight;
+			}
+		}
+
+		// account for local transparency change
+		PathThroughput *= PackedPayload.UnpackTransparencyColor();
+
+		// prepare next step around the loop (if any throughput is left)
+		// retrace the exact same ray with TMin one ulp past the hit we just found
+		Ray.TMin = ComputeNewTMin(Ray.Origin, Ray.Direction, PackedPayload.HitT);
+		if (!(Ray.TMin < Ray.TMax) || all(PathThroughput == 0))
+		{
+			break;
+		}
+	}
+	PathThroughput = ResultThroughput * HitSample.GetNormalization();
+	return ResultPayload;
+}
+
+
+
+FPathTracingResult PathTracingDebugCore(FRayDesc Ray, uint2 LaunchIndex, int SampleIndex)
+{
+	FPathTracingResult Result = (FPathTracingResult) 0;
+	float3 PathThroughput = 1;
+	float PathRoughness = 0;
+	float3 SigmaT = 0; // TODO: initialize from pre-pass for rays starting inside glass/water
+	uint ScatterType = PATHTRACER_SCATTER_CAMERA;
+	FRandomSequence RandSequence = RandomSequenceCreate(uint3(LaunchIndex, View.StateFrameIndex), SampleIndex, SamplesPerPixel);
+
+	// State about the markov chain selection that needs to be kept from one bounce to the next
+	float ScoresSum = 0;
+	float3 PreviousN = 0;
+	FMarkovChainState ChosenState = (FMarkovChainState)0;
+	// MCPG parameters
+#define N_MC  5 // From paper, seems to be the smallest value which produces good results, some subtle improvements from higher values at the cost of performance
+	const float AdaptiveGridProb = 0.7; // Mentioned in text - TODO: could rely on adaptive grid only with a tweak to level distribution?
+	const float StaticGridWidth = 25.6; // matches level 24 of adaptive grid
+	const float LevelScale = 3.0; 		// 3 levels per octave
+	const float MinWidth = 0.1; 		// 1mm - smallest possible voxel size
+	const float TanFactor = 0.0087;		// ~2*tan(0.25 degrees)
+	const int 	NMax = 1024;			// Blend factors [See Dittebrandt et al.]
+	const float AlphaMin = 1.0 / 100.0; // Allow blending over 100 frames, higher than original publication because the chains get reset during BSDF sampling
+	const float MaterialProb = 0.15f; 	// Chance of BSDF sampling (TODO: adapt this as a function of roughness)
+
+	LOOP
+	for (int Bounce = 0; Bounce <= MaxBounces; Bounce++)
+	{
+		float3 LocalRadiance = 0;
+		FPackedPathTracingPayload PackedPayload = TraceTransparentRay(Ray, ScatterType, Bounce, PathRoughness, SigmaT, PathThroughput, RandSequence, Result, LocalRadiance);
+
+		if (PackedPayload.IsMiss())
+		{
+			// We didn't hit anything, done
+			break;
+		}
+
+		const float3 TranslatedWorldPos = Ray.Origin + PackedPayload.HitT * Ray.Direction;
+		const float3 WorldNormal = PackedPayload.UnpackWorldNormal();
+		const uint PrimitiveLightingChannelMask = PackedPayload.GetPrimitiveLightingChannelMask();
+
+		const bool bCameraRay = Bounce == 0;
+		const bool bLastBounce = Bounce == MaxBounces;
+
+		FLightLoopCount LightLoopCount = LightGridLookup(TranslatedWorldPos);
+
+		// Compute direct lighting
+		FPathTracingPayload Payload = UnpackPathTracingPayload(PackedPayload, Ray);
+		AdjustPayloadAfterUnpack(Payload, true);
+		// TEMP: If the material has a valid SSS lobe, just merge it into diffuse for now
+		FSSSRandomWalkInfo SSS = GetMaterialSSSInfo(Payload, Ray.Direction);
+		if (any(SSS.Weight > 0))
+		{
+			Payload.DiffuseColor += SSS.Color;
+		}
+
+		// Generate main random number for direct+indirect sampling
+		float4 RandSample = RandSequence.Get4D();
+
+#if LIGHT_LOOP_METHOD == 0
+		float LightPickingCdf[RAY_TRACING_LIGHT_COUNT_MAXIMUM];
+		float LightPickingCdfSum = 0;
+
+		for (uint Index = 0, Num = LightLoopCount.NumLights; Index < Num; ++Index)
+		{
+			uint LightIndex = GetLightId(Index, LightLoopCount);
+			float LightEstimate = EstimateLight(LightIndex, TranslatedWorldPos, WorldNormal, PrimitiveLightingChannelMask, false);
+			LightPickingCdfSum += LightEstimate;
+			LightPickingCdf[Index] = LightPickingCdfSum;
+		}
+
+		if (LightPickingCdfSum > 0)
+		{
+			// init worked
+			int LightId;
+			float LightPickPdf = 0;
+			
+			FMaterialSample MaterialSample = SampleMaterial(-Ray.Direction, Payload, RandSample.xyz);
+
+			SelectLight(RandSample.x * LightPickingCdfSum, LightLoopCount.NumLights, LightPickingCdf, LightId, LightPickPdf);
+			LightPickPdf /= LightPickingCdfSum;
+			float2 LightRandSample = RandSample.yz;
+			LightId = GetLightId(LightId, LightLoopCount);
+#else // LIGHT_LOOP_METHOD != 0
+		float2 LightRandSample = RandSample.xy;
+
+#if LIGHT_LOOP_METHOD == 2
+		FRISContext TraceSample = InitRISContext(RandSample.z);
+		FRayDesc ShadowRaySample;
+		float3 ShadowRayContrib = 0;
+		float ShadowRayRoughness = 0;
+		uint ShadowRayLightId;
+#endif
+		FMaterialSample MaterialSample = SampleMaterial(-Ray.Direction, Payload, RandSample.xyz);
+		for (uint Index = 0, Num = LightLoopCount.NumLights; Index < Num; ++Index)
+		{
+			uint LightId = GetLightId(Index, LightLoopCount);
+			const float LightPickPdf = 1;
+#endif // LIGHT_LOOP_METHOD != 0
+
+			// Generate a sample on the light source
+			FLightSample LightSample = SampleLight(LightId, LightRandSample, TranslatedWorldPos, WorldNormal);
+			if (LightSample.Pdf > 0)
+			{
+				LightSample.RadianceOverPdf /= LightPickPdf;
+				LightSample.Pdf *= LightPickPdf;
+
+#if 1
+				// Evaluate real material
+				float2 LightDiffuseSpecularScale = float2(GetLightDiffuseScale(LightId), GetLightSpecularScale(LightId));
+				FMaterialEval MaterialEval = EvalMaterial(-Ray.Direction, LightSample.Direction, Payload, LightDiffuseSpecularScale);
+				float3 LightContrib = PathThroughput * LightSample.RadianceOverPdf * MaterialEval.Weight * MaterialEval.Pdf;
+				if (ScatterType == PATHTRACER_SCATTER_DIFFUSE || ScatterType == PATHTRACER_SCATTER_SPECULAR)
+				{
+					LightContrib *= GetLightIndirectScale(LightId, PathRoughness);
+				}
+
+#if USE_BSDF_SAMPLING
+				LightContrib *= MISWeightPower(LightSample.Pdf, MaterialEval.Pdf);
+#endif
+
+#else
+				// Hard-coded diffuse lobe for benchmarking
+#if SUBSTRATE_ENABLED
+				float3 MaterialEvalWeight = PackedPayload.UnpackDiffuseColor();
+#else
+				float3 MaterialEvalWeight = PackedPayload.UnpackBaseColor();
+#endif
+				float  MaterialEvalPdf = saturate(dot(WorldNormal, LightSample.Direction)) / PI;
+				float3 LightContrib = PathThroughput * LightSample.RadianceOverPdf * MaterialEvalWeight * MaterialEvalPdf;
+#endif
+				{
+					FRayDesc ShadowRay;
+					ShadowRay.Origin = TranslatedWorldPos;
+					ShadowRay.Direction = LightSample.Direction;
+					ShadowRay.TMin = 0;
+					ShadowRay.TMax = LightSample.Distance;
+
+					const float SignedPositionBias = Payload.IsMaterialTransmissive() ? sign(dot(Payload.WorldGeoNormal, LightSample.Direction)) : 1.0;
+					ApplyRayBias(ShadowRay.Origin, PackedPayload.HitT, SignedPositionBias * PackedPayload.UnpackWorldGeoNormal());
+
+#if LIGHT_LOOP_METHOD == 2
+					float SelectionWeight = LightContrib.x + LightContrib.y + LightContrib.z;
+					if (TraceSample.Accept(SelectionWeight))
+					{
+						ShadowRaySample = ShadowRay;
+						ShadowRayContrib = LightContrib / SelectionWeight;
+						ShadowRayRoughness = GetAverageRoughness(Payload);
+						ShadowRayLightId = LightId;
+					}
+#else
+					// Trace shadow ray immediately
+					const bool bCastShadows = CastsShadow(LightId);
+					const uint MissShaderIndex = GetLightMissShaderIndex(LightId);
+					LocalRadiance += LightContrib * TraceShadowRay(ShadowRay, GetAverageRoughness(Payload), PathRoughness, MissShaderIndex, bCastShadows);
+#endif
+				}
+			}
+
+#if USE_BSDF_SAMPLING
+			// Generate a sample by intersecting a BSDF ray with the light
+			{
+				FRayDesc ShadowRay;
+				ShadowRay.Origin = TranslatedWorldPos;
+				ShadowRay.Direction = MaterialSample.Direction;
+				ShadowRay.TMin = 0;
+				ShadowRay.TMax = RAY_DEFAULT_T_MAX;
+
+				ApplyRayBias(ShadowRay.Origin, PackedPayload.HitT, MaterialSample.PositionBiasSign * PackedPayload.UnpackWorldGeoNormal());
+
+				FLightHit LightResult = TraceLight(ShadowRay, LightId);
+				if (LightResult.IsHit())
+				{
+					ShadowRay.TMax = LightResult.HitT;
+					float3 LightContrib = PathThroughput * MaterialSample.Weight * LightResult.Radiance;
+					LightContrib *= MaterialSample.ScatterType == PATHTRACER_SCATTER_DIFFUSE ? GetLightDiffuseScale(LightId) : GetLightSpecularScale(LightId);
+					if (ScatterType == PATHTRACER_SCATTER_DIFFUSE || ScatterType == PATHTRACER_SCATTER_SPECULAR)
+					{
+						LightContrib *= GetLightIndirectScale(LightId, PathRoughness);
+					}
+					LightContrib *= MISWeightPower(MaterialSample.Pdf, LightResult.Pdf * LightPickPdf);
+#if LIGHT_LOOP_METHOD == 2
+					// Defer tracing shadow until later
+					float SelectionWeight = LightContrib.x + LightContrib.y + LightContrib.z;
+					if (TraceSample.Accept(SelectionWeight))
+					{
+						ShadowRaySample = ShadowRay;
+						ShadowRayContrib = LightContrib / SelectionWeight;
+						ShadowRayRoughness = MaterialSample.Roughness;
+						ShadowRayLightId = LightId;
+					}
+#else
+					const bool bCastShadows = CastsShadow(LightId);
+					const uint MissShaderIndex = GetLightMissShaderIndex(LightId);
+					LocalRadiance += LightContrib * TraceShadowRay(ShadowRay, MaterialSample.Roughness, PathRoughness, MissShaderIndex, bCastShadows);
+#endif
+				}
+			}
+#endif // USE_BSDF_SAMPLING
+		}
+#if LIGHT_LOOP_METHOD == 2
+		// Light loop gave us a valid candidate sample, trace it now
+		if (TraceSample.HasSample())
+		{
+			const bool bCastShadows = CastsShadow(ShadowRayLightId);
+			const uint MissShaderIndex = GetLightMissShaderIndex(ShadowRayLightId);
+			ShadowRayContrib *= TraceSample.GetNormalization();
+			LocalRadiance += ShadowRayContrib * TraceShadowRay(ShadowRaySample, ShadowRayRoughness, PathRoughness, MissShaderIndex, bCastShadows);
+		}
+#endif
+
+		Result.Radiance.rgb += LocalRadiance;
+
+		if (UsePathGuiding && Bounce > 0)
+		{
+			// Algorithm 3: State Transition and Maximum Likelihood Estimation
+			// Writes to grid for the parent path vertex
+			const float3 Contrib = LocalRadiance;
+			const float MCf = dot(Contrib, float3(0.25, 0.5, 0.25));
+			if (MCf > 0 && RandSequence.Get1D() * ScoresSum < MCf * N_MC)
+			{
+				const float3 AbsoluteWorldPosition = DFDemote(DFFastSubtract(Ray.Origin, ResolvedView.PreViewTranslation));
+				const float Distance = length(Ray.Origin);
+
+				// hit point is the "target" from the point of view of the previous hit
+				float3 TargetTranslatedWorldPos = TranslatedWorldPos;
+				float3 TargetAbsoluteWorldPosition = DFDemote(DFFastSubtract(TargetTranslatedWorldPos, ResolvedView.PreViewTranslation));
+				float3 CurrentStateDirection = StateGetDir(ChosenState, AbsoluteWorldPosition);
+				float Cosine = max(0.0, dot(normalize(TargetAbsoluteWorldPosition - AbsoluteWorldPosition), CurrentStateDirection));
+
+				ChosenState.N = min(ChosenState.N + 1, NMax);
+				const float Alpha = max(1.0 / ChosenState.N, AlphaMin);
+
+				float Weight = MCf;
+				ChosenState.WeightSum = lerp(ChosenState.WeightSum, Weight, Alpha);
+				ChosenState.WeightedTarget = lerp(ChosenState.WeightedTarget, Weight * TargetAbsoluteWorldPosition, Alpha);
+				ChosenState.WeightedCosine = lerp(ChosenState.WeightedCosine, Weight * Cosine, Alpha);
+
+				if (AdaptiveGridProb < 1)
+				{
+					// Save to Static Grid
+					float3 RandSample = RandSequence.Get3D();
+					int3 Coord = int3(floor(AbsoluteWorldPosition / StaticGridWidth + RandSample));
+					int Side = 0;
+					uint2 HashIndex = GridHash(int4(Coord, -6 + Side)).xy; // two-hashes for collision detection
+					ChosenState.Hash2 = HashIndex.y;
+					MarkovChainStateGrid[HashIndex.x & (MarkovChainStateGridSize - 1)] = ChosenState;
+				}
+				if (AdaptiveGridProb > 0)
+				{
+					// Save to adaptive grid
+					float4 RandSample = RandSequence.Get4D();
+					float TargetWidth = TanFactor * Distance;
+					float Level = round(LevelScale * log2(max(TargetWidth, MinWidth) / MinWidth)) + floor(-log2(1.0 - RandSample.w));
+					float CellWidth = MinWidth * exp2(Level / LevelScale);
+					int Side = GetDominantSide(PreviousN);
+					int LevelI = int(Level);
+					int3 Coord = int3(floor(AbsoluteWorldPosition / CellWidth + RandSample.xyz));
+					uint2 HashIndex = GridHash(int4(Coord, 6 * LevelI + Side)).xy; // two-hashes for collision detection
+					ChosenState.Hash2 = HashIndex.y;
+					MarkovChainStateGrid[HashIndex.x & (MarkovChainStateGridSize - 1)] = ChosenState;
+				}
+			}
+		}
+
+		// don't generate another ray on the last bounce or second to last bounce if emissive materials are disabled
+		if (bLastBounce || (Bounce + 1 == MaxBounces && EnableEmissive == 0))
+		{
+			break;
+		}
+
+		// sample new direction (potentially guided)
+
+		ScoresSum = 0; // reset
+		ChosenState = (FMarkovChainState)0;
+		float3 SampledDirection = 0;
+		float Scores[N_MC];
+		float4 VMFLobes[N_MC];
+		if (UsePathGuiding)
+		{
+			const float3 WorldSmoothNormal = PackedPayload.UnpackWorldSmoothNormal();
+			const float3 AbsoluteWorldPosition = DFDemote(DFFastSubtract(TranslatedWorldPos, ResolvedView.PreViewTranslation));
+			const float Distance = length(TranslatedWorldPos);
+
+			// Algorithm 1: Grid Resampling 
+			UNROLL
+			for (int Index = 0; Index < N_MC; Index++)
+			{
+				RandomSequence SplitRandSequence = RandSequence.Split(Index, N_MC);
+				float4 RandSample1 = SplitRandSequence.Get4D();
+				float4 RandSample2 = SplitRandSequence.Get4D();
+
+				bool bUseAdaptiveGrid = RandSample2.z < AdaptiveGridProb;
+
+				// static grid default
+				float CellWidth = StaticGridWidth;
+				int Side = 0;
+				int LevelI = -1;
+				if (bUseAdaptiveGrid)
+				{
+					// adaptive grid
+					float TargetWidth = TanFactor * Distance;
+					float Level = round(LevelScale * log2(max(TargetWidth, MinWidth) / MinWidth)) + floor(-log2(1.0 - RandSample1.w));
+					CellWidth = MinWidth * exp2(Level / LevelScale);
+					LevelI = int(Level);
+					Side = GetDominantSide(WorldSmoothNormal);
+				}
+				// stochastic rounding (pick one of the 8 possible neighbor grid cells randomly)
+				int3 Coord = int3(floor(AbsoluteWorldPosition / CellWidth + RandSample1.xyz));
+				
+				uint2 HashIndex = GridHash(int4(Coord, 6 * LevelI + Side)).xy; // two-hashes for collision detection
+
+				FMarkovChainState State = MarkovChainStateGrid[HashIndex.x & (MarkovChainStateGridSize - 1)];
+					
+				// collision detection
+				State.WeightSum *= float(State.Hash2 == HashIndex.y);
+				if (bUseAdaptiveGrid)
+				{
+					// adaptive grid
+				}
+				else
+				{
+					// static grid
+					float3 StateP = State.WeightSum > 0.0 ? State.WeightedTarget / State.WeightSum : State.WeightedTarget;
+					State.WeightSum *= float(dot(WorldSmoothNormal, normalize(StateP - AbsoluteWorldPosition)) > 0.0);
+				}
+
+				Scores[Index] = State.WeightSum;
+				ScoresSum += State.WeightSum;
+				VMFLobes[Index] = StateGetVMFLobe(State, AbsoluteWorldPosition);
+				if (ScoresSum * RandSample2.w < Scores[Index])
+				{
+					ChosenState = State;
+					SampledDirection = VMFSample(VMFLobes[Index], RandSample2.xy);
+				}
+			}
+		}
+
+		// Algorithm 2: Sampling and Ray Casting
+		// TODO: Adjust SurfaceProb based on roughness
+		float3 Throughput = 0;
+		if (ScoresSum == 0 || RandSample.w < MaterialProb)
+		{
+			// BSDF Sampling
+			Throughput = MaterialSample.Weight;
+			SampledDirection = MaterialSample.Direction;
+			ScatterType = ScatterType == PATHTRACER_SCATTER_CAMERA || ScatterType == PATHTRACER_SCATTER_REFRACT ? MaterialSample.ScatterType : ScatterType; // change if first bounce
+			PathRoughness = max(MaterialSample.Roughness, PathRoughness);
+			ChosenState = (FMarkovChainState)0;
+		}
+		if (ScoresSum > 0)
+		{
+			// MIS between guided lobes and BSDF sampling
+			float GuidedPdf = 0;
+			UNROLL
+			for (int Index = 0; Index < N_MC; Index++)
+			{
+				if (Scores[Index] > 0)
+				{
+					GuidedPdf += Scores[Index] * VMFPdf(SampledDirection, VMFLobes[Index]) / ScoresSum;
+				}
+			}
+			FMaterialEval MaterialEval = EvalMaterial(-Ray.Direction, SampledDirection, Payload, 1.0);
+			Throughput = MaterialEval.Weight * MISWeightBalanced(MaterialProb * MaterialEval.Pdf, GuidedPdf - GuidedPdf * MaterialProb) / MaterialProb;
+			MaterialSample.PositionBiasSign = sign(dot(SampledDirection, Payload.WorldGeoNormal));
+			ScatterType = PATHTRACER_SCATTER_DIFFUSE; // TODO: is there a good way to classify the scattering type for guided rays?
+			PathRoughness = 1.0;                      // TODO: return average roughness in EvalMaterial?
+		}
+
+		// update the current extinction if we are crossing a boundary on glass or water
+		if (MaterialSample.PositionBiasSign < 0 && Payload.IsMaterialSolidGlass())
+		{
+			const float3 LocalSigmaT = Payload.GetExtinction();
+			if (Payload.IsFrontFace())
+			{
+				// entering
+				SigmaT += LocalSigmaT;
+			}
+			else
+			{
+				// exiting
+				SigmaT -= LocalSigmaT;
+				SigmaT = max(SigmaT, 0);
+			}
+		}
+
+		float3 NextPathThroughput = PathThroughput * Throughput;
+		// Russian roulette:
+		//   The probability of keeping the path should be roughly proportional to the weight at the current shade point,
+		//  but just using MaterialWeight would miss out on cases where the path throughput changes color (like in a cornell
+		//  box when bouncing between walls of different colors). So use the ratio of the brightest color channel in the
+		//  previous and next throughput.
+		//   The second tweak is to add a sqrt() around the probability to soften the termination probability (paths will last
+		//  a little longer). This allows paths to go a bit deeper than the naive heuristic while still allowing them to terminate
+		//  early. This makes RR effective from the very first bounce without needing to delay it.
+		float ContinuationProb = sqrt(saturate(max3(NextPathThroughput.x, NextPathThroughput.y, NextPathThroughput.z) / max3(PathThroughput.x, PathThroughput.y, PathThroughput.z)));
+		if (ContinuationProb < 1)
+		{
+			// If there is some chance we should terminate the ray, draw an extra random value
+			float RussianRouletteRand = RandSample.w;
+			if (RussianRouletteRand >= ContinuationProb)
+			{
+				// stochastically terminate the path
+				break;
+			}
+			PathThroughput = NextPathThroughput / ContinuationProb;
+		}
+		else
+		{
+			PathThroughput = NextPathThroughput;
+		}
+
+
+
+		// Setup next ray
+		PathThroughput *= Throughput;
+		PreviousN = PackedPayload.UnpackWorldSmoothNormal();
+		Ray.Origin = TranslatedWorldPos;
+		Ray.Direction = SampledDirection;
+		Ray.TMin = 0;
+		Ray.TMax = RAY_DEFAULT_T_MAX;
+
+		ApplyRayBias(Ray.Origin, PackedPayload.HitT, MaterialSample.PositionBiasSign * PackedPayload.UnpackWorldGeoNormal());
+	}
+	Result.Radiance.rgb *= View.PreExposure;
+	return Result;
+}
+
+#else // PATH_TRACER_PRIMARY_RAYS
+
+FPathTracingResult PathTracingDebugCore(FRayDesc Ray, uint2 LaunchIndex)
+{
+	FPathTracingResult Result = (FPathTracingResult) 0;
+	const uint RayFlags = DebugMode == PATH_TRACER_DEBUG_VIZ_HITKIND ? 0 : RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+	const uint MissShaderIndex = 0;
+	uint InstanceInclusionMask = PATHTRACER_MASK_CAMERA;
+	int TransparentHitCount = 0;
+
+	const float RandSample = RandomSequenceCreate(uint3(LaunchIndex, View.StateFrameIndex), 0, 1).Get1D();
+
+
+	float3 PathThroughput = 1;
+	FPackedPathTracingPayload OpaquePackedPayload = InitPathTracingPayload(PATHTRACER_SCATTER_CAMERA, 0.0);
+	OpaquePackedPayload.SetDBufferA(float4(0, 0, 0, 1));
+	OpaquePackedPayload.SetDBufferB(float4(0, 0, 0, 1));
+	OpaquePackedPayload.SetDBufferC(float4(0, 0, 0, 1));
+	OpaquePackedPayload.SetStochasticSlabRand(RandSample);
+	OpaquePackedPayload.SetFlag(PATH_TRACING_PAYLOAD_INPUT_FLAG_IGNORE_TRANSLUCENT);
+
+	TraceRay(
+		TLAS,
+		RayFlags,
+		InstanceInclusionMask,
+		RAY_TRACING_SHADER_SLOT_MATERIAL,
+		RAY_TRACING_NUM_SHADER_SLOTS,
+		MissShaderIndex,
+		Ray.GetNativeDesc(),
+		OpaquePackedPayload);
+
+	if (OpaquePackedPayload.IsHit())
+	{
+		// TODO: If hit, also process decals, etc ...
+
+		// Now that we know where the opaque hit is, trace the remaining portion of the ray prior to this
+		Ray.TMax = asfloat(asuint(OpaquePackedPayload.HitT) - 1);
+	}
+
+	if (DebugMode == PATH_TRACER_DEBUG_VIZ_VOLUME_LIGHT_COUNT)
+	{
+		int NumLights = 0;
+		for (int LightId = SceneInfiniteLightCount; LightId < SceneLightCount; LightId++)
+		{
+			FVolumeLightSampleSetup LightSetup = PrepareLightVolumeSample(LightId, Ray.Origin, Ray.Direction, Ray.TMin, Ray.TMax);
+			if (LightSetup.IsValid())
+			{
+				float LightProb = LightSetup.LightImportance * GetVolumetricScatteringIntensity(LightId);
+				if (LightProb > 0)
+				{
+					NumLights++;
+					if (NumLights == RAY_TRACING_LIGHT_COUNT_MAXIMUM)
+					{
+						// reached max
+						break;
+					}
+				}
+			}
+		}
+
+		float NumLightsMax = min(SceneLightCount - SceneInfiniteLightCount, RAY_TRACING_LIGHT_COUNT_MAXIMUM);
+		Result.Radiance.rgb = NumLights > 0 ? BlueGreenRedColorMap(saturate(float(NumLights) / NumLightsMax)) : 0.18;
+		if (OpaquePackedPayload.IsHit())
+		{
+			// add some fake shading to help with definition
+			Result.Radiance.rgb *= abs(dot(OpaquePackedPayload.UnpackWorldNormal(), Ray.Direction));
+		}
+		return Result;
+	}
+
+
+	InstanceInclusionMask = PATHTRACER_MASK_CAMERA_TRANSLUCENT;
+
+	for (;;)
+	{
+#if PATH_TRACER_INCLUDE_TRANSLUCENT
+		FPackedPathTracingPayload PackedPayload = InitPathTracingPayload(PATHTRACER_SCATTER_CAMERA, 0.0);
+		PackedPayload.SetDBufferA(float4(0, 0, 0, 1));
+		PackedPayload.SetDBufferB(float4(0, 0, 0, 1));
+		PackedPayload.SetDBufferC(float4(0, 0, 0, 1));
+		PackedPayload.SetStochasticSlabRand(RandSample);
+		if (OpaquePackedPayload.IsHit())
+		{
+			const float3 ViewZ = View.ViewToTranslatedWorld[2].xyz;
+			const float3 TranslatedWorldPos = Ray.Origin + OpaquePackedPayload.HitT * Ray.Direction;
+			PackedPayload.SetFlag(PATH_TRACING_PAYLOAD_INPUT_FLAG_HAS_SCENE_DEPTH);
+			PackedPayload.SetSceneDepth(dot(TranslatedWorldPos, ViewZ));
+		}
+
+		// Trace the ray
+		TraceRay(
+			TLAS,
+			RayFlags,
+			InstanceInclusionMask,
+			RAY_TRACING_SHADER_SLOT_MATERIAL,
+			RAY_TRACING_NUM_SHADER_SLOTS,
+			MissShaderIndex,
+			Ray.GetNativeDesc(),
+			PackedPayload);
+
+		if (PackedPayload.IsMiss())
+		{
+			// If we miss the translucent geometry, the next hit is the opaque one
+			PackedPayload = OpaquePackedPayload;
+		}
+		else
+		{
+			TransparentHitCount++;
+		}
+#else // PATH_TRACER_INCLUDE_TRANSLUCENT
+		#define PackedPayload OpaquePackedPayload // just rename
+#endif // PATH_TRACER_INCLUDE_TRANSLUCENT
+		// If miss - exit
+		if (PackedPayload.IsMiss())
+		{
+			// still no hit -- the ray must have escaped to the background, we are done
+			// TODO: could add background Alpha here
+			break;
+		}
+
+		if (!PackedPayload.IsHoldout())
+		{
+			Result.Radiance.a += Luminance(PathThroughput * (1.0 - PackedPayload.UnpackTransparencyColor()));
+		}
+
+		{
+			FPathTracingPayload HitPayload = UnpackPathTracingPayload(PackedPayload, Ray);
+			AdjustPayloadAfterUnpack(HitPayload, true);
+
+			const float3 TranslatedWorldPos = Ray.Origin + PackedPayload.HitT * Ray.Direction;
+			const float3 WorldNormal = HitPayload.WorldNormal;
+
+			FLightLoopCount LightLoopCount = LightGridLookup(TranslatedWorldPos);
+
+			float FakeShading = abs(dot(WorldNormal, Ray.Direction)); // cheap shading, just to give some definition to otherwise "solid color" modes
+			float3 Color = 0;
+			float ExtraAlpha = 0;
+			switch (DebugMode)
+			{
+				case PATH_TRACER_DEBUG_VIZ_RADIANCE: 					Color = HitPayload.Radiance * View.PreExposure; break;
+				case PATH_TRACER_DEBUG_VIZ_WORLD_NORMAL: 				Color = WorldNormal * 0.5 + 0.5; break;
+				case PATH_TRACER_DEBUG_VIZ_WORLD_SMOOTH_NORMAL:			Color = HitPayload.WorldSmoothNormal * 0.5 + 0.5; break;
+				case PATH_TRACER_DEBUG_VIZ_WORLD_GEO_NORMAL:			Color = HitPayload.WorldGeoNormal * 0.5 + 0.5; break;
+#if SUBSTRATE_ENABLED
+				// TODO: implement more visualizations for this case
+				case PATH_TRACER_DEBUG_VIZ_BASE_COLOR:					Color = lerp(HitPayload.DiffuseColor, HitPayload.SpecularColor, F0RGBToMetallic(HitPayload.SpecularColor)); break;
+				case PATH_TRACER_DEBUG_VIZ_DIFFUSE_COLOR:				Color = HitPayload.DiffuseColor; break;
+				case PATH_TRACER_DEBUG_VIZ_SPECULAR_COLOR:				Color = HitPayload.SpecularColor; break;
+				case PATH_TRACER_DEBUG_VIZ_METALLIC:					Color = F0RGBToMetallic(HitPayload.SpecularColor); break;
+				case PATH_TRACER_DEBUG_VIZ_SPECULAR:					Color = F0RGBToDielectricSpecular(HitPayload.SpecularColor); break;
+				case PATH_TRACER_DEBUG_VIZ_ROUGHNESS:					Color = HitPayload.RoughnessData; break;
+				case PATH_TRACER_DEBUG_VIZ_ANISOTROPY:					Color = AnisoDebugColor(HitPayload.Anisotropy); break;
+#else
+				case PATH_TRACER_DEBUG_VIZ_BASE_COLOR:					Color = HitPayload.BaseColor; break;
+				case PATH_TRACER_DEBUG_VIZ_DIFFUSE_COLOR:				Color = HitPayload.BaseColor * (1 - HitPayload.Metallic); break;
+				case PATH_TRACER_DEBUG_VIZ_SPECULAR_COLOR:				Color = lerp(0.08 * HitPayload.Specular, HitPayload.BaseColor, HitPayload.Metallic); break;
+				case PATH_TRACER_DEBUG_VIZ_METALLIC:					Color = HitPayload.Metallic; break;
+				case PATH_TRACER_DEBUG_VIZ_SPECULAR:					Color = HitPayload.Specular; break;
+				case PATH_TRACER_DEBUG_VIZ_ROUGHNESS:					Color = HitPayload.Roughness; break;
+				case PATH_TRACER_DEBUG_VIZ_ANISOTROPY:					Color = AnisoDebugColor(HitPayload.Anisotropy); break;
+				case PATH_TRACER_DEBUG_VIZ_CUSTOM_DATA0:				Color = HitPayload.CustomData0.rgb * View.PreExposure; ExtraAlpha = HitPayload.CustomData0.a; break;
+				case PATH_TRACER_DEBUG_VIZ_CUSTOM_DATA1:				Color = HitPayload.CustomData1.rgb * View.PreExposure; ExtraAlpha = HitPayload.CustomData1.a; break;
+#endif
+				case PATH_TRACER_DEBUG_VIZ_TRANSPARENCY_COLOR:			Color = HitPayload.TransparencyColor; break;
+				case PATH_TRACER_DEBUG_VIZ_IOR:							Color = HitPayload.Ior; break;
+				case PATH_TRACER_DEBUG_VIZ_SHADING_MODEL:				Color = GetShadingModelColor(HitPayload.ShadingModelID); break;
+				case PATH_TRACER_DEBUG_VIZ_LIGHTING_CHANNEL_MASK:		Color = GetLightingChannelMaskDebugColor(HitPayload.PrimitiveLightingChannelMask); break;
+				case PATH_TRACER_DEBUG_VIZ_WORLD_POSITION:
+				{
+					float3 AbsoluteWorldPosition = DFDemote(DFFastSubtract(TranslatedWorldPos, ResolvedView.PreViewTranslation));
+					const float CellWidth = 10.0f; // 10cm
+					int3 Coord = int3(round(AbsoluteWorldPosition / CellWidth));
+					uint HashIndex = GridHash(int4(Coord, 0)).x;
+					Color = HUEtoRGB((HashIndex & 0xFFFFFF) * 5.96046447754e-08);
+					Color *= FakeShading;
+					break;
+				}
+				case PATH_TRACER_DEBUG_VIZ_WORLD_TANGENT: 				Color = PackedPayload.UnpackWorldTangent() * 0.5 + 0.5; break;
+				case PATH_TRACER_DEBUG_VIZ_LIGHT_GRID_COUNT:
+				case PATH_TRACER_DEBUG_VIZ_LIGHT_GRID_AXIS:
+				{
+
+					Color = LightGridVisualize(LightLoopCount, DebugMode == PATH_TRACER_DEBUG_VIZ_LIGHT_GRID_AXIS ? 4 : 1);
+					Color *= FakeShading;
+					break;
+				}
+				case PATH_TRACER_DEBUG_VIZ_DECAL_GRID_COUNT:
+				case PATH_TRACER_DEBUG_VIZ_DECAL_GRID_AXIS:
+				{
+					FDecalLoopCount DecalLoopCount = DecalGridLookup(TranslatedWorldPos);
+					Color = PackedPayload.IsDecalReceiver() ? DecalGridVisualize(DecalLoopCount, DebugMode == PATH_TRACER_DEBUG_VIZ_DECAL_GRID_AXIS ? 3 : 1) : 0.18;
+					Color *= FakeShading;
+					break;
+				}
+				case PATH_TRACER_DEBUG_VIZ_HITKIND:
+				{
+					Color = (PackedPayload.IsFrontFace() ? float3(0, 1, 0) : float3(1, 0, 0)) * FakeShading;
+					break;
+				}
+				case PATH_TRACER_DEBUG_VIZ_SSS_COLOR:
+				case PATH_TRACER_DEBUG_VIZ_SSS_RADIUS:
+				case PATH_TRACER_DEBUG_VIZ_SSS_WEIGHT:
+				case PATH_TRACER_DEBUG_VIZ_SSS_PHASE:
+				{
+					FSSSRandomWalkInfo SSS = GetMaterialSSSInfo(HitPayload, Ray.Direction);
+					if (any(SSS.Weight > 0))
+					{
+						if (DebugMode == PATH_TRACER_DEBUG_VIZ_SSS_COLOR)
+						{
+							Color = SSS.Color;
+						}
+						else if (DebugMode == PATH_TRACER_DEBUG_VIZ_SSS_RADIUS)
+						{
+							Color = SSS.Radius;
+						}
+						else if (DebugMode == PATH_TRACER_DEBUG_VIZ_SSS_WEIGHT)
+						{
+							Color = SSS.Weight;
+						}
+						else if (DebugMode == PATH_TRACER_DEBUG_VIZ_SSS_PHASE)
+						{
+							Color = BlueGreenRedColorMap(0.5 * SSS.G + 0.5);
+						}
+					}
+					break;
+				}
+				case PATH_TRACER_DEBUG_VIZ_BSDF_OPACITY:    Color = HitPayload.BSDFOpacity; break;
+#if SUBSTRATE_ENABLED
+				case PATH_TRACER_DEBUG_VIZ_FUZZ_COLOR:     	Color = (HitPayload.ShadingModelID == SHADINGMODELID_SUBSTRATE) ? HitPayload.FuzzColor     : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_FUZZ_ROUGHNESS:	Color = (HitPayload.ShadingModelID == SHADINGMODELID_SUBSTRATE) ? HitPayload.FuzzRoughness : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_FUZZ_AMOUNT:		Color = (HitPayload.ShadingModelID == SHADINGMODELID_SUBSTRATE) ? HitPayload.FuzzAmount    : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_SUBSTRATE_WEIGHT_V: 			Color = HitPayload.WeightV; 			break;
+				case PATH_TRACER_DEBUG_VIZ_SUBSTRATE_TRANSMITTANCE_N: 	Color = HitPayload.TransmittanceN; 		break;
+				case PATH_TRACER_DEBUG_VIZ_SUBSTRATE_COVERAGE_ABOVE_N: 	Color = HitPayload.CoverageAboveAlongN; break;
+				case PATH_TRACER_DEBUG_VIZ_SUBSTRATE_F90:				Color = HitPayload.SpecularEdgeColor;   break;
+
+#else
+				case PATH_TRACER_DEBUG_VIZ_FUZZ_COLOR:     	Color = (HitPayload.ShadingModelID == SHADINGMODELID_CLOTH) ? HitPayload.GetClothColor()  : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_FUZZ_ROUGHNESS: 	Color = (HitPayload.ShadingModelID == SHADINGMODELID_CLOTH) ? HitPayload.Roughness        : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_FUZZ_AMOUNT:    	Color = (HitPayload.ShadingModelID == SHADINGMODELID_CLOTH) ? HitPayload.GetClothAmount() : 0.0; break;
+#endif
+				case PATH_TRACER_DEBUG_VIZ_EYE_IRIS_MASK:      Color = (HitPayload.ShadingModelID == SHADINGMODELID_EYE) ?             HitPayload.GetEyeIrisMask()      : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_EYE_IRIS_NORMAL:    Color = (HitPayload.ShadingModelID == SHADINGMODELID_EYE) ? 0.5 + 0.5 * HitPayload.GetEyeIrisNormal()    : 0.0; break;
+				case PATH_TRACER_DEBUG_VIZ_EYE_CAUSTIC_NORMAL: Color = (HitPayload.ShadingModelID == SHADINGMODELID_EYE) ? 0.5 + 0.5 * HitPayload.GetEyeCausticNormal() : 0.0; break;
+				default:
+				{
+					break;
+				}
+			}
+
+			Result.Radiance.rgb += PathThroughput * Color;
+			Result.Radiance.a += Luminance(PathThroughput) * ExtraAlpha;
+		}
+
+		if (PackedPayload.ShouldOutputDepth() && Result.Z == 0.0)
+		{
+			const float3 ViewZ = View.ViewToTranslatedWorld[2].xyz;
+			const float3 TranslatedWorldPos = Ray.Origin + PackedPayload.HitT * Ray.Direction;
+			Result.LinearDepth = dot(TranslatedWorldPos, ViewZ);
+			Result.Z = ConvertToDeviceZ(Result.LinearDepth);
+			Result.WorldNormal = PackedPayload.UnpackWorldNormal();
+		}
+
+		// account for local transparency change
+		PathThroughput *= PackedPayload.UnpackTransparencyColor();
+
+		// prepare next step around the loop (if any throughput is left)
+		// retrace the exact same ray with TMin one ulp past the hit we just found
+		Ray.TMin = ComputeNewTMin(Ray.Origin, Ray.Direction, PackedPayload.HitT);
+		if (!(Ray.TMin < Ray.TMax) || all(PathThroughput == 0))
+		{
+			break;
+		}
+	}
+
+	if (DebugMode == PATH_TRACER_DEBUG_VIZ_TRANSPARENCY_COUNT)
+	{
+		Result.Radiance.rgb = TransparentHitCount > 0 ? BlueGreenRedColorMap(saturate((TransparentHitCount - 1) / 16.0)) : 0.5;
+		if (OpaquePackedPayload.IsHit())
+		{
+			// add some fake shading to help with definition
+			Result.Radiance.rgb *= abs(dot(OpaquePackedPayload.UnpackWorldNormal(), Ray.Direction));
+		}
+	}
+
+	return Result;
+}
+
+#endif // !PATH_TRACER_PRIMARY_RAYS
+
+RAY_TRACING_ENTRY_RAYGEN(PathTracingDebugRG)
+{
+	uint2 DispatchIdx = DispatchRaysIndex().xy;
+	const uint2 DispatchDim = DispatchRaysDimensions().xy;
+
+	ResolvedView = ResolveView();
+
+	uint2 LaunchIndex = DispatchIdx + View.ViewRectMin.xy;
+
+
+	const float2 AAJitter = 0.5; // trace through pixel center
+	const float2 ViewportUV = (LaunchIndex + AAJitter) * View.BufferSizeAndInvSize.zw;
+	const FRayDesc CameraRay = CreatePrimaryRay(ViewportUV);
+
+#if PATH_TRACER_PRIMARY_RAYS
+	FPathTracingResult Result = PathTracingDebugCore(CameraRay, LaunchIndex, SampleIndex);
+	if (SampleIndex > 0)
+	{
+		// Blend with previous value
+		Result.Radiance = lerp(RWSceneColor[DispatchIdx], Result.Radiance, SampleBlendFactor);
+		Result.Z = max(RWSceneDepth[DispatchIdx], Result.Z); // Device Z is inverted so larger numbers are closer
+	
+		// G-Buffer like data for denoisers
+		// NOTE: averaging here is not strictly necessary, but will be useful for stochastic situations
+		Result.LinearDepth   = lerp(RWSceneLinearDepth[DispatchIdx]			, Result.LinearDepth	, SampleBlendFactor); // TODO: would it be better to use min? only makes a difference in stochastic cases
+		Result.DiffuseColor  = lerp(RWSceneDiffuseColor[DispatchIdx].xyz	, Result.DiffuseColor	, SampleBlendFactor);
+		Result.SpecularColor = lerp(RWSceneSpecularColor[DispatchIdx].xyz	, Result.SpecularColor	, SampleBlendFactor);
+		Result.WorldNormal   = lerp(RWSceneNormal[DispatchIdx].xyz			, Result.WorldNormal	, SampleBlendFactor); // TODO: should we normalize? only makes a difference in stochastic cases
+		Result.Roughness     = lerp(RWSceneRoughness[DispatchIdx]			, Result.Roughness		, SampleBlendFactor);
+	}
+#else
+	FPathTracingResult Result = PathTracingDebugCore(CameraRay, LaunchIndex);
+#endif
+
+	// Write to output textures
+	RWSceneColor[DispatchIdx] = Result.Radiance;	
+	RWSceneDepth[DispatchIdx] = Result.Z;
+	RWSceneDiffuseColor[DispatchIdx] = float4(Result.DiffuseColor.xyz, 1.0f);
+	RWSceneSpecularColor[DispatchIdx] = float4(Result.SpecularColor.xyz, 1.0f);
+	RWSceneNormal[DispatchIdx] = float4(Result.WorldNormal, Result.Roughness); // TODO: which copy of roughness is actually used?
+	RWSceneRoughness[DispatchIdx] = Result.Roughness;
+	RWSceneLinearDepth[DispatchIdx] = Result.LinearDepth;
+}

@@ -1,0 +1,84 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+#define DYNAMIC_WIND_INVALID_BONE_INDEX 65535
+
+#define DYNAMIC_WIND_DIRECTIONALITY_SLICES 8
+
+#ifdef __cplusplus
+namespace UE::HLSL
+{
+#endif //__cplusplus
+
+struct FDynamicWindSkeletonData
+{
+	/** The index of the first element of the FDynamicWindBoneData for this skeleton */
+	uint BoneDataOffset;
+
+	/** The height (in units) of the skeleton */
+	float SkeletonHeight;
+
+	/** How much to attenuate trunk bones in the skeleton (0-1) */
+	float GustAttenuation;
+
+	/** The maximum SimulationGroupIndex value for all bones in the skeleton */
+	uint MaxSimulationGroupIndex : 31;
+
+	/** Whether or not this object is ground cover */
+	uint bIsGroundCover : 1;
+};
+
+struct FDynamicWindBoneData
+{
+	/** The index of this bone's parent bone, in the skeleton */
+	uint ParentBoneIndex;
+
+	/** The wind influence of this bone */
+	float Influence;
+
+	/** The simulation group for this bone */
+	int SimulationGroupIndex;
+
+	/** The length of bone chain that this bone is a member of */
+	float BoneChainLength;
+
+	/** Initial local-space orientation of the bone */
+	float4 BindPoseRotation;
+
+	/** Initial local-space position of the bone */
+	float3 BindPosePosition;
+
+	/** Whether this bone is to be considered part of a tree trunk */
+	uint bIsTrunkBone;
+};
+
+struct FDynamicWindBlockHeader
+{	
+	/** Index of the related FDynamicWindSkeletonData for the block */
+	uint SkeletonDataIndex;
+
+	/** Byte offset of the transforms to be written in the transform buffer */
+	uint BlockDstTransformOffset;
+
+	/** Number of bones in this block */
+	uint BlockNumBones : 8;
+
+	/** Index of the first bone (in the skeleton) of the block */
+	uint BlockBoneOffset : 24;
+
+	/** Index of the unique directional anim this block is associated with */
+	uint BlockDirectionalityIndex : 8;
+
+	/** Total number of transforms to be written for this skeleton anim. */
+	uint TotalTransformCount : 24;
+};
+
+#ifdef __cplusplus
+} // namespace UE::HLSL
+
+using FDynamicWindSkeletonData = UE::HLSL::FDynamicWindSkeletonData;
+using FDynamicWindBoneData = UE::HLSL::FDynamicWindBoneData;
+using FDynamicWindBlockHeader = UE::HLSL::FDynamicWindBlockHeader;
+
+#endif //__cplusplus

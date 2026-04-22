@@ -1,0 +1,27 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#include "MoverCVDDataWrappers.h"
+
+#include UE_INLINE_GENERATED_CPP_BY_NAME(MoverCVDDataWrappers)
+
+FStringView FMoverCVDSimDataWrapper::WrapperTypeName = TEXT("FMoverCVDSimDataWrapper");
+
+bool FMoverCVDSimDataWrapper::Serialize(FArchive& Ar)
+{
+	Ar << bHasValidData;
+
+	if (!bHasValidData)
+	{
+		return !Ar.IsError();
+	}
+
+	Ar << SolverID;
+	Ar << ParticleID;
+	Ar << SyncStateBytes;
+	Ar << SyncStateDataCollectionBytes;
+	Ar << InputCmdBytes;
+	Ar << InputMoverDataCollectionBytes;
+	Ar << LocalSimDataBytes;
+
+	return !Ar.IsError();
+}

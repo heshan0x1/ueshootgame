@@ -1,0 +1,916 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#define USE_HAIR_COMPLEX_TRANSMITTANCE 1
+#define SUBSTRATE_MATERIALCONTAINER_IS_VIEWRESOURCE 1
+// For now only Substrate Format=0 uses this path, which does not support Special complex classification
+#define SUBSTRATE_COMPLEXSPECIALPATH 0
+
+#include "../Common.ush"
+#include "../LightGridCommon.ush"
+#include "../Lumen/LumenMaterial.ush"
+#include "../Lumen/LumenReflectionCommon.ush"
+#include "../Lumen/LumenScreenProbeTileClassication.ush"
+#include "../MegaLights/MegaLightsTileClassification.ush"
+#include "StochasticLightingUpsample.ush"
+#include "StochasticLightingCommon.ush"
+
+MAX_OCCUPANCY
+
+#define DOWNSAMPLE_FACTOR	2
+#define TILE_SIZE			8
+#define TILE_SIZE_DIV_SHIFT	3
+
+#define STOCHASTIC_SAMPLE_OFFSET_2x1 1
+#define STOCHASTIC_SAMPLE_OFFSET_2x2 2
+
+Texture2D DepthHistoryTexture;
+Texture2D<float4> NormalAndShadingInfoHistory;
+Texture2D<half> MegaLightsNumFramesAccumulatedHistory;
+
+RWTexture2D<float> RWDepthTexture;
+RWTexture2D<float4> RWNormalTexture;
+RWTexture2DArray<uint> RWLumenTileBitmask;
+RWTexture2D<uint> RWMegaLightsTileBitmask;
+RWTexture2D<uint> RWEncodedHistoryScreenCoord;
+RWTexture2DArray<uint> RWLumenPackedPixelData;
+RWTexture2D<uint> RWMegaLightsPackedPixelData;
+
+uint EnableTexturedRectLights;
+float4 HistoryScreenPositionScaleBias;
+float4 HistoryUVMinMax;
+float4 HistoryGatherUVMinMax;
+float4 HistoryBufferSizeAndInvSize;
+float4 HistorySubPixelGridSizeAndInvSize;
+float LumenHistoryDistanceThreshold;
+float LumenHistoryDistanceThresholdForFoliage;
+float LumenHistoryNormalCosThreshold;
+uint2 HistoryScreenCoordDecodeShift;
+uint2 DownsampledViewMin2x1;
+uint2 DownsampledViewMin2x2;
+uint2 DownsampledViewSize2x1;
+uint2 DownsampledViewSize2x2;
+uint LumenStochasticSampleMode;
+uint MegaLightsStochasticSampleMode;
+
+#if TILE_CLASSIFY_LUMEN || TILE_CLASSIFY_MEGALIGHTS || TILE_CLASSIFY_SUBSTRATE
+#if PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS
+	groupshared uint SharedTileBitmask;
+#else
+	groupshared uint SharedTileBitmask[THREADGROUP_SIZE * THREADGROUP_SIZE];
+#endif
+
+	#define TILE_BITMASK_INDEX_LUMEN 0
+	#define TILE_BITMASK_INDEX_MEGALIGHTS 1
+	#define TILE_BITMASK_INDEX_SUBSTRATE 2
+	#define TILE_BITMASK_BIT_COUNT 10
+	#define TILE_BITMASK_BIT_MASK  0x3FF
+	#if PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS
+	#define WriteSharedTileBitmask(LinearThreadIndex, InBitmask, InBitmaskIndex) 				{ GroupTileBitmask |= (TILE_BITMASK_BIT_MASK & InBitmask) << (InBitmaskIndex*TILE_BITMASK_BIT_COUNT); }
+	#define ReadSharedTileBitmask(LinearThreadIndex, InBitmaskIndex) 			 				BitFieldExtractU32(GroupTileBitmask, TILE_BITMASK_BIT_COUNT, InBitmaskIndex * TILE_BITMASK_BIT_COUNT)
+	#else
+	void WriteSharedTileBitmask(uint LinearThreadIndex, uint InBitmask, uint InBitmaskIndex) 	{ SharedTileBitmask[LinearThreadIndex] |= (TILE_BITMASK_BIT_MASK & InBitmask) << (InBitmaskIndex*TILE_BITMASK_BIT_COUNT); }
+	uint ReadSharedTileBitmask(uint LinearThreadIndex, uint InBitmaskIndex) 					{ return BitFieldExtractU32(SharedTileBitmask[LinearThreadIndex], TILE_BITMASK_BIT_COUNT, InBitmaskIndex*TILE_BITMASK_BIT_COUNT); }
+	#endif
+#endif
+
+RWTexture2D<float> RWDownsampledSceneDepth2x1;
+RWTexture2D<float> RWDownsampledSceneDepth2x2;
+RWTexture2D<UNORM float3> RWDownsampledWorldNormal2x1;
+RWTexture2D<UNORM float3> RWDownsampledWorldNormal2x2;
+
+groupshared float SharedSceneDepth2x1[6][10];
+groupshared uint SharedEncodedNormal2x1[6][10];
+groupshared float SharedSceneDepth2x2[6][6];
+groupshared uint SharedEncodedNormal2x2[6][6];
+
+void StoreDepthToCache(uint2 SharedCoord, const uint2 DownsampleFactor, float Depth)
+{
+	if (all(DownsampleFactor == 2))
+	{
+		SharedSceneDepth2x2[SharedCoord.x][SharedCoord.y] = Depth;
+	}
+	else
+	{
+		SharedSceneDepth2x1[SharedCoord.x][SharedCoord.y] = Depth;
+	}
+}
+
+float LoadDepthFromCache(uint2 SharedCoord, const uint2 DownsampleFactor)
+{
+	if (all(DownsampleFactor == 2))
+	{
+		return SharedSceneDepth2x2[SharedCoord.x][SharedCoord.y];
+	}
+	else
+	{
+		return SharedSceneDepth2x1[SharedCoord.x][SharedCoord.y];
+	}
+}
+
+void StoreNormalToCache(uint2 SharedCoord, const uint2 DownsampleFactor, float3 Normal)
+{
+	Normal = saturate(EncodeNormal(Normal));
+
+	uint Packed = 0;
+	Packed |= uint(Normal.x * 1023.0 + 0.5);
+	Packed |= uint(Normal.y * 1023.0 + 0.5) << 10;
+	Packed |= uint(Normal.z * 1023.0 + 0.5) << 20;
+
+	if (all(DownsampleFactor == 2))
+	{
+		SharedEncodedNormal2x2[SharedCoord.x][SharedCoord.y] = Packed;
+	}
+	else
+	{
+		SharedEncodedNormal2x1[SharedCoord.x][SharedCoord.y] = Packed;
+	}
+}
+
+float3 LoadNormalFromCache(uint2 SharedCoord, const uint2 DownsampleFactor)
+{
+	uint Packed;
+	if (all(DownsampleFactor == 2))
+	{
+		Packed = SharedEncodedNormal2x2[SharedCoord.x][SharedCoord.y];
+	}
+	else
+	{
+		Packed = SharedEncodedNormal2x1[SharedCoord.x][SharedCoord.y];
+	}
+
+	float3 Normal;
+	Normal.x = BitFieldExtractU32(Packed, 10, 0) / 1023.0;
+	Normal.y = BitFieldExtractU32(Packed, 10, 10) / 1023.0;
+	Normal.z = BitFieldExtractU32(Packed, 10, 20) / 1023.0;
+
+	return DecodeNormal(Normal);
+}
+
+float GetNormalWeight(float3 SceneWorldNormal, float3 SampleWorldNormal)
+{
+	float AngleBetweenNormals = acosFast(saturate(dot(SampleWorldNormal, SceneWorldNormal)));
+	float NormalWeight = 1.0f - saturate(AngleBetweenNormals);
+
+	return Pow2(NormalWeight);
+}
+
+uint2 ThreadIndexToBorderCoord(uint LinearThreadIndex, const uint2 DownsampleFactor)
+{
+	const uint TileBorder = 1;
+	const uint2 TileSize = TILE_SIZE / DownsampleFactor + TileBorder * 2;
+	const uint NumPartialRows = TileSize.y - TileBorder * 2;
+	const uint PixelsPerPartialRow = TileBorder * 2;
+	
+	uint2 BorderCoord;
+	if (LinearThreadIndex < TileSize.x * TileBorder)
+	{
+		BorderCoord = uint2(LinearThreadIndex % TileSize.x, LinearThreadIndex / TileSize.x);
+	}
+	else if (LinearThreadIndex - TileSize.x * TileBorder < NumPartialRows * PixelsPerPartialRow)
+	{
+		uint LocalIndex = LinearThreadIndex - TileSize.x * TileBorder;
+		BorderCoord = uint2(LocalIndex % PixelsPerPartialRow, LocalIndex / PixelsPerPartialRow);
+		BorderCoord.x += BorderCoord.x < TileBorder ? 0 : (TileSize.x - TileBorder * 2);
+		BorderCoord.y += TileBorder;
+	}
+	else
+	{
+		uint LocalIndex = LinearThreadIndex - TileSize.x * TileBorder - NumPartialRows * PixelsPerPartialRow;
+		BorderCoord = uint2(LocalIndex % TileSize.x, TileSize.y - TileBorder + LocalIndex / TileSize.x);
+	}
+
+	return BorderCoord;
+}
+
+uint2 GetDownsampleJitter(uint2 DownsampledCoord, const uint2 DownsampleFactor)
+{
+	uint2 Jitter = 0;
+
+	if (all(DownsampleFactor == 2))
+	{
+		Jitter = GetDownsampleJitter2x2(DownsampledCoord);
+	}
+	else if (all(DownsampleFactor == uint2(2, 1)))
+	{
+		Jitter = GetDownsampleJitter2x1(DownsampledCoord);
+	}
+	
+	return Jitter;
+}
+
+void DownsampleDepthAndNormal(
+	uint2 GroupId,
+	uint2 GroupThreadId,
+	uint2 ScreenCoord,
+	FLumenMaterialData Material,
+	const uint2 DownsampleFactor,
+	RWTexture2D<float> RWDownsampledDepth,
+	RWTexture2D<UNORM float3> RWDownsampledNormal)
+{
+	const uint TileBorder = 1;
+	const uint2 TileSize = TILE_SIZE / DownsampleFactor + TileBorder * 2;
+
+	uint2 DownsampledScreenCoord = ScreenCoord / DownsampleFactor;
+	uint2 Jitter = GetDownsampleJitter(DownsampledScreenCoord, DownsampleFactor);
+
+	if (all(Jitter == ScreenCoord % DownsampleFactor))
+	{
+		RWDownsampledDepth[DownsampledScreenCoord] = Material.IsValid() ? Material.SceneDepth : -1.0f;
+		RWDownsampledNormal[DownsampledScreenCoord] = EncodeNormal(Material.WorldNormalForPositionBias);
+
+		uint2 SharedCoord = GroupThreadId / DownsampleFactor + TileBorder;
+		StoreDepthToCache(SharedCoord, DownsampleFactor, Material.IsValid() ? Material.SceneDepth : -1.0f);
+		StoreNormalToCache(SharedCoord, DownsampleFactor, Material.WorldNormalForPositionBias);
+	}
+
+	const uint NumBorderPixels = (TileSize.x + TileSize.y - TileBorder * 2) * TileBorder * 2;
+	uint LinearThreadIndex = GroupThreadId.x + THREADGROUP_SIZE * GroupThreadId.y;
+
+	if (LinearThreadIndex < NumBorderPixels)
+	{
+		uint2 BorderSharedCoord = ThreadIndexToBorderCoord(LinearThreadIndex, DownsampleFactor);
+		uint2 BorderDownsampledCoord = (View.ViewRectMinAndSize.xy + GroupId * TILE_SIZE) / DownsampleFactor - TileBorder + BorderSharedCoord;
+		uint2 BorderScreenCoord = BorderDownsampledCoord * DownsampleFactor + GetDownsampleJitter(BorderDownsampledCoord, DownsampleFactor);
+
+		bool bCanLoadFromCache = false;
+	#if STOCHASTIC_SAMPLE_OFFSET == (STOCHASTIC_SAMPLE_OFFSET_2x1 | STOCHASTIC_SAMPLE_OFFSET_2x2)
+		if (all(DownsampleFactor == uint2(2, 1)))
+		{
+			uint2 DownsampledCoord2x2 = BorderDownsampledCoord / uint2(1, 2);
+			uint2 ScreenCoord2x2 = DownsampledCoord2x2 * 2 + GetDownsampleJitter2x2(DownsampledCoord2x2);
+			bCanLoadFromCache = all(BorderScreenCoord == ScreenCoord2x2);
+		}
+	#endif
+
+		float BorderDepth = -1.0f;
+		float3 BorderNormal = 0.0f;
+		if (bCanLoadFromCache)
+		{
+			uint2 SharedCoord2x2 = BorderSharedCoord / uint2(1, 2);
+			BorderDepth = LoadDepthFromCache(SharedCoord2x2, uint2(2, 2));
+			BorderNormal = LoadNormalFromCache(SharedCoord2x2, uint2(2, 2));
+		}
+		else if (all(BorderScreenCoord - View.ViewRectMinAndSize.xy < View.ViewRectMinAndSize.zw))
+		{
+			FLumenMaterialCoord BorderCoord = (FLumenMaterialCoord)0;
+			BorderCoord.SvPosition = BorderScreenCoord;
+			FLumenMaterialData BorderMaterial = ReadMaterialData(BorderCoord, MaxRoughnessToTrace);
+
+			BorderDepth = BorderMaterial.IsValid() ? BorderMaterial.SceneDepth : -1.0f;
+			BorderNormal = BorderMaterial.WorldNormalForPositionBias;
+		}
+
+		StoreDepthToCache(BorderSharedCoord, DownsampleFactor, BorderDepth);
+		StoreNormalToCache(BorderSharedCoord, DownsampleFactor, BorderNormal);
+	}
+}
+
+bool IsValidDownsampledCoord(uint2 DownsampledScreenCoord, const uint2 DownsampleFactor)
+{
+	if (all(DownsampleFactor == 2))
+	{
+		return all(DownsampledScreenCoord.xy < DownsampledViewMin2x2 + DownsampledViewSize2x2);
+	}
+	else
+	{
+		return all(DownsampledScreenCoord.xy < DownsampledViewMin2x1 + DownsampledViewSize2x1);
+	}
+}
+
+float4 ComputeUpsampleWeights(uint2 GroupThreadId, uint2 ScreenCoord, float2 ScreenUV, float2 ScreenPosition, float3 TranslatedWorldPosition, FLumenMaterialData Material, const uint2 DownsampleFactor)
+{
+	const uint TileBorder = 1;
+	const bool bDownsample2x1 = all(DownsampleFactor == uint2(2, 1));
+
+	int2 SampleOffsets[4];
+	int2 SharedCoord00;
+	int2 DownsampledCoord00;
+
+	if (bDownsample2x1)
+	{
+		SampleOffsets[0] = int2(0, 0);
+		SampleOffsets[1] = int2(ScreenCoord.x % DownsampleFactor.x == 0 ? -1 : 1, 0);
+		SampleOffsets[2] = int2(0, -1);
+		SampleOffsets[3] = int2(0, 1);
+
+		SharedCoord00 = GroupThreadId / DownsampleFactor + TileBorder;
+		DownsampledCoord00 = ScreenCoord / DownsampleFactor;
+	}
+	else
+	{
+		SampleOffsets[0] = int2(0, 0);
+		SampleOffsets[1] = int2(1, 0);
+		SampleOffsets[2] = int2(0, 1);
+		SampleOffsets[3] = int2(1, 1);
+
+		SharedCoord00 = (GroupThreadId + TileBorder * 2 - 1) / DownsampleFactor;
+		DownsampledCoord00 = floor(ScreenUV * View.BufferSizeAndInvSize.xy / DownsampleFactor - 0.5f);
+	}
+
+	float4 CornerDepths;
+	CornerDepths.x = LoadDepthFromCache(SharedCoord00 + SampleOffsets[0], DownsampleFactor);
+	CornerDepths.y = LoadDepthFromCache(SharedCoord00 + SampleOffsets[1], DownsampleFactor);
+	CornerDepths.z = LoadDepthFromCache(SharedCoord00 + SampleOffsets[2], DownsampleFactor);
+	CornerDepths.w = LoadDepthFromCache(SharedCoord00 + SampleOffsets[3], DownsampleFactor);
+
+	int2 ScreenCoordOffset = ScreenCoord - DownsampledCoord00 * DownsampleFactor;
+	int2 SampleScreenOffset00 = GetDownsampleJitter(DownsampledCoord00 + SampleOffsets[0], DownsampleFactor) + SampleOffsets[0] * 2 - ScreenCoordOffset;
+	int2 SampleScreenOffset10 = GetDownsampleJitter(DownsampledCoord00 + SampleOffsets[1], DownsampleFactor) + SampleOffsets[1] * 2 - ScreenCoordOffset;
+	int2 SampleScreenOffset01 = GetDownsampleJitter(DownsampledCoord00 + SampleOffsets[2], DownsampleFactor) + SampleOffsets[2] * 2 - ScreenCoordOffset;
+	int2 SampleScreenOffset11 = GetDownsampleJitter(DownsampledCoord00 + SampleOffsets[3], DownsampleFactor) + SampleOffsets[3] * 2 - ScreenCoordOffset;
+
+	// Triangle filter weights between pixel and 4 samples
+	float4 UpsampleWeights;
+	if (bDownsample2x1)
+	{
+		UpsampleWeights = select(SampleScreenOffset00.x == 0, float4(1.0, 0.0, 0.0, 0.0), float4(0.25, 0.25, 0.25, 0.25));
+	}
+	else
+	{
+		UpsampleWeights.x = (2.0f - abs(SampleScreenOffset00.x)) * (2.0f - abs(SampleScreenOffset00.y));
+		UpsampleWeights.y = (2.0f - abs(SampleScreenOffset10.x)) * (2.0f - abs(SampleScreenOffset10.y));
+		UpsampleWeights.z = (2.0f - abs(SampleScreenOffset01.x)) * (2.0f - abs(SampleScreenOffset01.y));
+		UpsampleWeights.w = (2.0f - abs(SampleScreenOffset11.x)) * (2.0f - abs(SampleScreenOffset11.y));
+	}
+
+	float4 DepthWeights = 1.0f;	
+	{
+		float4 ScenePlane = float4(Material.WorldNormalForPositionBias, dot(TranslatedWorldPosition, Material.WorldNormalForPositionBias));
+
+		float2 ScreenPosition00 = ScreenPosition + SampleScreenOffset00 * View.BufferSizeAndInvSize.zw / View.ScreenPositionScaleBias.xy;
+		float2 ScreenPosition10 = ScreenPosition + SampleScreenOffset10 * View.BufferSizeAndInvSize.zw / View.ScreenPositionScaleBias.xy;
+		float2 ScreenPosition01 = ScreenPosition + SampleScreenOffset01 * View.BufferSizeAndInvSize.zw / View.ScreenPositionScaleBias.xy;
+		float2 ScreenPosition11 = ScreenPosition + SampleScreenOffset11 * View.BufferSizeAndInvSize.zw / View.ScreenPositionScaleBias.xy;
+
+		float3 Position00 = mul(float4(GetScreenPositionForProjectionType(ScreenPosition00, CornerDepths.x), CornerDepths.x, 1), View.ScreenToTranslatedWorld).xyz;
+		float3 Position10 = mul(float4(GetScreenPositionForProjectionType(ScreenPosition10, CornerDepths.y), CornerDepths.y, 1), View.ScreenToTranslatedWorld).xyz;
+		float3 Position01 = mul(float4(GetScreenPositionForProjectionType(ScreenPosition01, CornerDepths.z), CornerDepths.x, 1), View.ScreenToTranslatedWorld).xyz;
+		float3 Position11 = mul(float4(GetScreenPositionForProjectionType(ScreenPosition11, CornerDepths.w), CornerDepths.w, 1), View.ScreenToTranslatedWorld).xyz;
+
+		float4 PlaneDistances;
+		PlaneDistances.x = abs(dot(float4(Position00, -1), ScenePlane));
+		PlaneDistances.y = abs(dot(float4(Position10, -1), ScenePlane));
+		PlaneDistances.z = abs(dot(float4(Position01, -1), ScenePlane));
+		PlaneDistances.w = abs(dot(float4(Position11, -1), ScenePlane));
+
+		float4 RelativeDepthDifference = PlaneDistances / Material.SceneDepth;
+
+		DepthWeights = select(CornerDepths > 0.0f, exp2(-5000.0f * (RelativeDepthDifference * RelativeDepthDifference)), 0.0f);
+	}
+	UpsampleWeights *= DepthWeights;
+
+	float4 NormalWeights = 1.0f;
+	{
+		float3 SampleWorldNormal00 = LoadNormalFromCache(SharedCoord00 + SampleOffsets[0], DownsampleFactor);
+		float3 SampleWorldNormal10 = LoadNormalFromCache(SharedCoord00 + SampleOffsets[1], DownsampleFactor);
+		float3 SampleWorldNormal01 = LoadNormalFromCache(SharedCoord00 + SampleOffsets[2], DownsampleFactor);
+		float3 SampleWorldNormal11 = LoadNormalFromCache(SharedCoord00 + SampleOffsets[3], DownsampleFactor);
+
+		NormalWeights.x = GetNormalWeight(Material.WorldNormalForPositionBias, SampleWorldNormal00);
+		NormalWeights.y = GetNormalWeight(Material.WorldNormalForPositionBias, SampleWorldNormal10);
+		NormalWeights.z = GetNormalWeight(Material.WorldNormalForPositionBias, SampleWorldNormal01);
+		NormalWeights.w = GetNormalWeight(Material.WorldNormalForPositionBias, SampleWorldNormal11);
+	}
+	UpsampleWeights *= NormalWeights;
+
+	// Skip out of view samples
+	UpsampleWeights.x = IsValidDownsampledCoord(DownsampledCoord00 + SampleOffsets[0], DownsampleFactor) ? UpsampleWeights.x : 0.0f;
+	UpsampleWeights.y = IsValidDownsampledCoord(DownsampledCoord00 + SampleOffsets[1], DownsampleFactor) ? UpsampleWeights.y : 0.0f;
+	UpsampleWeights.z = IsValidDownsampledCoord(DownsampledCoord00 + SampleOffsets[2], DownsampleFactor) ? UpsampleWeights.z : 0.0f;
+	UpsampleWeights.w = IsValidDownsampledCoord(DownsampledCoord00 + SampleOffsets[3], DownsampleFactor) ? UpsampleWeights.w : 0.0f;
+
+	return UpsampleWeights;
+}
+
+#if TILE_CLASSIFY_SUBSTRATE
+	RWBuffer<uint> TileDrawIndirectDataBufferUAV;
+	RWBuffer<uint> TileListBufferUAV;
+	uint bRectPrimitive;
+	uint TileEncoding;
+	uint4 TileListBufferOffsets[SUBSTRATE_TILE_TYPE_COUNT];
+	uint GetTileListBufferOffsets(uint Type)
+	{
+		return TileListBufferOffsets[Type].x;
+	}
+#endif
+
+/**
+ * Load GBuffer data once and transform it for subsequent lighting passes
+ * This includes full res depth and normal copy for opaque before it gets overwritten by water or other translucency writing depth
+ */
+[numthreads(THREADGROUP_SIZE, THREADGROUP_SIZE, 1)]
+void StochasticLightingTileClassificationMarkCS(
+	uint2 GroupId : SV_GroupID,
+	uint2 GroupThreadId : SV_GroupThreadID,
+	uint2 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint LinearThreadIndex = GroupThreadId.x + THREADGROUP_SIZE * GroupThreadId.y;
+
+#if TILE_CLASSIFY_LUMEN || TILE_CLASSIFY_MEGALIGHTS || TILE_CLASSIFY_SUBSTRATE
+#if PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS
+	uint GroupTileBitmask = 0;
+#else
+	SharedTileBitmask[LinearThreadIndex] = 0;
+
+	GroupMemoryBarrierWithGroupSync();
+#endif
+#endif
+
+	FLumenMaterialData Material = (FLumenMaterialData) 0;
+	Material.SceneDepth = -1.0f;
+
+	bool bIsValid = false;
+	bool bIsAnyValid = false;
+	const FLumenMaterialCoord Coord = GetLumenMaterialCoord(DispatchThreadId, GroupId, GroupThreadId, bIsValid, bIsAnyValid, true /* bAddMinRect*/);
+
+	if (bIsValid)
+	{
+		Material = ReadMaterialData(Coord, MaxRoughnessToTrace);
+	}
+
+#if COPY_DEPTH_AND_NORMAL
+	if (Coord.ClosureIndex == 0)
+	{
+		RWDepthTexture[Coord.SvPosition] = ConvertToDeviceZ(Material.SceneDepth);
+
+		FNormalAndShadingInfo Info;
+		Info.Normal = Material.WorldNormalForPositionBias;
+		Info.bIsHair = Material.bIsHair;
+		Info.bHasBackfaceDiffuse = Material.bHasBackfaceDiffuse;
+		RWNormalTexture[Coord.SvPosition] = PackNormalAndShadingInfo(Info);
+	}
+#endif
+
+	if (Coord.ClosureIndex == 0)
+	{
+	#if (STOCHASTIC_SAMPLE_OFFSET & STOCHASTIC_SAMPLE_OFFSET_2x2) != 0
+		DownsampleDepthAndNormal(GroupId, GroupThreadId, Coord.SvPosition, Material, uint2(2, 2), RWDownsampledSceneDepth2x2, RWDownsampledWorldNormal2x2);
+	#endif
+
+	#if (STOCHASTIC_SAMPLE_OFFSET & STOCHASTIC_SAMPLE_OFFSET_2x1) != 0
+		DownsampleDepthAndNormal(GroupId, GroupThreadId, Coord.SvPosition, Material, uint2(2, 1), RWDownsampledSceneDepth2x1, RWDownsampledWorldNormal2x1);
+	#endif
+	}
+
+#if TILE_CLASSIFY_LUMEN
+	if (bIsValid && IsValid(Material))
+	{
+		uint TileBitmask = 0;
+		uint DiffuseIntegrationMethod = GetDiffuseIntegrationMethod(Material);
+		const float DiffuseLerp = RoughReflectionsDiffuseLerp(Material);
+
+		if (IsHair(Material))
+		{
+			TileBitmask |= LUMEN_TILE_BITMASK_GI_ALL;
+		}
+		else if (DiffuseIntegrationMethod == DIFFUSE_INTEGRATION_IMPORTANCE_SAMPLE_BRDF || DiffuseLerp < 1.0f)
+		{
+			TileBitmask |= LUMEN_TILE_BITMASK_GI_IMPORTANCE_SAMPLE_BRDF;
+		}
+		else
+		{
+			TileBitmask |= LUMEN_TILE_BITMASK_GI_SIMPLE_DIFFUSE;
+		}
+
+		Material = ApplySmoothBias(Material, false /*bTopLayerRoughness*/);
+		if (NeedRayTracedReflections(Material.Roughness, Material))
+		{
+			TileBitmask |= LUMEN_TILE_BITMASK_REFLECTIONS;
+		}
+
+		// Pack into shared tile bitmask for 8x8 reduction
+		WriteSharedTileBitmask(LinearThreadIndex, TileBitmask, TILE_BITMASK_INDEX_LUMEN);
+	}
+#endif
+
+#if TILE_CLASSIFY_MEGALIGHTS
+	if (bIsValid)
+	{
+		uint TileBitmask = 0;
+
+		if (Material.IsSimple())
+		{
+			TileBitmask |= MEGALIGHTS_TILE_BITMASK_SIMPLE;
+		}
+		else if (Material.IsSingle())
+		{
+			TileBitmask |= MEGALIGHTS_TILE_BITMASK_SINGLE;
+		}
+		else if (Material.IsComplexSpecial())
+		{
+			TileBitmask |= MEGALIGHTS_TILE_BITMASK_COMPLEX_SPECIAL;
+		}
+		else if (Material.IsValid())
+		{
+			TileBitmask |= MEGALIGHTS_TILE_BITMASK_COMPLEX;
+		}
+
+		const uint EyeIndex = 0;
+		const uint GridIndex = ComputeLightGridCellIndex(Coord.SvPosition - View.ViewRectMin.xy, Material.SceneDepth, EyeIndex);
+		const FCulledLightsGridHeader CulledLightGridHeader = GetCulledLightsGridHeader(GridIndex);
+
+		if (CulledLightGridHeader.bHasRectLight)
+		{
+			TileBitmask |= MEGALIGHTS_TILE_BITMASK_RECT_LIGHT;
+		}
+
+		if (CulledLightGridHeader.bHasTexturedLight && EnableTexturedRectLights != 0)
+		{
+			TileBitmask |= MEGALIGHTS_TILE_BITMASK_TEXTURED_RECT_LIGHT;
+		}
+
+		// Pack into shared tile bitmask for 8x8 reduction
+		WriteSharedTileBitmask(LinearThreadIndex, TileBitmask, TILE_BITMASK_INDEX_MEGALIGHTS);
+	}
+#endif
+
+#if TILE_CLASSIFY_SUBSTRATE
+
+	// Init primitive index
+	if (DispatchThreadId.x < SUBSTRATE_TILE_TYPE_COUNT && DispatchThreadId.y == 0)
+	{
+		const uint TileType = DispatchThreadId.x;
+		const uint IndexCountPerInstance = bRectPrimitive > 0 ? 4 : 6;
+		TileDrawIndirectDataBufferUAV[GetSubstrateTileTypeDrawIndirectArgOffset_DWord(TileType) + 0] = IndexCountPerInstance;
+	}
+
+	if (Material.bIsValid)
+	{
+		uint TileBitmask = 0;
+		#if SUBSTRATE_COMPLEXSPECIALPATH
+		if (Material.bIsComplexSpecial)
+		{
+			TileBitmask |= SUBSTRATE_TILE_BITMASK_COMPLEXSPECIAL;
+		}
+		else
+		#endif
+		if (Material.bIsComplex)
+		{
+			TileBitmask |= SUBSTRATE_TILE_BITMASK_COMPLEX;
+		}
+		else if (Material.bIsSingle)
+		{
+			TileBitmask |= SUBSTRATE_TILE_BITMASK_SINGLE;
+		}
+		else if (Material.bIsSimple)
+		{
+			TileBitmask |= SUBSTRATE_TILE_BITMASK_SIMPLE;
+		}
+
+		// Pack into shared tile bitmask for 8x8 reduction
+		WriteSharedTileBitmask(LinearThreadIndex, TileBitmask, TILE_BITMASK_INDEX_SUBSTRATE);
+	}
+#endif
+
+#if TILE_CLASSIFY_LUMEN || TILE_CLASSIFY_MEGALIGHTS || TILE_CLASSIFY_SUBSTRATE
+#if PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS
+	GroupTileBitmask = WaveActiveBitOr(GroupTileBitmask);
+
+	if (WaveGetLaneCount() < THREADGROUP_SIZE * THREADGROUP_SIZE)
+	{
+		if (LinearThreadIndex == 0)
+		{
+			SharedTileBitmask = 0;
+		}
+
+		GroupMemoryBarrierWithGroupSync();
+		
+		if (WaveIsFirstLane())
+		{
+			uint Unused;
+			InterlockedOr(SharedTileBitmask, GroupTileBitmask, Unused);
+		}
+		
+		GroupMemoryBarrierWithGroupSync();
+		
+		GroupTileBitmask = SharedTileBitmask;
+	}	
+#else // PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS
+	GroupMemoryBarrierWithGroupSync();
+
+	// GroupShared reduction
+	if (LinearThreadIndex < 32)
+	{
+		SharedTileBitmask[LinearThreadIndex] = SharedTileBitmask[LinearThreadIndex] | SharedTileBitmask[LinearThreadIndex + 32];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 16)
+	{
+		SharedTileBitmask[LinearThreadIndex] = SharedTileBitmask[LinearThreadIndex] | SharedTileBitmask[LinearThreadIndex + 16];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 8)
+	{
+		SharedTileBitmask[LinearThreadIndex] = SharedTileBitmask[LinearThreadIndex] | SharedTileBitmask[LinearThreadIndex + 8];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 4)
+	{
+		SharedTileBitmask[LinearThreadIndex] = SharedTileBitmask[LinearThreadIndex] | SharedTileBitmask[LinearThreadIndex + 4];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 2)
+	{
+		SharedTileBitmask[LinearThreadIndex] = SharedTileBitmask[LinearThreadIndex] | SharedTileBitmask[LinearThreadIndex + 2];
+	}
+
+	GroupMemoryBarrierWithGroupSync();
+
+	if (LinearThreadIndex < 1)
+	{
+		SharedTileBitmask[LinearThreadIndex] = SharedTileBitmask[LinearThreadIndex] | SharedTileBitmask[LinearThreadIndex + 1];
+	}
+#endif // PLATFORM_SUPPORTS_SM6_0_WAVE_OPERATIONS
+
+	if (LinearThreadIndex == 0)
+	{
+		#if TILE_CLASSIFY_LUMEN
+		{
+			RWLumenTileBitmask[int3(Coord.SvPosition / TILE_SIZE, Coord.ClosureIndex)] = ReadSharedTileBitmask(0, TILE_BITMASK_INDEX_LUMEN);
+		}
+		#endif
+
+		#if TILE_CLASSIFY_MEGALIGHTS
+		if (Coord.ClosureIndex == 0)
+		{
+			RWMegaLightsTileBitmask[Coord.SvPosition / TILE_SIZE] = ReadSharedTileBitmask(0, TILE_BITMASK_INDEX_MEGALIGHTS);
+		}
+		#endif
+
+		#if TILE_CLASSIFY_SUBSTRATE
+		{
+			const uint TileBitmask = ReadSharedTileBitmask(0, TILE_BITMASK_INDEX_SUBSTRATE);
+			if (TileBitmask != 0)
+			{
+				const uint2 TileCoord = (Coord.SvPosition.xy - uint2(View.ViewRectMin.xy)) >> TILE_SIZE_DIV_SHIFT;
+				const uint EncodedTile = SubstratePackTile(TileCoord, TileEncoding);
+
+				#if SUBSTRATE_COMPLEXSPECIALPATH
+				if (TileBitmask & SUBSTRATE_TILE_BITMASK_COMPLEXSPECIAL)
+				{
+					uint WriteToIndex;
+					InterlockedAdd(TileDrawIndirectDataBufferUAV[GetSubstrateTileTypeDrawIndirectArgOffset_DWord(SUBSTRATE_TILE_TYPE_COMPLEX_SPECIAL) + 1], 1, WriteToIndex);
+					TileListBufferUAV[GetTileListBufferOffsets(SUBSTRATE_TILE_TYPE_COMPLEX_SPECIAL) + WriteToIndex] = EncodedTile;
+				}
+				else 
+				#endif
+				if (TileBitmask & SUBSTRATE_TILE_BITMASK_COMPLEX)
+				{
+					uint WriteToIndex;
+					InterlockedAdd(TileDrawIndirectDataBufferUAV[GetSubstrateTileTypeDrawIndirectArgOffset_DWord(SUBSTRATE_TILE_TYPE_COMPLEX) + 1], 1, WriteToIndex);
+					TileListBufferUAV[GetTileListBufferOffsets(SUBSTRATE_TILE_TYPE_COMPLEX) + WriteToIndex] = EncodedTile;
+				}
+				else if (TileBitmask & SUBSTRATE_TILE_BITMASK_SINGLE)
+				{
+					uint WriteToIndex;
+					InterlockedAdd(TileDrawIndirectDataBufferUAV[GetSubstrateTileTypeDrawIndirectArgOffset_DWord(SUBSTRATE_TILE_TYPE_SINGLE) + 1], 1, WriteToIndex);
+					TileListBufferUAV[GetTileListBufferOffsets(SUBSTRATE_TILE_TYPE_SINGLE) + WriteToIndex] = EncodedTile;
+				}
+				else // (TileBitmask & SUBSTRATE_TILE_BITMASK_SIMPLE)
+				{
+					uint WriteToIndex;
+					InterlockedAdd(TileDrawIndirectDataBufferUAV[GetSubstrateTileTypeDrawIndirectArgOffset_DWord(SUBSTRATE_TILE_TYPE_SIMPLE) + 1], 1, WriteToIndex);
+					TileListBufferUAV[GetTileListBufferOffsets(SUBSTRATE_TILE_TYPE_SIMPLE) + WriteToIndex] = EncodedTile;
+				}
+			}
+		}
+		#endif
+	}
+#endif // TILE_CLASSIFY_LUMEN || TILE_CLASSIFY_MEGALIGHTS || TILE_CLASSIFY_SUBSTRATE
+
+#if REPROJECT_LUMEN || REPROJECT_MEGALIGHTS
+	if (bIsValid)
+	{
+		uint2 ScreenCoord = Coord.SvPosition;
+
+		FLumenPackedPixelData LumenPackedPixelData = (FLumenPackedPixelData)LUMEN_INVALID_PACKED_PIXEL_DATA;
+		FMegaLightsPackedPixelData MegaLightsPackedPixelData = (FMegaLightsPackedPixelData)MEGALIGHTS_INVALID_PACKED_PIXEL_DATA;
+
+		if (Material.IsValid())
+		{
+			LumenPackedPixelData.Packed = 0;
+			LumenPackedPixelData.SetHasBackfaceDiffuse(Material.bHasBackfaceDiffuse);
+			MegaLightsPackedPixelData.Packed = 0;
+
+			float2 ScreenUV = (ScreenCoord + 0.5f) * View.BufferSizeAndInvSize.zw;
+			float2 ScreenPosition = (ScreenUV - View.ScreenPositionScaleBias.wz) / View.ScreenPositionScaleBias.xy;
+			float3 TranslatedWorldPosition = mul(float4(GetScreenPositionForProjectionType(ScreenPosition, Material.SceneDepth), Material.SceneDepth, 1), View.ScreenToTranslatedWorld).xyz;
+			const float RandomScalar = BlueNoiseScalar(ScreenCoord, StochasticLightingStateFrameIndex);
+
+			#if (STOCHASTIC_SAMPLE_OFFSET & STOCHASTIC_SAMPLE_OFFSET_2x2) != 0
+			{
+				float4 UpsampleWeights = ComputeUpsampleWeights(GroupThreadId, ScreenCoord, ScreenUV, ScreenPosition, TranslatedWorldPosition, Material, uint2(2, 2));
+
+				const uint2 StochasticBilinearOffset = GetStochasticBilinearOffset(RandomScalar, UpsampleWeights);
+				bool bCanReconstruct = dot(UpsampleWeights, 1.0f) >= 0.01f;
+
+				bool bSetForLumen = true;
+				bool bSetForMegaLights = true;
+			#if STOCHASTIC_SAMPLE_OFFSET == (STOCHASTIC_SAMPLE_OFFSET_2x1 | STOCHASTIC_SAMPLE_OFFSET_2x2)
+				bSetForLumen = LumenStochasticSampleMode == STOCHASTIC_SAMPLE_OFFSET_2x2;
+				bSetForMegaLights = MegaLightsStochasticSampleMode == STOCHASTIC_SAMPLE_OFFSET_2x2;
+			#endif
+				if (bSetForLumen)
+				{
+					LumenPackedPixelData.SetStochasticSampleOffset(StochasticBilinearOffset, bCanReconstruct);
+				}
+				if (bSetForMegaLights)
+				{
+					MegaLightsPackedPixelData.SetStochasticSampleOffset(StochasticBilinearOffset, bCanReconstruct);
+				}
+			}
+			#endif
+
+			#if (STOCHASTIC_SAMPLE_OFFSET & STOCHASTIC_SAMPLE_OFFSET_2x1) != 0
+			{
+				float4 UpsampleWeights = ComputeUpsampleWeights(GroupThreadId, ScreenCoord, ScreenUV, ScreenPosition, TranslatedWorldPosition, Material, uint2(2, 1));
+
+				const uint2 StochasticBilinearOffset = GetStochasticBilinearOffset(RandomScalar, UpsampleWeights);
+				bool bCanReconstruct = dot(UpsampleWeights, 1.0f) >= 0.01f;
+
+				bool bSetForLumen = true;
+				bool bSetForMegaLights = true;
+			#if STOCHASTIC_SAMPLE_OFFSET == (STOCHASTIC_SAMPLE_OFFSET_2x1 | STOCHASTIC_SAMPLE_OFFSET_2x2)
+				bSetForLumen = LumenStochasticSampleMode == STOCHASTIC_SAMPLE_OFFSET_2x1;
+				bSetForMegaLights = MegaLightsStochasticSampleMode == STOCHASTIC_SAMPLE_OFFSET_2x1;
+			#endif
+				if (bSetForLumen)
+				{
+					LumenPackedPixelData.SetStochasticSampleOffset(StochasticBilinearOffset, bCanReconstruct);
+				}
+				if (bSetForMegaLights)
+				{
+					MegaLightsPackedPixelData.SetStochasticSampleOffset(StochasticBilinearOffset, bCanReconstruct);
+				}
+			}
+			#endif
+
+			float3 HistoryScreenPosition = GetHistoryScreenPosition(ScreenPosition, ScreenUV, ConvertToDeviceZ(Material.SceneDepth));
+			float2 HistoryScreenUV = HistoryScreenPosition.xy * HistoryScreenPositionScaleBias.xy + HistoryScreenPositionScaleBias.wz;
+
+			bool bHistoryWasOnScreen = all(HistoryScreenUV >= HistoryUVMinMax.xy) && all(HistoryScreenUV <= HistoryUVMinMax.zw);
+			float2 HistoryScreenCoord;
+			half2 HistoryBilinearWeights;
+
+			// Encode and write out HistoryScreenCoord with subpixel precision
+			{
+				HistoryScreenUV = clamp(HistoryScreenUV, HistoryGatherUVMinMax.xy, HistoryGatherUVMinMax.zw);
+				HistoryScreenCoord = HistoryScreenUV * HistoryBufferSizeAndInvSize.xy - 0.5f;
+
+				uint Encoded = EncodeHistoryScreenCoord(HistoryScreenCoord, HistorySubPixelGridSizeAndInvSize.xy);
+				RWEncodedHistoryScreenCoord[ScreenCoord] = Encoded;
+				
+				float4 Decoded = DecodeHistoryScreenCoord(Encoded, HistoryScreenCoordDecodeShift, HistorySubPixelGridSizeAndInvSize.zw);
+				HistoryScreenCoord = Decoded.xy;
+				HistoryBilinearWeights = half2(Decoded.zw);
+			}
+
+			if (bHistoryWasOnScreen)
+			{
+				float2 HistoryGatherUV = (HistoryScreenCoord + 1.0f) * HistoryBufferSizeAndInvSize.zw;
+
+				float4 HistorySampleSceneDepth4 = DepthHistoryTexture.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+				HistorySampleSceneDepth4.x = ConvertFromDeviceZ(HistorySampleSceneDepth4.x);
+				HistorySampleSceneDepth4.y = ConvertFromDeviceZ(HistorySampleSceneDepth4.y);
+				HistorySampleSceneDepth4.z = ConvertFromDeviceZ(HistorySampleSceneDepth4.z);
+				HistorySampleSceneDepth4.w = ConvertFromDeviceZ(HistorySampleSceneDepth4.w);
+
+				float ReprojectedSceneDepth = ConvertFromDeviceZ(HistoryScreenPosition.z);
+
+				float4 DistanceToHistoryValue;
+				{
+				#define PLANE_DISOCCLUSION_WEIGHTS 0
+				#define EXPAND_HISTORY_DISTANCE_THRESHOLD_FOR_JITTER !PLANE_DISOCCLUSION_WEIGHTS
+
+				#if PLANE_DISOCCLUSION_WEIGHTS
+					float3 PrevTranslatedPrevWorldPosition = mul(float4(GetScreenPositionForProjectionType(HistoryScreenPosition.xy, ReprojectedSceneDepth), ReprojectedSceneDepth, 1), View.PrevScreenToTranslatedWorld).xyz;
+					float4 PrevTranslatedPrevScenePlane = float4(Material.WorldNormalForPositionBias, dot(PrevTranslatedPrevWorldPosition, Material.WorldNormalForPositionBias));
+
+					float2 HistoryGatherUV00 = HistoryGatherUV + HistoryBufferSizeAndInvSize.zw * float2(-0.5, -0.5);
+					float2 HistoryGatherUV10 = HistoryGatherUV + HistoryBufferSizeAndInvSize.zw * float2(+0.5, -0.5);
+					float2 HistoryGatherUV01 = HistoryGatherUV + HistoryBufferSizeAndInvSize.zw * float2(-0.5, +0.5);
+					float2 HistoryGatherUV11 = HistoryGatherUV + HistoryBufferSizeAndInvSize.zw * float2(+0.5, +0.5);
+
+					float2 HistoryScreenPosition00 = (HistoryGatherUV00 - HistoryScreenPositionScaleBias.wz) / HistoryScreenPositionScaleBias.xy;
+					float3 PrevTranslatedHistoryWorldPosition00 = mul(float4(GetScreenPositionForProjectionType(HistoryScreenPosition00, HistorySampleSceneDepth4.x), HistorySampleSceneDepth4.x, 1), View.PrevScreenToTranslatedWorld).xyz;
+					DistanceToHistoryValue.x = abs(dot(float4(PrevTranslatedHistoryWorldPosition00, -1), PrevTranslatedPrevScenePlane));
+
+					float2 HistoryScreenPosition10 = (HistoryGatherUV10.x - HistoryScreenPositionScaleBias.wz) / HistoryScreenPositionScaleBias.xy;
+					float3 PrevTranslatedHistoryWorldPosition10 = mul(float4(GetScreenPositionForProjectionType(HistoryScreenPosition10, HistorySampleSceneDepth4.y), HistorySampleSceneDepth4.y, 1), View.PrevScreenToTranslatedWorld).xyz;
+					DistanceToHistoryValue.y = abs(dot(float4(PrevTranslatedHistoryWorldPosition10, -1), PrevTranslatedPrevScenePlane));
+
+					float2 HistoryScreenPosition01 = (HistoryGatherUV01 - HistoryScreenPositionScaleBias.wz) / HistoryScreenPositionScaleBias.xy;
+					float3 PrevTranslatedHistoryWorldPosition01 = mul(float4(GetScreenPositionForProjectionType(HistoryScreenPosition01, HistorySampleSceneDepth4.z), HistorySampleSceneDepth4.z, 1), View.PrevScreenToTranslatedWorld).xyz;
+					DistanceToHistoryValue.z = abs(dot(float4(PrevTranslatedHistoryWorldPosition01, -1), PrevTranslatedPrevScenePlane));
+
+					float2 HistoryScreenPosition11 = (HistoryGatherUV11 - HistoryScreenPositionScaleBias.wz) / HistoryScreenPositionScaleBias.xy;
+					float3 PrevTranslatedHistoryWorldPosition11 = mul(float4(GetScreenPositionForProjectionType(HistoryScreenPosition11.xy, HistorySampleSceneDepth4.w), HistorySampleSceneDepth4.w, 1), View.PrevScreenToTranslatedWorld).xyz;
+					DistanceToHistoryValue.w = abs(dot(float4(PrevTranslatedHistoryWorldPosition11, -1), PrevTranslatedPrevScenePlane));
+				#else
+					DistanceToHistoryValue = abs(HistorySampleSceneDepth4 - ReprojectedSceneDepth);
+				#endif
+				}
+
+				half4 LumenDepthWeights;
+				{
+					float LumenDisocclusionDistanceThreshold = Material.bHasBackfaceDiffuse ? LumenHistoryDistanceThresholdForFoliage : LumenHistoryDistanceThreshold;
+					LumenDisocclusionDistanceThreshold *= lerp(0.5f, 1.5f, RandomScalar);
+				#if EXPAND_HISTORY_DISTANCE_THRESHOLD_FOR_JITTER
+					const float3 V = normalize(-TranslatedWorldPosition);
+					// Raise the threshold at grazing angles to compensate for TAA jitter causing a depth mismatch dependent on the angle
+					// This also introduces some ghosting around characters, needs a better solution
+					LumenDisocclusionDistanceThreshold /= clamp(saturate(dot(V, Material.WorldNormalForPositionBias)), 0.1f, 1.0f); 
+				#endif
+					LumenDepthWeights = select(DistanceToHistoryValue >= ReprojectedSceneDepth * LumenDisocclusionDistanceThreshold, half(0.0), half(1.0));
+				}
+
+				float MegaLightsDisocclusionDistanceThreshold = 0.1f;
+				half4 MegaLightsDepthWeights = select(DistanceToHistoryValue >= ReprojectedSceneDepth * MegaLightsDisocclusionDistanceThreshold, half(0.0), half(1.0));
+
+				// Any history neighbor depth valid bit for GenerateLightSamplesCS
+				MegaLightsPackedPixelData.SetAnyHistoryDepthValid(any(MegaLightsDepthWeights > 0.01));
+
+				half4 HistoryWeights = half4(
+					(1 - HistoryBilinearWeights.y) * (1 - HistoryBilinearWeights.x),
+					(1 - HistoryBilinearWeights.y) * HistoryBilinearWeights.x,
+					HistoryBilinearWeights.y * (1 - HistoryBilinearWeights.x),
+					HistoryBilinearWeights.y * HistoryBilinearWeights.x);
+
+				half4 LumenHistoryWeights = HistoryWeights * LumenDepthWeights;
+				half4 MegaLightsHistoryWeights = HistoryWeights * MegaLightsDepthWeights;
+
+				#if HISTORY_REJECT_BASED_ON_NORMAL
+				{
+					// UnpackNormalAndShadingInfo(Texture2DSampleLevel(DiffuseIndirectNormalHistory, GlobalPointClampedSampler, InUV, 0)).Normal
+					float4 NormalR = NormalAndShadingInfoHistory.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+					float4 NormalG = NormalAndShadingInfoHistory.GatherGreen(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+					float4 NormalB = NormalAndShadingInfoHistory.GatherBlue(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+
+					const float3 HistoryNormal00 = UnpackNormalAndShadingInfo(float4(NormalR.x, NormalG.x, NormalB.x, 0)).Normal;
+					const float3 HistoryNormal10 = UnpackNormalAndShadingInfo(float4(NormalR.y, NormalG.y, NormalB.y, 0)).Normal;
+					const float3 HistoryNormal01 = UnpackNormalAndShadingInfo(float4(NormalR.z, NormalG.z, NormalB.z, 0)).Normal;
+					const float3 HistoryNormal11 = UnpackNormalAndShadingInfo(float4(NormalR.w, NormalG.w, NormalB.w, 0)).Normal;
+
+					const float4 HistoryNormalWeights = select(float4(
+						dot(HistoryNormal00, Material.WorldNormalForPositionBias),
+						dot(HistoryNormal10, Material.WorldNormalForPositionBias),
+						dot(HistoryNormal01, Material.WorldNormalForPositionBias),
+						dot(HistoryNormal11, Material.WorldNormalForPositionBias)) < LumenHistoryNormalCosThreshold, half(0.0), half(1.0));
+
+					LumenHistoryWeights *= HistoryNormalWeights;
+				}
+				#endif
+
+				{
+					const float4 PackedW = NormalAndShadingInfoHistory.GatherAlpha(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+
+					// Reject based on the foliage material flag (bHasBackfaceDiffuse)
+					const bool4 bHasBackfaceDiffuse = bool4(
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.x)).bHasBackfaceDiffuse,
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.y)).bHasBackfaceDiffuse,
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.z)).bHasBackfaceDiffuse,
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.w)).bHasBackfaceDiffuse);
+					LumenHistoryWeights *= select(Material.bHasBackfaceDiffuse.xxxx == bHasBackfaceDiffuse, half(1.0), half(0.0));
+
+					// If shading info history is available, used it to only fetch compatible pixels.
+					// For now only hair pixel are filtered out as their shading model is too different from the others
+					const bool4 bIsHair4 = bool4(
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.x)).bIsHair,
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.y)).bIsHair,
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.z)).bIsHair,
+						UnpackNormalAndShadingInfo(float4(0, 0, 0, PackedW.w)).bIsHair);
+					MegaLightsHistoryWeights *= select(Material.bIsHair.xxxx == bIsHair4, half(1.0), half(0.0));
+
+				#if REPROJECT_MEGALIGHTS
+					// History might have invalid lighting pixels. Only use history lighting if it has valid data.
+					half4 FramesAccumulatedHistory4 = MegaLightsNumFramesAccumulatedHistory.GatherRed(GlobalPointClampedSampler, HistoryGatherUV).wzxy;
+					MegaLightsHistoryWeights = select(FramesAccumulatedHistory4 > 0.0, MegaLightsHistoryWeights, 0.0);
+				#endif
+				}
+
+				// History neighbor valid mask for ScreenProbeTemporalReprojectionCS and DenoiserTemporalCS
+				LumenPackedPixelData.SetHistorySampleValidity(LumenHistoryWeights > 0.01);
+				MegaLightsPackedPixelData.SetHistorySampleValidity(MegaLightsHistoryWeights > 0.01);
+			}
+		}
+
+	#if REPROJECT_LUMEN
+		RWLumenPackedPixelData[uint3(ScreenCoord, Coord.ClosureIndex)] = LumenPackedPixelData.Packed;
+	#endif
+	#if REPROJECT_MEGALIGHTS
+		if (Coord.ClosureIndex == 0)
+		{
+			RWMegaLightsPackedPixelData[ScreenCoord] = MegaLightsPackedPixelData.Packed;
+		}
+	#endif
+	}
+#endif
+}

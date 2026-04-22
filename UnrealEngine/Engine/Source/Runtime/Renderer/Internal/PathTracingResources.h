@@ -1,0 +1,25 @@
+// Copyright Epic Games, Inc. All Rights Reserved.
+
+#pragma once
+
+class FRDGTexture;
+
+struct FPathTracingResources
+{
+	FRDGTexture* DenoisedRadiance = nullptr;
+	FRDGTexture* Radiance = nullptr;
+	FRDGTexture* Albedo = nullptr;
+	FRDGTexture* Normal = nullptr;
+	FRDGTexture* Variance = nullptr;
+	
+	bool bPostProcessEnabled = false;
+};
+
+struct FPathTracingRealtimeDenoiserResources
+{
+	FRDGTexture* DiffuseColor = nullptr;
+	FRDGTexture* SpecularColor = nullptr;
+	FRDGTexture* Roughness = nullptr;
+	FRDGTexture* Normal = nullptr;
+	FRDGTexture* LinearDepth = nullptr;
+};

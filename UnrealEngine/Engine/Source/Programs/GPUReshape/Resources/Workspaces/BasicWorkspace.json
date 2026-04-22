@@ -1,0 +1,14 @@
+{
+	"Config": {
+		"Coverage": true,
+		"Detail": true,
+		"RedirectOutput": true,
+		"SuspendDeferredInitialization": true
+	},
+	"Features": [
+		"Resource Bounds",
+		"Export Stability",
+		"Descriptor",
+		"Loop"
+	]
+}
