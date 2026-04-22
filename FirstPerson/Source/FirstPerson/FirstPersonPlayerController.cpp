@@ -19,6 +19,7 @@ AFirstPersonPlayerController::AFirstPersonPlayerController()
 void AFirstPersonPlayerController::BeginPlay()
 {
 	Super::BeginPlay();
+	UE_LOG(LogFirstPerson, Log, TEXT("AFirstPersonPlayerController::BeginPlay. GetNetMode:%d"), GetNetMode());
 
 	// only spawn touch controls on local player controllers
 	if (GetNetMode() != NM_DedicatedServer && ShouldUseTouchControls() && IsLocalPlayerController())
