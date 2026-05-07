@@ -17,6 +17,9 @@ public class FirstPerson : ModuleRules
 			"AIModule",
 			"StateTreeModule",
 			"GameplayStateTreeModule",
+			"MassEntity",
+			"MassCommon",
+			"StructUtils",
 			"UMG",
 			"Slate"
 		});
