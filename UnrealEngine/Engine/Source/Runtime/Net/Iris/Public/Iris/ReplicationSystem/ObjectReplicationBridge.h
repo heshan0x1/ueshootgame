@@ -143,6 +143,8 @@ class UObjectReplicationBridge : public UReplicationBridge
 
 public:
 
+	using EGetRefHandleFlags = UE::Net::EGetRefHandleFlags;
+
 	struct FRootObjectReplicationParams;
 	struct FSubObjectReplicationParams;
 

@@ -747,123 +747,34 @@ Flush 开始
 
 ## 9. 注释过程中发现的疑似 Bug 与改进建议
 
-> 以下是 10 波注释过程中累积的"看代码时发现的疑点"。所有发现都已在源文件的中文注释中就地标记。本节做汇总，按严重程度排序，便于后续修复或上报 Epic。
+> **完整清单已独立到 [`Docs/BUGS.md`](./BUGS.md)**（共 76 项：8 项严重 + 7 项中等 + 41 项较低 + 8 项灰色区域 + 12 项可优化点）。本节仅保留概览供快速感知，详细描述、复现步骤、修复建议请查阅 BUGS.md。
+>
+> 所有发现都已在源文件的中文注释中就地标注（搜索 "疑似" 或 "TODO" 关键词即可定位）。
 
-### 9.1 严重（功能失效或可能导致崩溃）
+### 9.1 概览
 
-#### B1. `FMassCommandAddFragmentInstances` ctor 硬编码 `Set` 操作类型
-- **位置**：`Public/MassCommands.h:409-410`
-- **现象**：构造函数形参 `OperationType` 完全被丢弃，`Super(EMassCommandOperationType::Set ...)` 写死为 `Set`。
-- **影响**：派生类 `FMassCommandBuildEntity` 在 ctor 中传 `Create` 想覆盖父类，但实际仍落到 `Set` 阶段——`BuildEntity` 不会按 Create 阶段在 Flush 第一组执行，而是在 Set 阶段（4）执行。
-- **修复**：`Super(OperationType FORWARD_DEBUG_NAME_PARAM)`。
+| 类别 | 数量 | 示例 |
+|------|----:|------|
+| **严重** (B-001 ~ B-008) | 8 | 命令系统硬编码 Set / 调试器 `&` 漏写 / Phase Manager delegate 注册错位（UAF） |
+| **中等** (B-009 ~ B-015) | 7 | `SwapTags` 不发 observer / 已废弃构造函数总崩溃 |
+| **较低** (L-001 ~ L-041) | 41 | typo / 死代码 / 多余分号 / 命名不对称 |
+| **灰色区域** (G-001 ~ G-008) | 8 | 函数声明无实现 / 30-bit Generation 设计未文档化 |
+| **可优化点** (O-001 ~ O-012) | 12 | trace 强转布局依赖 / 命名易反直觉 / 大段注释代码 |
 
-#### B2. `FGroupEntities::Add` 不调用 `Super::Add`，命令永不执行
-- **位置**：`Public/MassArchetypeGroupCommands.h:30`
-- **现象**：函数把 entity 全塞进自家 `Groups` map，没有把 entity 推入基类的 `TargetEntities`，也没有把 `bHasWork` 置为 true。
-- **影响**：基类 `HasWork()` 返回 false → `CommandTypeOrder` 把命令排到 invalid → 整个跳过执行。**这条命令很可能根本不会运行**。
-- **修复**：补 `bHasWork = true` 并/或在 `HasWork`/`GetNumOperationsStat` 反映 `Groups.Num()`。
+### 9.2 强烈建议优先修复（命中即出问题）
 
-#### B3. `FMassProcessingPhaseManager` 两个 delegate 都注册到 `OnEntityManagerInitialized`
-- **位置**：`Private/MassProcessingPhaseManager.cpp` 构造函数
-- **现象**：
-  ```cpp
-  OnDebugEntityManagerInitializedHandle   = FMassDebugger::OnEntityManagerInitialized.AddRaw(this, &...::OnDebugEntityManagerInitialized);
-  OnDebugEntityManagerDeinitializedHandle = FMassDebugger::OnEntityManagerInitialized.AddRaw(this, &...::OnDebugEntityManagerDeinitialized);
-  ```
-  两行都是 `OnEntityManagerInitialized`。
-- **影响**：deinit 永远不会回调到 `OnDebugEntityManagerDeinitialized`。
-- **修复**：第二行改为 `OnEntityManagerDeinitialized`。
+| ID | 文件（关键标识符） | 影响 |
+|----|---|---|
+| B-001 | `MassCommands.h::FMassCommandAddFragmentInstances` | `BuildEntity` 不在 Create 阶段执行 |
+| B-002 | `MassArchetypeGroupCommands.h::FGroupEntities::Add` | 命令永不执行 |
+| B-003 | `MassProcessingPhaseManager.cpp` 构造函数 | deinit 回调失效 |
+| B-004 | `MassProcessingPhaseManager.cpp` 析构函数 | UAF 风险 |
+| B-005 | `MassDebugger.cpp::SetFragmentWriteBreakForSelectedEntity` | 调试器命令完全失效 |
+| B-006 | `MassDebugger.cpp::ClearAllFragmentWriteBreak` | 清断点不生效，可能触发 ensure |
+| B-007 | `MassQueryExecutor.h::FConstOptionalFragmentAccess::ConfigureQuery` | const optional 被当作 required |
+| B-008 | `MassDebuggerBreakpoints.cpp::ApplyEntityFilterByFragments` | Query 过滤断点几乎不触发 |
 
-#### B4. `FMassProcessingPhaseManager` 析构未 Remove debug delegate handles
-- **位置**：`Private/MassProcessingPhaseManager.cpp` 析构函数
-- **现象**：构造时 `AddRaw(this, ...)` 注册了两个 handle，析构时没有任何 `Remove`。
-- **影响**：`FMassDebugger` 的多播仍持有原始 `this` 指针——下次 broadcast 即 UAF。
-- **修复**：析构中 `FMassDebugger::OnEntityManagerInitialized.Remove(handle)`。
-
-#### B5. `SetFragmentWriteBreakForSelectedEntity` 漏写 `&`
-- **位置**：`Private/MassDebugger.cpp`
-- **现象**：
-  ```cpp
-  FBreakpoint NewBreakpoint = ActiveEnvironment.Breakpoints.Emplace_GetRef();
-  ```
-  缺引用——后续对 `NewBreakpoint` 的字段写入全部丢失。
-- **影响**：写入断点功能在被选中实体路径上失效——`mass.debug.SetFragmentBreakpoint` 控制台命令不可用。
-- **修复**：`FBreakpoint& NewBreakpoint = ...`。
-
-#### B6. `ClearAllFragmentWriteBreak` 比较了错误的 TriggerType
-- **位置**：`Private/MassDebugger.cpp`
-- **现象**：函数语义是清除 fragment 写入断点，但代码里比较的是 `ETriggerType::ProcessorExecute`，应当是 `FragmentWrite`。
-- **影响**：(a) 想清除的断点不被清除；(b) 试图把 Trigger 当作 ScriptStruct 解读 ProcessorExecute trigger，可能触发 TVariant 断言。
-
-#### B7. `FConstOptionalFragmentAccess::ConfigureQuery` 漏传 `Optional`
-- **位置**：`Public/MassQueryExecutor.h`
-- **现象**：
-  ```cpp
-  EntityQuery.AddRequirement<TFragment>(EMassFragmentAccess::ReadOnly);
-  // 缺少 EMassFragmentPresence::Optional
-  ```
-  与同文件的 `FMutableOptionalFragmentAccess::ConfigureQuery`（正确传了 Optional）不一致。
-- **影响**："const optional" accessor 实际被注册为 "const required"——archetype 匹配错误（要求 fragment 必须存在）。
-
-#### B8. `FBreakpoint::ApplyEntityFilterByFragments` 的 Query 分支永远返回 false
-- **位置**：`Private/MassDebuggerBreakpoints.cpp`
-- **现象**：所有 requirement 通过后返回 `false` 而非 `true`。
-- **影响**：`FilterType::Query` 的"实体创建"断点几乎不会触发。
-
-### 9.2 中等（行为不一致或踩坑场景）
-
-#### B9. `SwapTagsForEntity` 不触发 observer
-- **位置**：`Private/MassEntityManager.cpp:1262-1288`
-- **现象**：直接调用 `MoveEntityToAnotherArchetype`，不调 `OnPreCompositionRemoved`/`OnPostCompositionAdded`。
-- **影响**：依赖 tag observer 监听状态切换的项目代码会静默丢失通知，而 `RemoveTag(A) + AddTag(B)` 会正常触发。
-
-#### B10. `FMassCommandRemoveTagsInternal::CheckBreakpoints` 调用 Add 路径
-- **位置**：`Public/MassCommands.h:374`
-- **现象**：copy-paste 残留，调用了 `CheckFragmentAddBreakpoints` 而非 `CheckFragmentRemoveBreakpoints`。形参名 `InFragments`（实际是 tags）也佐证。
-
-#### B11. `FMassFragmentRequirements::Reset()` 漏清 `bRequiresGameThreadExecution`
-- **位置**：`Private/MassRequirements.cpp::Reset()`
-- **现象**：`FMassSubsystemRequirements::Reset()` 是清零的，但 `FMassFragmentRequirements::Reset()` 漏掉。
-- **影响**：曾声明过 GT-only shared fragment 的 query Reset 后再加非 GT-only 需求，仍报 GT-only，造成不必要的 GT 串行化。
-
-#### B12. `FMassQueryRequirementIndicesMapping::IsEmpty()` 用 `||` 而非 `&&`
-- **位置**：`Internal/MassArchetypeData.h`
-- **现象**：`EntityFragments.Num() == 0 || ChunkFragments.Num() == 0`，只要任意一类为空就视作"empty"。
-- **影响**：只需 chunk fragment 不需 entity fragment 的 query 会被错误视作 empty。
-
-#### B13. `BatchGroupEntities` 缺失 observer 接入（已知 TODO）
-- **位置**：`Private/MassEntityManager.cpp:914-952`
-- **现象**：代码注释 `// we need something like the following to support observers` 直接保留。
-- **影响**：archetype group 变化无法被 observer 监听。
-
-#### B14. `MassChildOf.cpp::Execute` 硬编码 `FMassChildOfFragment::StaticStruct()`
-- **位置**：`Private/Relations/MassChildOf.cpp`
-- **现象**：注释说"this observer processor being used by relations that extend the ChildOf"，但代码硬编码 fragment 类型。
-- **影响**：派生关系类型若复用本 observer，会写错 fragment。建议改为 `RelationData.Traits.RoleTraits[Subject].Element`。
-
-#### B15. 已废弃的 `FMassFragmentRequirements` 构造函数总是 check 失败
-- **位置**：`Private/MassRequirements.cpp:421-435`
-- **现象**：`FMassFragmentRequirements(initializer_list)` / `(TConstArrayView)` 直接调 `AddRequirement`，但 `AddRequirement` 的 `checkf(bInitialized, ...)` 在没经过 `Initialize()` 的情况下必然触发。
-- **影响**：这两个构造函数不可用——任何调用都会崩。
-
-### 9.3 较低（设计不一致或可改进）
-
-- **`MoveAppend` 内 `GetAllocatedSize` 漏算 `AppendedCommandInstances` 自身数组**
-- **`FMassArchetypeCompositionDescriptor::DebugOutputDescription` 的 Empty 判定不完整**（只检查 3 个位集，忽略 Shared/ConstShared）
-- **`AddElementRequirement` 路由不完整**（不支持 chunk/shared/constShared）
-- **`FConcurrentEntityStorage::Release` 对槽位字段更新放在锁外**（理论上的 race window）
-- **多处文档 typo**：`equivelncy`、`deprevate`、`fall through on purse`、`Can go our of date`、`MagPageCount`、注释类名错误等
-- **多处死代码**：`PhaseConfig` 局部变量未使用、`PhaseDumpDependencyGraphFileName` 计算后未传递、Property 局部变量未使用
-- **多处遗留注释**：`Interfaces/ITextureFormat.h` 错误 include、`#undef WITH_RELATIONSHIP_VALIDATION` 空 undef、几处 `@todo` 长期未跟进
-
-### 9.4 文档/语义需明确化的"灰色区域"
-
-- **`FRelationTypeTraits::IsValid()` 仅声明未实现**——若有调用方使用会链接错误。
-- **30-bit Generation 而非 31-bit**：`FEntityData` 中 `bIsAllocated:1` + `uint32`，留出 30 位用途未文档化。
-- **`FMassRelationRoleInstanceHandle` 不存 SerialNumber**：handle 仅 8 字节（30+30+2 bit），运行时还原时通过 `EntityManager.CreateEntityIndexHandle` 拉取——是性能/正确性的取舍点。
-- **`FArchetypeGroups::GetID` 用 `IsValidIndex` 而非 `IsAllocated`**：可能读到稀疏数组中已销毁槽位的残留值。
-- **`FRelationManager` 递归限制 10 vs BFS 上限 64** 不一致——前者 destruction observer 链深度，后者查询步数，应提到命名常量。
-- **`FArchetypeGroupID(uint32)` 缺 `explicit`**：与 `FArchetypeGroupType` 不对称。
+→ 详见 BUGS.md §1。
 
 ---
 

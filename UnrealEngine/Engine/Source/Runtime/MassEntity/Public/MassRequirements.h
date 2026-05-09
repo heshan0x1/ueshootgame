@@ -856,7 +856,7 @@ protected:
 	 */
 	MASSENTITY_API void SortRequirements();
 
-	/** 自增 IncrementalChangesCount 并令 bPropertiesCached 失效。任何 Add*/Reset 都会调用。 */
+	/** 自增 IncrementalChangesCount 并令 bPropertiesCached 失效。任何 Add/Reset 都会调用。 */
 	void IncrementChangeCounter();
 	/** 上层（FMassEntityQuery::CacheArchetypes）确认已消费当前的变更后调用，归零计数。 */
 	void ConsumeIncrementalChangesCount();
@@ -1193,7 +1193,7 @@ inline bool FMassFragmentRequirements::DoesRequireGameThreadExecution() const
 	return bRequiresGameThreadExecution;
 }
 
-/** 任何 Add*/Reset 都调用：自增计数 + 让缓存失效。 */
+/** 任何 Add/Reset 都调用：自增计数 + 让缓存失效。 */
 inline void FMassFragmentRequirements::IncrementChangeCounter()
 { 
 	++IncrementalChangesCount; 

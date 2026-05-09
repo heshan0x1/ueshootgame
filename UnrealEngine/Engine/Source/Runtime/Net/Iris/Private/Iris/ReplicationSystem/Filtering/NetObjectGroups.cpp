@@ -409,8 +409,6 @@ void FNetObjectGroups::GetGroupHandlesOfNetObject(FInternalNetRefIndex InternalI
 	}
 }
 
-} // end namespace UE::Net::Private
-
 bool FNetObjectGroups::IsMemberOf(const FNetObjectGroupMembership& Target, FNetObjectGroupHandle Group)
 {
 	return Target.ContainsMembership(Group);

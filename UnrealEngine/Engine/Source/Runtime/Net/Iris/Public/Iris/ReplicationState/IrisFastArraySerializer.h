@@ -65,14 +65,12 @@ USTRUCT(Experimental)
 struct FIrisFastArraySerializer : public FFastArraySerializer
 {
 	// At the moment as we have no way to specify this per derived type, currently we reserve a fixed range of bits used for the changemask, the first bit is used for the array itself
-	enum {
-		// 元素 changemask 占 63 位（不含 array bit）。数组长度超过 63 时用 modulo 共享位。
-		IrisFastArrayChangeMaskBits = 63U,
-		// 元素 changemask 起始偏移（bit 0 是 array bit，因此元素位从 1 开始）。
-		IrisFastArrayChangeMaskBitOffset = 1U,
-		// "数组总体脏"位 —— 任意修改都会把它置位，作为外部的"全脏"快速通道。
-		IrisFastArrayPropertyBitIndex = 0U
-	};
+	// 元素 changemask 占 63 位（不含 array bit）。数组长度超过 63 时用 modulo 共享位。
+	enum { IrisFastArrayChangeMaskBits = 63U };
+	// 元素 changemask 起始偏移（bit 0 是 array bit，因此元素位从 1 开始）。
+	enum { IrisFastArrayChangeMaskBitOffset = 1U };
+	// "数组总体脏"位 —— 任意修改都会把它置位，作为外部的"全脏"快速通道。
+	enum { IrisFastArrayPropertyBitIndex = 0U };	
 
 	GENERATED_BODY()
 	IRISCORE_API FIrisFastArraySerializer();

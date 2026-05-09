@@ -195,18 +195,6 @@ FObjectScopeHysteresisUpdater::FLocalIndex FObjectScopeHysteresisUpdater::GetOrC
 	return LocalIndex;
 }
 
-// 释放 LocalIndex：仅清位图与反查 Map；LocalIndexToNetRefIndex 不维护"未占用槽位"的内容（节省一次写）。
-void FObjectScopeHysteresisUpdater::FreeLocalIndex(FLocalIndex LocalIndex)
-{
-	UsedLocalIndices.ClearBit(LocalIndex);
-	const FInternalNetRefIndex NetRefIndex = LocalIndexToNetRefIndex[LocalIndex];
-	NetRefIndexToLocalIndex.Remove(NetRefIndex);
-	ObjectsToUpdate.ClearBit(NetRefIndex);
-	// Intentionally not updating LocalIndexToNetRefIndex since it isn't accessed for unset local indices.
-}
-
-}
-
 /** Removes all objects in the bitarray vfrom hysteresis. */
 void FObjectScopeHysteresisUpdater::RemoveHysteresis(const FNetBitArrayView& ObjectsToRemove)
 {
@@ -338,6 +326,7 @@ FObjectScopeHysteresisUpdater::FLocalIndex FObjectScopeHysteresisUpdater::GetOrC
 	return LocalIndex;
 }
 
+// 释放 LocalIndex：仅清位图与反查 Map；LocalIndexToNetRefIndex 不维护"未占用槽位"的内容（节省一次写）。
 void FObjectScopeHysteresisUpdater::FreeLocalIndex(FLocalIndex LocalIndex)
 {
 	UsedLocalIndices.ClearBit(LocalIndex);
