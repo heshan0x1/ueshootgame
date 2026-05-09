@@ -22,7 +22,8 @@ from pathlib import Path
 
 DEFAULTS = {
     # Root paths
-    "engine_root":     r"D:\workspace\ShootGame\UnrealEngine",
+    # "engine_root":     r"D:\workspace\ShootGame\UnrealEngine",
+    "engine_root":     r"D:\workspace\UnrealEngine-Angelscript",
     "project_root":    r"D:\workspace\ShootGame\FirstPerson",
 
     # Build settings

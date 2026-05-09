@@ -1,5 +1,21 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================================
+// 文件作用：UFieldOfViewNetObjectPrioritizer —— 视野（FOV）感知打分器。
+// 几何形状（4 种几何区域，最终取 max）：
+//   1) 视锥（Cone）：以 ViewPos 为顶点，ViewDir 为中心轴；
+//                    长度 [0, ConeLength]，半张角由 ConeFieldOfViewDegrees 控制；
+//                    优先级在 [0, InnerConeLength] 内 = MaxConePriority，
+//                    在 [InnerConeLength, ConeLength] 线性衰减到 MinConePriority。
+//   2) 内球：半径 InnerSphereRadius，固定 InnerSpherePriority（不衰减）。
+//   3) 外球：半径 OuterSphereRadius，固定 OuterSpherePriority（不衰减）。
+//   4) 视线胶囊（Line of Sight）：沿 ViewDir 的胶囊，半径 LineOfSightWidth/2，长度同 ConeLength；
+//      固定 LineOfSightPriority。
+//   不在以上任何形状内：使用 OutsidePriority。
+// 多视图：每个视点独立计算后取 max（不像 Sphere 那样取最近视点——因为视锥与视点方向相关）。
+// 实现仍是 4-wide SIMD，但相比 Sphere 多了"投影到中心轴 / 距轴距离 / FOV 半径限制"几个判定。
+// =============================================================================================================================
+
 #pragma once
 
 #include "Iris/ReplicationSystem/Prioritization/LocationBasedNetObjectPrioritizer.h"
@@ -17,6 +33,7 @@ class UFieldOfViewNetObjectPrioritizerConfig : public UNetObjectPrioritizerConfi
 
 public:
 	/* Inner sphere radius that will set InnerSpherePriority on objects in it. */
+	// 内球半径（典型 3000 cm = 30 m）。
 	UPROPERTY(Config)
 	float InnerSphereRadius = 3000.0f;
 
@@ -25,6 +42,7 @@ public:
 	float InnerSpherePriority = 1.0f;
 
 	/* Outer sphere radius that will set OuterSpherePriority on objects in it. */
+	// 外球半径（典型 10000 cm = 100 m）。
 	UPROPERTY(Config)
 	float OuterSphereRadius = 10000.0f;
 
@@ -33,14 +51,17 @@ public:
 	float OuterSpherePriority = 0.2f;
 
 	/* The field of view used to form the cone. */
+	// 视锥总张角（degrees）。半角 = ConeFieldOfViewDegrees/2，决定锥半径 / 锥长比。
 	UPROPERTY(Config)
 	float ConeFieldOfViewDegrees = 45.0f;
 
 	/** Give max cone priority up to this length of the cone. */
+	// 视锥近端区间 [0, InnerConeLength] 全部享受 MaxConePriority。
 	UPROPERTY(Config)
 	float InnerConeLength = 3000.0f;
 
 	/** Total cone length. */
+	// 视锥全长。
 	UPROPERTY(Config)
 	float ConeLength = 20000.0f;
 
@@ -53,6 +74,7 @@ public:
 	float MaxConePriority = 1.0f;
 
 	/** Line of sight length is same as cone length but the width needs to be specified. */
+	// 视线胶囊宽度（直径），长度复用 ConeLength。
 	UPROPERTY(Config)
 	float LineOfSightWidth = 200.0f;
 
@@ -61,6 +83,7 @@ public:
 	float LineOfSightPriority = 1.0f;
 	
 	/** Priority outside the field of view cone, spheres and line of sight */
+	// 几何外兜底优先级。
 	UPROPERTY(Config)
 	float OutsidePriority = 0.1f;
 };
@@ -83,6 +106,7 @@ protected:
 	IRISCORE_API virtual void Prioritize(FNetObjectPrioritizationParams&) override;
 
 protected:
+	// SIMD 计算常量（4-wide 广播）。比 Sphere 多 4 类几何形状的预算。
 	struct FPriorityCalculationConstants
 	{
 		// Cone constants
@@ -93,6 +117,8 @@ protected:
 		// 1/ConeLengthDiff
 		VectorRegister InvConeLengthDiff;
 		// ConeLength/ConeRadius for cone radius calculations at various distances.
+		// "锥半径增长率" = tan(half_fov)，即每前进 1 单位中心轴距离锥半径增长多少；
+		// 用 ConeDist * ConeRadiusFactor 即可得到该位置的锥半径。
 		VectorRegister ConeRadiusFactor;
 		VectorRegister InnerConePriority;
 		VectorRegister OuterConePriority;
@@ -100,12 +126,14 @@ protected:
 		VectorRegister ConePriorityDiff;
 
 		// Inner and outer sphere constants
+		// 球用平方比较（避免 sqrt）。
 		VectorRegister InnerSphereRadiusSqr;
 		VectorRegister OuterSphereRadiusSqr;
 		VectorRegister InnerSpherePriority;
 		VectorRegister OuterSpherePriority;
 
 		// Line of sight constants
+		// 胶囊半径平方（用半宽的平方）。
 		VectorRegister LineOfSightRadiusSqr;
 		VectorRegister LineOfSightPriority;
 

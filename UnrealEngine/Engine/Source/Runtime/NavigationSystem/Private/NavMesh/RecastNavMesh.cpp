@@ -1,5 +1,31 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// ============================================================================
+// 文件概览：RecastNavMesh.cpp
+// ----------------------------------------------------------------------------
+// 本文件是 ARecastNavMesh（ANavigationData 的 Recast 实现 Actor）的主体实现。
+// 主要职责：
+//   1) UObject 生命周期（Ctor/Serialize/PostLoad/PostInitProperties/BeginPlay）
+//   2) Filter / Area / 命名过滤器（NamedFilters）的维护
+//   3) 调试绘制参数 + 调试几何收集（GetDebugGeometryForTile 等）
+//   4) 向外公开的查询 API：FindPath / TestPath / NavMeshRaycast / ProjectPoint /
+//      BatchRaycast / GetRandomPoint / FindMoveAlongSurface / FindDistanceToWall ...
+//   5) Tile / Poly 级操作：GetNavMeshTilesAt / GetPolyCenter / GetPolyVerts /
+//      GetPolyFlags / UpdateCustomLink 等
+//   6) 序列化：NavMesh 版本号控制 + SerializeRecastNavMesh；Tile 数据打包/解包
+//   7) 生成器桥接：ConditionalConstructGenerator / RebuildTile / DirtyTilesInBounds /
+//      OnNavMeshTilesUpdated / InvalidateAffectedPaths
+// 
+// 关键模式：
+//   * 绝大多数公有查询 API 仅做一层薄封装——校验 RecastNavMeshImpl 非空，
+//     然后"转发到 FPImplRecastNavMesh::XXX"（Pimpl 里才真正调用 Detour）。
+//   * 异步生成开启时（RECAST_ASYNC_REBUILDING=1），所有对 Tile 数据的读取都
+//     需要用 BeginBatchQuery / FinishBatchQuery 包一层 Critical Section。
+//   * 术语：NavMesh / Tile / Poly / Filter / Octree / NavData / Agent /
+//     StringPull / PathCorridor / Detour。AreaID 为 uint8（最多 64 种，见
+//     RECAST_MAX_AREAS / RECAST_NULL_AREA / RECAST_DEFAULT_AREA）。
+// ============================================================================
+
 #include "NavMesh/RecastNavMesh.h"
 #include "Misc/Paths.h"
 #include "EngineGlobals.h"
@@ -100,6 +126,7 @@ namespace UE::NavMesh::Private
 #endif // WITH_RECAST
 } // namespace UE::NavMesh::Private
 
+// 从已加载的 dtMeshTile 反推 Tile 字节布局：读 header 里的各段数量后交给 InitFromSizeInfo。
 FDetourTileLayout::FDetourTileLayout(const dtMeshTile& tile)
 {
 #if WITH_RECAST
@@ -132,11 +159,13 @@ FDetourTileLayout::FDetourTileLayout(const dtMeshTile& tile)
 #endif // WITH_RECAST
 }
 
+// 直接从 FDetourTileSizeInfo 构造 Tile 布局；在序列化 / 预估 Tile 大小时使用。
 FDetourTileLayout::FDetourTileLayout(const FDetourTileSizeInfo& SizeInfo)
 {
 	InitFromSizeInfo(SizeInfo);
 }
 
+// 按 Detour 的字节对齐要求算出每段（Verts/Polys/Links/DetailMesh/BV/OffMesh/...）的偏移与 TileSize 总长。
 void FDetourTileLayout::InitFromSizeInfo(const FDetourTileSizeInfo& SizeInfo)
 {
 #if WITH_RECAST
@@ -166,6 +195,7 @@ void FDetourTileLayout::InitFromSizeInfo(const FDetourTileSizeInfo& SizeInfo)
 }
 
 
+// 释放 Tile 持有的 RawNavData；Recast 环境走 Detour 的 dtFree，否则走引擎内存分配器。
 FNavMeshTileData::FNavData::~FNavData()
 {
 #if WITH_RECAST
@@ -175,6 +205,7 @@ FNavMeshTileData::FNavData::~FNavData()
 #endif // WITH_RECAST
 }
 
+// 判断某个 Tile 坐标 (TileX,TileY) 是否落在调试指定的单点/矩形范围内（编辑器 Tile 调试用）。
 bool FRecastNavMeshTileGenerationDebug::IsWithinTileCoordinates(const int32 TileX, const int32 TileY) const
 {
 	if (bUseMaxTileCoordinate)
@@ -187,6 +218,7 @@ bool FRecastNavMeshTileGenerationDebug::IsWithinTileCoordinates(const int32 Tile
 }
 
 // Temporary test to narrow a crash.
+// 诊断用：触碰 RawNavData 首字节并校验分配大小，以便在崩溃前暴露野指针。
 void FNavMeshTileData::FNavData::TestPtr() const
 {
 	if (RawNavData != nullptr)
@@ -199,6 +231,7 @@ void FNavMeshTileData::FNavData::TestPtr() const
 	}
 }
 
+// 构造 Tile 数据装箱：记录大小、层索引、层包围盒，并把 RawData 包进共享 FNavData。
 FNavMeshTileData::FNavMeshTileData(uint8* RawData, int32 RawDataSize, int32 LayerIdx, FBox LayerBounds)
 	: LayerIndex(LayerIdx)
 	, LayerBBox(LayerBounds)
@@ -208,6 +241,7 @@ FNavMeshTileData::FNavMeshTileData(uint8* RawData, int32 RawDataSize, int32 Laye
 	NavData = MakeShareable(new FNavData(RawData, DataSize));
 }
 
+// 析构：仅当最后一个引用释放时扣减 TileCache 内存统计。
 FNavMeshTileData::~FNavMeshTileData()
 {
 	if (NavData.IsUnique() && NavData->GetRawNavData())
@@ -217,6 +251,7 @@ FNavMeshTileData::~FNavMeshTileData()
 	}
 }
 
+// 交出 RawNavData 所有权给调用方（典型用法：把 Tile Bytes 移交给 Detour），并重置本装箱。
 uint8* FNavMeshTileData::Release()
 {
 	uint8* RawData = nullptr;
@@ -233,6 +268,7 @@ uint8* FNavMeshTileData::Release()
 	return RawData;
 }
 
+// 若当前 RawNavData 被多个 FNavMeshTileData 共享，则深拷贝出独立副本（避免修改互相影响）。
 void FNavMeshTileData::MakeUnique()
 {
 	if (DataSize > 0 && !NavData.IsUnique())
@@ -265,10 +301,12 @@ FVector::FReal ARecastNavMesh::DrawDistanceSq = 0.;
 float ARecastNavMesh::MinimumSizeForChaosNavMeshInfluenceSq = 0.0f;
 #if !WITH_RECAST
 
+// 非 Recast 构建下的空壳构造；真正功能依赖 WITH_RECAST=1。
 ARecastNavMesh::ARecastNavMesh(const FObjectInitializer& ObjectInitializer) : Super(ObjectInitializer)
 {
 }
 
+// 非 Recast 构建下的序列化：跳过 NavMesh 字节块并将自身标记销毁（需重新生成）。
 void ARecastNavMesh::Serialize( FArchive& Ar )
 {
 	Super::Serialize(Ar);
@@ -295,11 +333,13 @@ void ARecastNavMesh::Serialize( FArchive& Ar )
 	}
 }
 
+// 非 Recast 构建下的析构（空）。
 ARecastNavMesh::~ARecastNavMesh()
 {
 }
 
 #if WITH_EDITOR
+// 非 Recast 构建下禁止编辑所有属性（避免在无 Recast 支持时修改生成参数）。
 bool ARecastNavMesh::CanEditChange(const FProperty* InProperty) const
 {
 	return false;
@@ -316,6 +356,7 @@ bool ARecastNavMesh::CanEditChange(const FProperty* InProperty) const
 //----------------------------------------------------------------------//
 // FRecastDebugGeometry
 //----------------------------------------------------------------------//
+// 汇总调试几何自身占用的内存大小（所有顶点 / 索引 / OffMeshLink 数组）。
 uint32 FRecastDebugGeometry::GetAllocatedSize() const
 {
 	SIZE_T Size = sizeof(*this) + MeshVerts.GetAllocatedSize()
@@ -356,6 +397,7 @@ uint32 FRecastDebugGeometry::GetAllocatedSize() const
 // FNavTileRef
 //----------------------------------------------------------------------//
 
+// 兼容旧 API：从 64 位 FNavTileRef 数组反解出 32 位 TileId 数组（仅供已弃用函数使用）。
 // Only use for deprecation
 void FNavTileRef::DeprecatedGetTileIdsFromNavTileRefs(const FPImplRecastNavMesh* RecastNavMeshImpl, const TArray<FNavTileRef>& InTileRefs, TArray<uint32>& OutTileIds)
 {
@@ -372,6 +414,7 @@ void FNavTileRef::DeprecatedGetTileIdsFromNavTileRefs(const FPImplRecastNavMesh*
 	}
 }
 
+// 兼容旧 API：由 TileId 数组重建 FNavTileRef（Salt 填 0，仅供已弃用函数使用）。
 // Only use for deprecation
 void FNavTileRef::DeprecatedMakeTileRefsFromTileIds(const FPImplRecastNavMesh* RecastNavMeshImpl, const TArray<uint32>& InTileIds, TArray<FNavTileRef>& OutTileRefs)
 {
@@ -410,6 +453,7 @@ namespace FNavMeshConfig
 {
 	ARecastNavMesh::FNavPolyFlags NavLinkFlag = ARecastNavMesh::FNavPolyFlags(0);
 
+	// 初始化进程级命名过滤器：NavLinkFlag 占 dtPoly::flags 最高位，过滤掉 NavLink / 非默认 Area 或两者组合。
 	FRecastNamedFiltersCreator::FRecastNamedFiltersCreator(bool bVirtualFilters)
 	{
 		// setting up the last bit available in dtPoly::flags
@@ -435,6 +479,7 @@ namespace FNavMeshConfig
 
 #endif // WITH_RECAST
 
+// 默认构造 Tile 调试参数：全部调试开关归零，坐标归零。
 FRecastNavMeshTileGenerationDebug::FRecastNavMeshTileGenerationDebug()
 {
 	bEnabled = false;
@@ -468,6 +513,9 @@ FRecastNavMeshTileGenerationDebug::FRecastNavMeshTileGenerationDebug()
 
 ARecastNavMesh::FNavPolyFlags ARecastNavMesh::NavLinkFlag = ARecastNavMesh::FNavPolyFlags(0);
 
+// ARecastNavMesh 正式构造：初始化调试开关 / 分区算法 / 生成参数默认值；
+// 非 CDO 时创建 FPImplRecastNavMesh 并把 FindPath/TestPath/Raycast 静态入口
+// 挂到基类函数指针；同时预注册 Null/LowHeight/Default 三个保留 Area。
 ARecastNavMesh::ARecastNavMesh(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 	, bDrawFilledPolys(true)
@@ -543,6 +591,7 @@ PRAGMA_ENABLE_DEPRECATION_WARNINGS
 	}
 }
 
+// 析构：扣减内存统计并销毁 PImpl（释放 dtNavMesh 及相关资源）。
 ARecastNavMesh::~ARecastNavMesh()
 {
 	if (HasAnyFlags(RF_ClassDefaultObject) == false)
@@ -552,6 +601,7 @@ ARecastNavMesh::~ARecastNavMesh()
 	}
 }
 
+// 显式销毁 FPImplRecastNavMesh（供析构 / 重新加载 Tile 数据前调用）。
 void ARecastNavMesh::DestroyRecastPImpl()
 {
 	if (RecastNavMeshImpl != NULL)
@@ -561,11 +611,13 @@ void ARecastNavMesh::DestroyRecastPImpl()
 	}
 }
 
+// 构造用于绘制 NavMesh 的 UPrimitiveComponent（渲染由 UNavMeshRenderingComponent 负责）。
 UPrimitiveComponent* ARecastNavMesh::ConstructRenderingComponent() 
 {
 	return NewObject<UNavMeshRenderingComponent>(this, TEXT("NavRenderingComp"), RF_Transient);
 }
 
+// 在编辑器中触发 NavMesh 调试渲染组件的重绘（非 Shipping）。
 void ARecastNavMesh::UpdateNavMeshDrawing()
 {
 #if !UE_BUILD_SHIPPING
@@ -580,6 +632,7 @@ void ARecastNavMesh::UpdateNavMeshDrawing()
 #endif // UE_BUILD_SHIPPING
 }
 
+// 在生成器重建 NavMesh 之前（编辑器里），若工程采用 WorldPartition 则先把可导航区加载进来。
 void ARecastNavMesh::LoadBeforeGeneratorRebuild()
 {
 #if WITH_EDITOR
@@ -608,6 +661,7 @@ void ARecastNavMesh::LoadBeforeGeneratorRebuild()
 #endif //WITH_EDITOR
 }
 
+// ANavigationData::CleanUp 的 Recast 实现：取消进行中的生成任务、销毁 PImpl。
 void ARecastNavMesh::CleanUp()
 {
 	Super::CleanUp();
@@ -620,6 +674,8 @@ void ARecastNavMesh::CleanUp()
 	DestroyRecastPImpl();
 }
 
+// PostLoad：根据加载时的 NavMeshVersion 做字段迁移（TileResolutions / CellHeight /
+// AgentMaxStepHeight / NavLinkJumpConfigs），并重建默认过滤器、预览 PolyRef 位宽。
 void ARecastNavMesh::PostLoad()
 {
 	UE_LOG(LogNavigation, Verbose, TEXT("%hs %s"), __FUNCTION__, *GetFullNameSafe(this));
@@ -706,6 +762,7 @@ void ARecastNavMesh::PostLoad()
 	UpdatePolyRefBitsPreview();
 }
 
+// 开始销毁前移除 NavigationSystem 的 OnNavigationInitStart 回调，避免悬挂引用。
 void ARecastNavMesh::BeginDestroy()
 {
 	UNavigationSystemBase::OnNavigationInitStartStaticDelegate().RemoveAll(this);
@@ -713,6 +770,7 @@ void ARecastNavMesh::BeginDestroy()
 	Super::BeginDestroy();
 }
 
+// 若当前 Actor 位于子关卡而不在 PersistentLevel，则在 NavSys 初始化时丢弃它（避免多份 NavMesh 冲突）。
 void ARecastNavMesh::CheckToDiscardSubLevelNavData(const UNavigationSystemBase& BaseNavSys)
 {
 	// This used to be in ARecastNavMesh::PostInitProperties() but the OwningWorld is not always available, it might be too soon to query it.
@@ -736,6 +794,7 @@ void ARecastNavMesh::CheckToDiscardSubLevelNavData(const UNavigationSystemBase& 
 	}
 }
 
+// 将已生成的 Jump NavLink Proxy 注册到 NavigationSystem（跳下 / 跳跃类自动生成的 NavLink 入口）。
 void ARecastNavMesh::RegisterGeneratedLinksProxy()
 {
 	for (FNavLinkGenerationJumpConfig& NavLinkJumpConfig : NavLinkJumpConfigs)
@@ -757,6 +816,7 @@ void ARecastNavMesh::RegisterGeneratedLinksProxy()
 	}
 }
 
+// 反向操作：从 NavigationSystem 注销所有 Jump NavLink Proxy（卸载 / 重建前调用）。
 void ARecastNavMesh::UnregisterGeneratedLinksProxy()
 {
 	for (FNavLinkGenerationJumpConfig& NavLinkJumpConfig : NavLinkJumpConfigs)
@@ -779,6 +839,7 @@ void ARecastNavMesh::UnregisterGeneratedLinksProxy()
 }
 
 // Deprecated
+// 旧 API：创建跳下（JumpDown）NavLink Proxy 并注册；新代码请改用 CreateAndRegisterJumpLinksProxy。
 void ARecastNavMesh::CreateAndRegisterJumpDownLinksProxy(const FNavLinkId LinkProxyId /*= FNavLinkId::GenerateUniqueId()*/)
 {
 #if WITH_EDITORONLY_DATA
@@ -802,6 +863,7 @@ void ARecastNavMesh::CreateAndRegisterJumpDownLinksProxy(const FNavLinkId LinkPr
 #endif // WITH_EDITORONLY_DATA	
 }
 
+// 按给定的 Jump Config 创建 NavLink Proxy UObject，并通过 RegisterGeneratedLinksProxy 注册。
 void ARecastNavMesh::CreateAndRegisterJumpLinksProxy(FNavLinkGenerationJumpConfig& InOutNavLinkJumpConfig, 
 	const FNavLinkId LinkProxyId /*= FNavLinkId::GenerateUniqueId()*/)
 {
@@ -822,6 +884,7 @@ void ARecastNavMesh::CreateAndRegisterJumpLinksProxy(FNavLinkGenerationJumpConfi
 	}
 }
 
+// 所有组件注册完毕：若 Actor 非零位移则把位移应用到 NavMesh；对启用了 NavLink 生成的 Jump 配置建 Proxy。
 void ARecastNavMesh::PostRegisterAllComponents()
 {
 	Super::PostRegisterAllComponents();
@@ -843,6 +906,7 @@ void ARecastNavMesh::PostRegisterAllComponents()
 	}
 }
 
+// 组件反注册：注销 NavLink Proxy 并清空 LinkProxy 引用。
 void ARecastNavMesh::PostUnregisterAllComponents()
 {
 	Super::PostUnregisterAllComponents();
@@ -855,6 +919,8 @@ void ARecastNavMesh::PostUnregisterAllComponents()
 	}
 }
 
+// 属性初始化完成：对 CDO 构造进程级命名过滤器；对实例重建默认过滤器，并校正 VoxelCache
+// 要求所有 NavMesh 共用 TileSizeUU / CellSize 的一致性。
 void ARecastNavMesh::PostInitProperties()
 {
 	if (HasAnyFlags(RF_ClassDefaultObject) == true)
@@ -934,6 +1000,8 @@ void ARecastNavMesh::PostInitProperties()
 	UpdatePolyRefBitsPreview();
 }
 
+// 重建 DefaultQueryFilter：按 SupportedAreas 把每个 Area 的默认代价同步进 FRecastQueryFilter；
+// 清除 NavLink flag 以避免对 AreaFlags==0 的 NavLink 误放行。
 void ARecastNavMesh::RecreateDefaultFilter()
 {
 	DefaultQueryFilter->SetFilterType<FRecastQueryFilter>();
@@ -967,6 +1035,7 @@ void ARecastNavMesh::RecreateDefaultFilter()
 	}
 }
 
+// 计算并缓存 dtPolyRef 的位宽预览（Tile / Poly / Salt 三段），用于编辑器面板显示 + 容量校验。
 void ARecastNavMesh::UpdatePolyRefBitsPreview()
 {
 	static const int32 TotalBits = (sizeof(dtPolyRef) * 8);
@@ -975,6 +1044,7 @@ void ARecastNavMesh::UpdatePolyRefBitsPreview()
 	PolyRefSaltBits = TotalBits - PolyRefTileBits - PolyRefNavPolyBits;
 }
 
+// 新的 NavArea 被注册到系统时：同步默认过滤器代价、通知生成器刷新缓存（OnAreaAdded）。
 void ARecastNavMesh::OnNavAreaAdded(const UClass* NavAreaClass, int32 AgentIndex)
 {
 	Super::OnNavAreaAdded(NavAreaClass, AgentIndex);
@@ -997,6 +1067,7 @@ void ARecastNavMesh::OnNavAreaAdded(const UClass* NavAreaClass, int32 AgentIndex
 	}
 }
 
+// NavArea 被从系统移除时：仅通知生成器同步缓存（默认过滤器的 AreaCost 不再复位，见注释说明）。
 void ARecastNavMesh::OnNavAreaRemoved(const UClass* NavAreaClass)
 {
 	// In an ideal world we'd reset the DefaultQueryFilter Costs here for the AreaID but its
@@ -1011,6 +1082,7 @@ void ARecastNavMesh::OnNavAreaRemoved(const UClass* NavAreaClass)
 	Super::OnNavAreaRemoved(NavAreaClass);
 }
 
+// Area 代价被改动：通知 PImpl 让所有 cached Filter 重新采样 Area 代价。
 void ARecastNavMesh::OnNavAreaChanged()
 {
 	if (RecastNavMeshImpl)
@@ -1019,6 +1091,7 @@ void ARecastNavMesh::OnNavAreaChanged()
 	}
 }
 
+// 为新 NavArea 分配 AreaID：保留位 Null/LowHeight/Default 特判，其余从父类分配并跳过保留 ID。
 int32 ARecastNavMesh::GetNewAreaID(const UClass* AreaClass) const
 {
 	if (AreaClass == FNavigationSystem::GetDefaultWalkableArea())
@@ -1046,6 +1119,7 @@ int32 ARecastNavMesh::GetNewAreaID(const UClass* AreaClass) const
 	return FreeAreaID;
 }
 
+// 查询某个 AreaID 对应 UNavArea 的调试绘制颜色（未知则红色兜底）。
 FColor ARecastNavMesh::GetAreaIDColor(uint8 AreaID) const
 {
 	const UClass* AreaClass = GetAreaClass(AreaID);
@@ -1053,6 +1127,8 @@ FColor ARecastNavMesh::GetAreaIDColor(uint8 AreaID) const
 	return DefArea ? DefArea->DrawColor : FColor::Red;
 }
 
+// 生成器在标记 Tile 前把 Area Modifier 按代价升序排序：Replace 语义的排最后以便覆盖 Apply，
+// 代价 / 固定进入代价 / NavMesh 分辨率依次作为排序键。
 void ARecastNavMesh::SortAreasForGenerator(TArray<FRecastAreaNavModifierElement>& Modifiers) const
 {
 	// initialize costs for sorting
@@ -1112,6 +1188,7 @@ void ARecastNavMesh::SortAreasForGenerator(TArray<FRecastAreaNavModifierElement>
 	Modifiers.Sort(FNavAreaSortPredicate());
 }
 
+// 返回当前活跃 Tile 坐标集合（只读 & 可写两个重载）——用于动态生成模式的 Tile 流式加载/卸载决策。
 const TSet<FIntPoint>& ARecastNavMesh::GetActiveTileSet() const
 {
 	const FRecastNavMeshGenerator* MyGenerator = static_cast<const FRecastNavMeshGenerator*>(GetGenerator());
@@ -1126,6 +1203,7 @@ TSet<FIntPoint>& ARecastNavMesh::GetActiveTileSet()
 	return MyGenerator->ActiveTileSet;
 }
 
+// VLog 工具：输出"(TileX,TileY:Layer) OpName TileId/Salt/TileRef"，用于 Tile 操作追踪。
 void ARecastNavMesh::LogRecastTile(const TCHAR* Caller, const FName& Prefix, const FName& OperationName, const dtNavMesh& DetourMesh, const int32 TileX, const int32 TileY, const int32 LayerIndex, const dtTileRef TileRef) const
 {
 	UE_LOG(LogNavigation, VeryVerbose, TEXT("%s> %s Tile (%d,%d:%d), %s TileId: %d, Salt: %d, TileRef: 0x%llx (%s)"),
@@ -1135,6 +1213,7 @@ void ARecastNavMesh::LogRecastTile(const TCHAR* Caller, const FName& Prefix, con
 		   Caller);
 }
 
+// 动态模式开关：限制生成器只在 ActiveTileSet 范围内构建 Tile（大世界 / 流式世界典型用法）。
 void ARecastNavMesh::RestrictBuildingToActiveTiles(bool InRestrictBuildingToActiveTiles)
 {
 	FRecastNavMeshGenerator* MyGenerator = static_cast<FRecastNavMeshGenerator*>(GetGenerator());
@@ -1144,6 +1223,7 @@ void ARecastNavMesh::RestrictBuildingToActiveTiles(bool InRestrictBuildingToActi
 	}
 }
 
+// Actor 被注册时：若 PImpl 已被 CleanUp 销毁则重建，随后走基类注册。
 void ARecastNavMesh::OnRegistered()
 {
 	// (Re)allocate if necessary (might have been destroyed by a call to Cleanup)
@@ -1159,6 +1239,7 @@ void ARecastNavMesh::OnRegistered()
 	Super::OnRegistered();
 }
 
+// 把"实际的 Detour Tile 数据"序列化到归档；加载时按需分配 PImpl，然后转发到 FPImplRecastNavMesh::Serialize。
 void ARecastNavMesh::SerializeRecastNavMesh(FArchive& Ar, FPImplRecastNavMesh*& NavMesh, int32 InNavMeshVersion)
 {
 	if (!Ar.IsLoading()	&& NavMesh == NULL)
@@ -1181,6 +1262,8 @@ void ARecastNavMesh::SerializeRecastNavMesh(FArchive& Ar, FPImplRecastNavMesh*& 
 	}	
 }
 
+// Actor 级序列化入口：写 NavMeshVersion + 占位长度 + NavMesh 主体字节；
+// 加载时按版本号做兼容，不匹配时跳过整块数据（NavMesh 需要重建）。
 void ARecastNavMesh::Serialize( FArchive& Ar )
 {
 	Super::Serialize(Ar);
@@ -1256,6 +1339,7 @@ void ARecastNavMesh::Serialize( FArchive& Ar )
 }
 
 #if WITH_EDITOR
+// 编辑器可编辑性过滤：未启用 Cluster Links 时隐藏 bDrawClusters 属性。
 bool ARecastNavMesh::CanEditChange(const FProperty* InProperty) const
 {
 #if !WITH_NAVMESH_CLUSTER_LINKS
@@ -1273,6 +1357,7 @@ bool ARecastNavMesh::CanEditChange(const FProperty* InProperty) const
 }
 #endif // WITH_EDITOR
 
+// 应用 FNavDataConfig：同步 AgentHeight/Radius/StepHeight 到 ARecastNavMesh，处理 StepHeight 覆盖规则。
 void ARecastNavMesh::SetConfig(const FNavDataConfig& Src) 
 {
 	// Step 1: set NavDataConfig
@@ -1301,6 +1386,7 @@ void ARecastNavMesh::SetConfig(const FNavDataConfig& Src)
 	}
 }
 
+// 反向：把当前 NavMesh 的 Agent 参数回填到 Dest FNavDataConfig（供 NavigationSystem 复制）。
 void ARecastNavMesh::FillConfig(FNavDataConfig& Dest)
 {
 	Dest = NavDataConfig;
@@ -1309,6 +1395,7 @@ void ARecastNavMesh::FillConfig(FNavDataConfig& Dest)
 	Dest.AgentStepHeight = GetAgentMaxStepHeight(ENavigationDataResolution::Default);
 }
 
+// 批量查询开始：在 RECAST_ASYNC_REBUILDING 下递增计数，阻止生成线程移除 Tile 数据。嵌套调用安全。
 void ARecastNavMesh::BeginBatchQuery() const
 {
 #if RECAST_ASYNC_REBUILDING
@@ -1321,6 +1408,7 @@ void ARecastNavMesh::BeginBatchQuery() const
 #endif // RECAST_ASYNC_REBUILDING
 }
 
+// 批量查询结束：递减计数；归零后生成线程才可继续修改 Tile 数据。
 void ARecastNavMesh::FinishBatchQuery() const
 {
 #if RECAST_ASYNC_REBUILDING
@@ -1328,6 +1416,7 @@ void ARecastNavMesh::FinishBatchQuery() const
 #endif // RECAST_ASYNC_REBUILDING
 }
 
+// 返回整张 NavMesh 的世界空间 AABB（无 NavMesh 时返回空 Box）。转发到 FPImplRecastNavMesh。
 FBox ARecastNavMesh::GetNavMeshBounds() const
 {
 	FBox Bounds;
@@ -1340,6 +1429,7 @@ FBox ARecastNavMesh::GetNavMeshBounds() const
 }
 
 // Deprecated
+// 旧 API：按 TileIndex 取 Tile 包围盒；内部把 TileIndex 转 FNavTileRef 再走新路径。
 FBox ARecastNavMesh::GetNavMeshTileBounds(int32 TileIndex) const
 {
 	if (RecastNavMeshImpl && (TileIndex != INDEX_NONE))
@@ -1352,6 +1442,7 @@ FBox ARecastNavMesh::GetNavMeshTileBounds(int32 TileIndex) const
 	return FBox(ForceInit);
 }
 
+// 新 API：按 FNavTileRef 取对应 dtMeshTile 的 AABB（Recast 坐标转 Unreal）。
 FBox ARecastNavMesh::GetNavMeshTileBounds(FNavTileRef TileRef) const
 {
 	FBox Bounds(ForceInit);
@@ -1376,6 +1467,7 @@ FBox ARecastNavMesh::GetNavMeshTileBounds(FNavTileRef TileRef) const
 }
 
 // Deprecated
+// 旧 API：按 TileIndex 取 (X,Y,Layer) 坐标；通过 FNavTileRef 转接。
 bool ARecastNavMesh::GetNavMeshTileXY(int32 TileIndex, int32& OutX, int32& OutY, int32& OutLayer) const
 {
 	if (RecastNavMeshImpl && (TileIndex != INDEX_NONE))
@@ -1387,6 +1479,7 @@ bool ARecastNavMesh::GetNavMeshTileXY(int32 TileIndex, int32& OutX, int32& OutY,
 	return false;
 }
 
+// 新 API：按 FNavTileRef 从 dtMeshHeader 读出 Tile 的 (X,Y,Layer)。
 bool ARecastNavMesh::GetNavMeshTileXY(FNavTileRef TileRef, int32& OutX, int32& OutY, int32& OutLayer) const
 {
 	if (HasValidNavmesh() && TileRef.IsValid())
@@ -1411,12 +1504,14 @@ bool ARecastNavMesh::GetNavMeshTileXY(FNavTileRef TileRef, int32& OutX, int32& O
 	return false;
 }
 
+// 由世界空间点反查所在 Tile 的 (X,Y)。转发到 FPImplRecastNavMesh::GetNavMeshTileXY。
 bool ARecastNavMesh::GetNavMeshTileXY(const FVector& Point, int32& OutX, int32& OutY) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetNavMeshTileXY(Point, OutX, OutY);
 }
 
 // Deprecated
+// 旧 API：按 TileIndex 取 Tile 分辨率（Low/Default/High）。
 bool ARecastNavMesh::GetNavmeshTileResolution(int32 TileIndex, ENavigationDataResolution& OutResolution) const
 {
 	if (RecastNavMeshImpl && (TileIndex != INDEX_NONE))
@@ -1429,6 +1524,7 @@ bool ARecastNavMesh::GetNavmeshTileResolution(int32 TileIndex, ENavigationDataRe
 	return false;
 }
 
+// 新 API：按 FNavTileRef 从 dtMeshHeader::resolution 读取 Tile 分辨率等级。
 bool ARecastNavMesh::GetNavmeshTileResolution(FNavTileRef TileRef, ENavigationDataResolution& OutResolution) const
 {
 	if (RecastNavMeshImpl)
@@ -1449,6 +1545,7 @@ bool ARecastNavMesh::GetNavmeshTileResolution(FNavTileRef TileRef, ENavigationDa
 	return false;
 }
 
+// 检查某世界点是否会落在 Recast 支持的 Tile 索引范围内（避免大世界坐标溢出 int16）。
 bool ARecastNavMesh::CheckTileIndicesInValidRange(const FVector& Point, bool& bOutInRange) const
 {
 	const dtNavMesh* const DetourNavMesh = RecastNavMeshImpl ? RecastNavMeshImpl->DetourNavMesh : nullptr;
@@ -1464,6 +1561,7 @@ bool ARecastNavMesh::CheckTileIndicesInValidRange(const FVector& Point, bool& bO
 }
 
 // Deprecated
+// 旧 API：获取 (TileX,TileY) 处所有层 Tile 的 TileIndex 列表。
 void ARecastNavMesh::GetNavMeshTilesAt(int32 TileX, int32 TileY, TArray<int32>& Indices) const
 {
 	if (RecastNavMeshImpl)
@@ -1478,6 +1576,7 @@ void ARecastNavMesh::GetNavMeshTilesAt(int32 TileX, int32 TileY, TArray<int32>& 
 	}
 }
 
+// 新 API：获取 (TileX,TileY) 处所有层 Tile 的 FNavTileRef（按 Tile 层数遍历 dtNavMesh）。
 void ARecastNavMesh::GetNavMeshTilesAt(int32 TileX, int32 TileY, TArray<FNavTileRef>& OutRefs) const
 {	
 	if (HasValidNavmesh())
@@ -1501,6 +1600,7 @@ void ARecastNavMesh::GetNavMeshTilesAt(int32 TileX, int32 TileY, TArray<FNavTile
 	}
 }
 
+// 枚举当前 dtNavMesh 内所有已分配 Tile 的 FNavTileRef（跳过空 Tile）。
 void ARecastNavMesh::GetAllNavMeshTiles(TArray<FNavTileRef>& OutRefs) const
 {
 	if (HasValidNavmesh())
@@ -1949,6 +2049,8 @@ bool ARecastNavMesh::FindOverlappingEdges(const FNavLocation& StartLocation, TCo
 	return false;
 }
 
+// 在路径的某一段（StartPoint→EndPoint）沿 PathCorridor 找 SearchArea 内的边界墙段，结果写入 OutEdges。
+// 直接调用 Detour 的 findWallsAroundPath。
 bool ARecastNavMesh::GetPathSegmentBoundaryEdges(const FNavigationPath& Path, const FNavPathPoint& StartPoint, const FNavPathPoint& EndPoint, const TConstArrayView<FVector> SearchArea, TArray<FVector>& OutEdges, const float MaxAreaEnterCost, FSharedConstNavQueryFilter Filter, const UObject* Querier) const
 {
 	if (RecastNavMeshImpl == NULL || RecastNavMeshImpl->DetourNavMesh == NULL)
@@ -2032,6 +2134,7 @@ bool ARecastNavMesh::GetPathSegmentBoundaryEdges(const FNavigationPath& Path, co
 	return false;
 }
 
+// 把一个点投影到 NavMesh 上（单点版本）。转发给 FPImplRecastNavMesh::ProjectPointToNavMesh。
 bool ARecastNavMesh::ProjectPoint(const FVector& Point, FNavLocation& OutLocation, const FVector& Extent, FSharedConstNavQueryFilter Filter, const UObject* QueryOwner) const
 {
 	bool bSuccess = false;
@@ -2043,6 +2146,7 @@ bool ARecastNavMesh::ProjectPoint(const FVector& Point, FNavLocation& OutLocatio
 	return bSuccess;
 }
 
+// 判断 NodeRef 是否对应当前 NavMesh 中一块合法的 Tile+Poly（通过 getTileAndPolyByRef 判断）。
 bool ARecastNavMesh::IsNodeRefValid(NavNodeRef NodeRef) const
 {
 	if (NodeRef == INVALID_NAVNODEREF)
@@ -2061,6 +2165,7 @@ bool ARecastNavMesh::IsNodeRefValid(NavNodeRef NodeRef) const
 	return bSuccess;
 }
 
+// 批量投影：对一组点用同一个 Extent 搜索最近的 Poly。原地写回每个 Work 的 OutLocation/bResult。
 void ARecastNavMesh::BatchProjectPoints(TArray<FNavigationProjectionWork>& Workload, const FVector& Extent, FSharedConstNavQueryFilter Filter, const UObject* Querier) const 
 {
 	if (Workload.Num() == 0 || RecastNavMeshImpl == NULL || RecastNavMeshImpl->DetourNavMesh == NULL)
@@ -2107,6 +2212,7 @@ void ARecastNavMesh::BatchProjectPoints(TArray<FNavigationProjectionWork>& Workl
 	}
 }
 
+// 批量投影重载：每个 Work 自带 ProjectionLimit（AABB），投影以各自的 Box 中心 + 半尺寸为搜索范围。
 void ARecastNavMesh::BatchProjectPoints(TArray<FNavigationProjectionWork>& Workload, FSharedConstNavQueryFilter Filter, const UObject* Querier) const
 {
 	if (Workload.Num() == 0 || RecastNavMeshImpl == NULL || RecastNavMeshImpl->DetourNavMesh == NULL)
@@ -2156,6 +2262,7 @@ void ARecastNavMesh::BatchProjectPoints(TArray<FNavigationProjectionWork>& Workl
 	}
 }
 
+// 取 Box 范围内命中的所有 Poly（最多 256），过滤掉非地面类型后转成 FNavPoly 追加到 Polys。
 bool ARecastNavMesh::GetPolysInBox(const FBox& Box, TArray<FNavPoly>& Polys, FSharedConstNavQueryFilter Filter, const UObject* InOwner) const
 {
 	// sanity check
@@ -2218,6 +2325,7 @@ bool ARecastNavMesh::GetPolysInBox(const FBox& Box, TArray<FNavPoly>& Polys, FSh
 	return bSuccess;
 }
 
+// 在以 Center 为圆心、半径 Radius 的邻域内查找边界墙段（Detour::findWallsInNeighbourhood）。
 bool ARecastNavMesh::FindEdges(const NavNodeRef CenterNodeRef, const FVector Center, const FVector::FReal Radius, const FSharedConstNavQueryFilter Filter, TArray<FNavigationWallEdge>& OutEdges) const
 {
 	if (HasValidNavmesh() == false)
@@ -2260,6 +2368,7 @@ bool ARecastNavMesh::FindEdges(const NavNodeRef CenterNodeRef, const FVector Cen
 	return false;
 }
 
+// 按 Filter 收集指定 Tile 内满足过滤条件的 Poly 边；转发给 FPImplRecastNavMesh。
 void ARecastNavMesh::GetTilePolyEdgesForFilter(FNavTileRef TileRef, FSharedConstNavQueryFilter Filter, TArray<FNavigationWallEdge>& OutEdges) const
 {
 	const dtNavMesh* const DetourNavMesh = GetRecastMesh();
@@ -2272,6 +2381,7 @@ void ARecastNavMesh::GetTilePolyEdgesForFilter(FNavTileRef TileRef, FSharedConst
 	}
 }
 
+// 取指定 Tile 的所有外边界（与其它 Tile 的接缝）。注意原实现最后总是返回 false（疑似 bug）。
 bool ARecastNavMesh::GetEdgesInTile(FNavTileRef TileRef, TArray<FNavigationWallEdge>& OutEdges) const
 {
 	if (HasValidNavmesh())
@@ -2306,12 +2416,14 @@ bool ARecastNavMesh::GetEdgesInTile(FNavTileRef TileRef, TArray<FNavigationWallE
 	return false;
 }
 
+// 一点投影到多层 NavMesh（比如上下两层楼），返回所有 Z 区间内的命中。转发给 Pimpl。
 bool ARecastNavMesh::ProjectPointMulti(const FVector& Point, TArray<FNavLocation>& OutLocations, const FVector& Extent,
 	FVector::FReal MinZ, FVector::FReal MaxZ, FSharedConstNavQueryFilter Filter, const UObject* QueryOwner) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->ProjectPointMulti(Point, OutLocations, Extent, MinZ, MaxZ, GetRightFilterRef(Filter), QueryOwner);
 }
 
+// 只要 Cost 不要 Length 的便捷包装；内部走 CalcPathLengthAndCost。
 ENavigationQueryResult::Type ARecastNavMesh::CalcPathCost(const FVector& PathStart, const FVector& PathEnd, FVector::FReal& OutPathCost, FSharedConstNavQueryFilter QueryFilter, const UObject* QueryOwner) const
 {
 	FVector::FReal TmpPathLength = 0.f;
@@ -2319,6 +2431,7 @@ ENavigationQueryResult::Type ARecastNavMesh::CalcPathCost(const FVector& PathSta
 	return Result;
 }
 
+// 只要 Length 不要 Cost 的便捷包装；内部走 CalcPathLengthAndCost。
 ENavigationQueryResult::Type ARecastNavMesh::CalcPathLength(const FVector& PathStart, const FVector& PathEnd, FVector::FReal& OutPathLength, FSharedConstNavQueryFilter QueryFilter, const UObject* QueryOwner) const
 {
 	FVector::FReal TmpPathCost = 0.f;
@@ -2326,6 +2439,7 @@ ENavigationQueryResult::Type ARecastNavMesh::CalcPathLength(const FVector& PathS
 	return Result;
 }
 
+// 实打实地跑一次 FindPath 拿到路径，再读 Length 与 Cost。起终点太近直接返回 0。
 ENavigationQueryResult::Type ARecastNavMesh::CalcPathLengthAndCost(const FVector& PathStart, const FVector& PathEnd, FVector::FReal& OutPathLength, FVector::FReal& OutPathCost, FSharedConstNavQueryFilter QueryFilter, const UObject* QueryOwner) const
 {
 	ENavigationQueryResult::Type Result = ENavigationQueryResult::Invalid;
@@ -2359,6 +2473,7 @@ ENavigationQueryResult::Type ARecastNavMesh::CalcPathLengthAndCost(const FVector
 	return Result;
 }
 
+// 判断世界坐标点是否在指定 Poly（NodeRef）内部。调用 Detour::isPointInsidePoly。
 bool ARecastNavMesh::DoesNodeContainLocation(NavNodeRef NodeRef, const FVector& WorldSpaceLocation) const
 {
 	bool bResult = false;
@@ -2377,11 +2492,13 @@ bool ARecastNavMesh::DoesNodeContainLocation(NavNodeRef NodeRef, const FVector& 
 	return bResult; 
 }
 
+// 以 CenterPos/CenterNodeRef 为起点做半径 Radius 的 Dijkstra 扩散，产出可达 Poly 列表。转发给 Pimpl。
 bool ARecastNavMesh::FindPolysAroundCircle(const FVector& CenterPos, const NavNodeRef CenterNodeRef, const FVector::FReal Radius, const FSharedConstNavQueryFilter& Filter, const UObject* QueryOwner, TArray<NavNodeRef>* OutPolys, TArray<NavNodeRef>* OutPolysParent, TArray<float>* OutPolysCost, int32* OutPolysCount) const
 {
 	return RecastNavMeshImpl ? RecastNavMeshImpl->FindPolysAroundCircle(CenterPos, CenterNodeRef, Radius, GetRightFilterRef(Filter), QueryOwner, OutPolys, OutPolysParent, OutPolysCost, OutPolysCount) : false;
 }
 
+// 在 Loc±Extent 范围内找离得最近的 Poly，返回其 NavNodeRef。转发给 Pimpl。
 NavNodeRef ARecastNavMesh::FindNearestPoly(FVector const& Loc, FVector const& Extent, FSharedConstNavQueryFilter Filter, const UObject* QueryOwner) const
 {
 	NavNodeRef PolyRef = 0;
@@ -2393,6 +2510,7 @@ NavNodeRef ARecastNavMesh::FindNearestPoly(FVector const& Loc, FVector const& Ex
 	return PolyRef;
 }
 
+// 从 StartLoc 出发，在 MaxDistance 范围内查最近的 NavMesh 墙，返回距离及命中点（可选）。
 FVector::FReal ARecastNavMesh::FindDistanceToWall(const FVector& StartLoc, FSharedConstNavQueryFilter Filter, FVector::FReal MaxDistance, FVector* OutClosestPointOnWall) const
 {
 	if (HasValidNavmesh() == false)
@@ -2439,6 +2557,7 @@ FVector::FReal ARecastNavMesh::FindDistanceToWall(const FVector& StartLoc, FShar
 	return 0.;
 }
 
+// 根据自定义链接的 AreaClass 更新其对应 Poly 的 AreaID+Flags。副作用：非 Shipping 下请求调试重绘。
 void ARecastNavMesh::UpdateCustomLink(const INavLinkCustomInterface* CustomLink)
 {
 	TSubclassOf<UNavArea> AreaClass = CustomLink->GetLinkAreaClass();
@@ -2461,6 +2580,7 @@ void ARecastNavMesh::UpdateCustomLink(const INavLinkCustomInterface* CustomLink)
 	}
 }
 
+// 直接以 UserId 更新 NavLink 的 Area+Flags（不触发重绘）。给 UpdateCustomLink 内部复用。
 void ARecastNavMesh::UpdateNavigationLinkArea(FNavLinkId UserId, TSubclassOf<UNavArea> AreaClass) const
 {
 	int32 AreaId = GetAreaID(AreaClass);
@@ -2474,6 +2594,7 @@ void ARecastNavMesh::UpdateNavigationLinkArea(FNavLinkId UserId, TSubclassOf<UNa
 }
 
 #if WITH_NAVMESH_SEGMENT_LINKS
+// Segment Link 对应的 Area 更新（未量产特性，仅在 WITH_NAVMESH_SEGMENT_LINKS 时可用）。
 void ARecastNavMesh::UpdateSegmentLinkArea(int32 UserId, TSubclassOf<UNavArea> AreaClass) const
 {
 	int32 AreaId = GetAreaID(AreaClass);
@@ -2487,26 +2608,31 @@ void ARecastNavMesh::UpdateSegmentLinkArea(int32 UserId, TSubclassOf<UNavArea> A
 }
 #endif // WITH_NAVMESH_SEGMENT_LINKS
 
+// 取 Poly 的几何中心点；转发给 Pimpl。
 bool ARecastNavMesh::GetPolyCenter(NavNodeRef PolyID, FVector& OutCenter) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetPolyCenter(PolyID, OutCenter);
 }
 
+// 取 Poly 的顶点数组（世界坐标）；转发给 Pimpl。
 bool ARecastNavMesh::GetPolyVerts(NavNodeRef PolyID, TArray<FVector>& OutVerts) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetPolyVerts(PolyID, OutVerts);
 }
 
+// 在 Poly 面积上均匀取一个随机点；转发给 Pimpl。
 bool ARecastNavMesh::GetRandomPointInPoly(NavNodeRef PolyID, FVector& OutPoint) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetRandomPointInPoly(PolyID, OutPoint);
 }
 
+// 返回 Poly 的面积（detail mesh 三角形累加）。转发给 Pimpl。
 FVector::FReal ARecastNavMesh::GetPolySurfaceArea(NavNodeRef PolyID) const
 {
 	return RecastNavMeshImpl ? RecastNavMeshImpl->GetPolySurfaceArea(PolyID) : 0;
 }
 
+// 返回 Poly 当前的 AreaID（失败时回落到 RECAST_DEFAULT_AREA）。
 uint32 ARecastNavMesh::GetPolyAreaID(NavNodeRef PolyID) const
 {
 	uint32 AreaID = RECAST_DEFAULT_AREA;
@@ -2518,6 +2644,7 @@ uint32 ARecastNavMesh::GetPolyAreaID(NavNodeRef PolyID) const
 	return AreaID;
 }
 
+// 设置单个 Poly 的 AreaID 和 AreaFlags（直接改 Detour NavMesh，不触发重建）。
 bool ARecastNavMesh::SetPolyArea(NavNodeRef PolyID, TSubclassOf<UNavArea> AreaClass)
 {
 	bool bSuccess = false;
@@ -2537,6 +2664,7 @@ bool ARecastNavMesh::SetPolyArea(NavNodeRef PolyID, TSubclassOf<UNavArea> AreaCl
 	return bSuccess;
 }
 
+// 批量把一组 Poly 的 Area 改成同一个 AreaClass；不触发重建，仅改 flags/area 字节。
 void ARecastNavMesh::SetPolyArrayArea(const TArray<FNavPoly>& Polys, TSubclassOf<UNavArea> AreaClass)
 {
 	if (AreaClass && RecastNavMeshImpl)
@@ -2556,6 +2684,7 @@ void ARecastNavMesh::SetPolyArrayArea(const TArray<FNavPoly>& Polys, TSubclassOf
 	}
 }
 
+// 遍历 Bounds 覆盖到的 Tile，将 OldArea 改成 NewArea，返回改动的 Poly 数。ReplaceLinks 控制是否处理 OffMesh Link。
 int32 ARecastNavMesh::ReplaceAreaInTileBounds(const FBox& Bounds, TSubclassOf<UNavArea> OldArea, TSubclassOf<UNavArea> NewArea, bool ReplaceLinks, TArray<NavNodeRef>* OutTouchedNodes)
 {
 	if (!ensureMsgf(Bounds.IsValid, TEXT("%hs Bounds is not valid"), __FUNCTION__))
@@ -2627,6 +2756,7 @@ int32 ARecastNavMesh::ReplaceAreaInTileBounds(const FBox& Bounds, TSubclassOf<UN
 	return PolysTouched;
 }
 
+// 取 Poly 的原始 Flags（Detour 用）与 Area 默认 Flags（UNavArea 定义）。
 bool ARecastNavMesh::GetPolyFlags(NavNodeRef PolyID, uint16& PolyFlags, uint16& AreaFlags) const
 {
 	bool bFound = false;
@@ -2645,6 +2775,7 @@ bool ARecastNavMesh::GetPolyFlags(NavNodeRef PolyID, uint16& PolyFlags, uint16& 
 	return bFound;
 }
 
+// GetPolyFlags 的结构化重载：打包 Area/AreaFlags/PathFlags 到 FNavMeshNodeFlags。
 bool ARecastNavMesh::GetPolyFlags(NavNodeRef PolyID, FNavMeshNodeFlags& Flags) const
 {
 	bool bFound = false;
@@ -2666,16 +2797,19 @@ bool ARecastNavMesh::GetPolyFlags(NavNodeRef PolyID, FNavMeshNodeFlags& Flags) c
 	return bFound;
 }
 
+// 取 Poly 的邻接 Poly 列表：返回带门边/端点信息。转发给 Pimpl。
 bool ARecastNavMesh::GetPolyNeighbors(NavNodeRef PolyID, TArray<FNavigationPortalEdge>& Neighbors) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetPolyNeighbors(PolyID, Neighbors);
 }
 
+// GetPolyNeighbors 的轻量重载：只返回邻居 Ref。
 bool ARecastNavMesh::GetPolyNeighbors(NavNodeRef PolyID, TArray<NavNodeRef>& Neighbors) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetPolyNeighbors(PolyID, Neighbors);
 }
 
+// 取 Poly 的所有边（包括外部 Tile 边界），每条边以 Portal 结构返回。转发给 Pimpl。
 bool ARecastNavMesh::GetPolyEdges(NavNodeRef PolyID, TArray<FNavigationPortalEdge>& Neighbors) const
 {
 	bool bFound = false;
@@ -2687,6 +2821,7 @@ bool ARecastNavMesh::GetPolyEdges(NavNodeRef PolyID, TArray<FNavigationPortalEdg
 	return bFound;
 }
 
+// 基于 Filter 过滤后只返回那些"对该过滤器不可通行"的边（即墙壁段）。转发给 Pimpl。
 bool ARecastNavMesh::GetPolyWallSegments(NavNodeRef PolyID, FSharedConstNavQueryFilter Filter, const UObject* QueryOwner, TArray<FNavigationPortalEdge>& OutNeighbors) const
 {
 	bool bFound = false;
@@ -2698,39 +2833,46 @@ bool ARecastNavMesh::GetPolyWallSegments(NavNodeRef PolyID, FSharedConstNavQuery
 	return bFound;
 }
 
+// 把 TestPt 投影到指定 Poly 上，得到该 Poly 上离 TestPt 最近的点。转发给 Pimpl。
 bool ARecastNavMesh::GetClosestPointOnPoly(NavNodeRef PolyID, const FVector& TestPt, FVector& PointOnPoly) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetClosestPointOnPoly(PolyID, TestPt, PointOnPoly);
 }
 
+// 从 PolyID 解包出 TileIndex 和该 Tile 内的 PolyIndex。转发给 Pimpl。
 bool ARecastNavMesh::GetPolyTileIndex(NavNodeRef PolyID, uint32& PolyIndex, uint32& TileIndex) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetPolyTileIndex(PolyID, PolyIndex, TileIndex);
 }
 
+// 取 OffMesh Link Poly 的两个端点（世界坐标）。转发给 Pimpl。
 bool ARecastNavMesh::GetLinkEndPoints(NavNodeRef LinkPolyID, FVector& PointA, FVector& PointB) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetLinkEndPoints(LinkPolyID, PointA, PointB);
 }
 
+// 判断某 Poly 是否是 Custom Link（INavLinkCustomInterface 注册的）。转发给 Pimpl。
 bool ARecastNavMesh::IsCustomLink(NavNodeRef LinkPolyID) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->IsCustomLink(LinkPolyID);
 }
 
 #if WITH_NAVMESH_CLUSTER_LINKS
+// 取 Cluster 的 AABB（仅 WITH_NAVMESH_CLUSTER_LINKS 下）。转发给 Pimpl。
 bool ARecastNavMesh::GetClusterBounds(NavNodeRef ClusterRef, FBox& OutBounds) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetClusterBounds(ClusterRef, OutBounds);
 }
 #endif // WITH_NAVMESH_CLUSTER_LINKS
 
+// 从 StartLoc 出发 Dijkstra 扩散，收集路径代价 ≤ PathingDistance 的全部 Poly。转发给 Pimpl。
 bool ARecastNavMesh::GetPolysWithinPathingDistance(FVector const& StartLoc, const FVector::FReal PathingDistance, TArray<NavNodeRef>& FoundPolys,
 	FSharedConstNavQueryFilter Filter, const UObject* QueryOwner, FRecastDebugPathfindingData* DebugData) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->GetPolysWithinPathingDistance(StartLoc, PathingDistance, GetRightFilterRef(Filter), QueryOwner, FoundPolys, DebugData);
 }
 
+// Deprecated：按旧 TileIndex 取调试几何，先翻译成 FNavTileRef 再转发。
 // Deprecated
 bool ARecastNavMesh::GetDebugGeometryForTile(FRecastDebugGeometry& OutGeometry, int32 TileIndex) const
 {
@@ -2748,6 +2890,7 @@ bool ARecastNavMesh::GetDebugGeometryForTile(FRecastDebugGeometry& OutGeometry, 
 	return true;
 }
 
+// 汇总一个 Tile 的调试渲染数据（verts/tris/links 等）到 OutGeometry。转发给 Pimpl。
 bool ARecastNavMesh::GetDebugGeometryForTile(FRecastDebugGeometry& OutGeometry, FNavTileRef TileRef) const
 {
 	if (RecastNavMeshImpl)
@@ -2757,6 +2900,7 @@ bool ARecastNavMesh::GetDebugGeometryForTile(FRecastDebugGeometry& OutGeometry, 
 	return true;
 }
 
+// 请求一次调试 NavMesh 重绘：bForce=true 时强制，否则看 ShowFlag。派到 GameThread 执行 UpdateDrawing。
 void ARecastNavMesh::RequestDrawingUpdate(bool bForce)
 {
 #if !UE_BUILD_SHIPPING
@@ -2782,11 +2926,13 @@ void ARecastNavMesh::RequestDrawingUpdate(bool bForce)
 #endif // !UE_BUILD_SHIPPING
 }
 
+// GameThread 调度过来后的真正更新入口；转调 UpdateNavMeshDrawing。
 void ARecastNavMesh::UpdateDrawing()
 {
 	UpdateNavMeshDrawing();
 }
 
+// DrawDebugHelpers 画出路径走廊（按 Poly 边框 + Poly 中心连线）。仅在 ENABLE_DRAW_DEBUG 下可用。
 void ARecastNavMesh::DrawDebugPathCorridor(NavNodeRef const* PathPolys, int32 NumPathPolys, bool bPersistent) const
 {
 #if ENABLE_DRAW_DEBUG
@@ -2828,12 +2974,14 @@ void ARecastNavMesh::DrawDebugPathCorridor(NavNodeRef const* PathPolys, int32 Nu
 #endif // ENABLE_DRAW_DEBUG
 }
 
+// NavMesh 某批 Tile 被重建/更新后的回调：去作废那些经过这些 Tile 的已注册路径。
 void ARecastNavMesh::OnNavMeshTilesUpdated(const TArray<FNavTileRef>& ChangedTiles)
 {
 	InvalidateAffectedPaths(ChangedTiles);
 }
 
 #if WITH_NAVMESH_SEGMENT_LINKS
+// 在所有 Tile 生成完后统一拉起 Segment Link 的跨 Tile 连接；Tile 需排序避免重复建边。
 void ARecastNavMesh::CreateSegmentLinkConnections(TSet<FNavTileRef>& TilesPendingSegmentLinks)
 {
 	if(!RecastNavMeshImpl || !RecastNavMeshImpl->DetourNavMesh)
@@ -2913,6 +3061,7 @@ void ARecastNavMesh::CreateSegmentLinkConnections(TSet<FNavTileRef>& TilesPendin
 }
 #endif // WITH_NAVMESH_SEGMENT_LINKS
 
+// 遍历 ActivePaths，把路径穿过 ChangedTiles 的那些 Path 标记失效并摘掉。ActivePathsLock 保护（异步寻路线程可能注册路径）。
 void ARecastNavMesh::InvalidateAffectedPaths(const TArray<FNavTileRef>& ChangedTiles)
 {
 	const int32 PathsCount = ActivePaths.Num();
@@ -2974,16 +3123,19 @@ void ARecastNavMesh::InvalidateAffectedPaths(const TArray<FNavTileRef>& ChangedT
 	}
 }
 
+// 从 Level 上挂的 NavDataChunks 中找到归属当前 NavMesh 名字的那一块。三重载，入口不同。
 URecastNavMeshDataChunk* ARecastNavMesh::GetNavigationDataChunk(ULevel* InLevel) const
 {
 	return GetNavigationDataChunk(InLevel->NavDataChunks);
 }
 
+// 同上，从 WorldPartition 的 ANavigationDataChunkActor 取。
 URecastNavMeshDataChunk* ARecastNavMesh::GetNavigationDataChunk(const ANavigationDataChunkActor& InActor) const
 {
 	return GetNavigationDataChunk(InActor.GetNavDataChunk());
 }
 
+// 真正按 FName 查找的公共实现。
 URecastNavMeshDataChunk* ARecastNavMesh::GetNavigationDataChunk(const TArray<UNavigationDataChunk*>& InChunks) const
 {
 	FName ThisName = GetFName();
@@ -3001,6 +3153,7 @@ URecastNavMeshDataChunk* ARecastNavMesh::GetNavigationDataChunk(const TArray<UNa
 	return RcNavDataChunk;
 }
 
+// 父类 EnsureBuildCompletion 之后，强制重建默认 Filter（历史 UE-20646 bug 的保险丝）。
 void ARecastNavMesh::EnsureBuildCompletion()
 {
 	Super::EnsureBuildCompletion();
@@ -3011,6 +3164,7 @@ void ARecastNavMesh::EnsureBuildCompletion()
 	RecreateDefaultFilter();
 }
 
+// 一次 NavMesh 生成完成后的收尾：编辑器下把 Tile 数据按 Level 分发到各自 NavDataChunk（支撑流式加载），并通知 NavSys。
 void ARecastNavMesh::OnNavMeshGenerationFinished()
 {
 	UWorld* World = GetWorld();
@@ -3080,6 +3234,7 @@ void ARecastNavMesh::OnNavMeshGenerationFinished()
 }
 
 #if !UE_BUILD_SHIPPING
+// 调试输出当前 NavMesh 已占内存（按 Tile 累加）。非 Shipping 版本。
 uint32 ARecastNavMesh::LogMemUsed() const 
 {
 	const uint32 SuperMemUsed = Super::LogMemUsed();
@@ -3110,6 +3265,7 @@ uint32 ARecastNavMesh::LogMemUsed() const
 
 #endif // !UE_BUILD_SHIPPING
 
+// 读/写默认 Filter 的 ForbiddenFlags（禁止通行的 Area Flag 掩码）。两者都是一行封装。
 uint16 ARecastNavMesh::GetDefaultForbiddenFlags() const
 {
 	return FPImplRecastNavMesh::GetFilterForbiddenFlags((const FRecastQueryFilter*)DefaultQueryFilter->GetImplementation());
@@ -3120,6 +3276,7 @@ void ARecastNavMesh::SetDefaultForbiddenFlags(uint16 ForbiddenAreaFlags)
 	FPImplRecastNavMesh::SetFilterForbiddenFlags((FRecastQueryFilter*)DefaultQueryFilter->GetImplementation(), ForbiddenAreaFlags);
 }
 
+// 运行时改 Tile 并行生成上限（至少 1）。若生成器存在则同步下发。
 void ARecastNavMesh::SetMaxSimultaneousTileGenerationJobsCount(int32 NewJobsCountLimit) 
 {
 	const int32 NewCount = NewJobsCountLimit > 0 ? NewJobsCountLimit : 1;
@@ -3134,6 +3291,7 @@ void ARecastNavMesh::SetMaxSimultaneousTileGenerationJobsCount(int32 NewJobsCoun
 	}
 }
 
+// 按给定 Filter 过滤一组 Poly，把不满足条件的剔出 PolyRefs（原地）。转发给 Pimpl。
 bool ARecastNavMesh::FilterPolys(TArray<NavNodeRef>& PolyRefs, const FRecastQueryFilter* Filter, const UObject* QueryOwner) const
 {
 	bool bSuccess = false;
@@ -3145,6 +3303,7 @@ bool ARecastNavMesh::FilterPolys(TArray<NavNodeRef>& PolyRefs, const FRecastQuer
 	return bSuccess;
 }
 
+// World Origin Rebase：把整个 NavMesh 数据按 Offset 平移，并请求重绘。
 void ARecastNavMesh::ApplyWorldOffset(const FVector& InOffset, bool bWorldShift)
 {
 	if (RecastNavMeshImpl)
@@ -3156,6 +3315,7 @@ void ARecastNavMesh::ApplyWorldOffset(const FVector& InOffset, bool bWorldShift)
 	RequestDrawingUpdate();
 }
 
+// WorldPartition：把 QueryBounds 内的 Tile 打包成 DataChunk 存到 DataChunkActor，便于流式加载。
 void ARecastNavMesh::FillNavigationDataChunkActor(const FBox& QueryBounds, ANavigationDataChunkActor& DataChunkActor, FBox& OutTilesBounds) const
 {
 	if (!RecastNavMeshImpl)
@@ -3185,6 +3345,7 @@ void ARecastNavMesh::FillNavigationDataChunkActor(const FBox& QueryBounds, ANavi
 	}
 }
 
+// WP 流式 NavDataChunkActor 加载回调：Attach 其中的 DataChunk，并在动态 NavMesh 下把 Actor 范围标脏。
 void ARecastNavMesh::OnStreamingNavDataAdded(ANavigationDataChunkActor& InActor)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMesh_OnStreamingNavDataAdded);
@@ -3230,6 +3391,7 @@ void ARecastNavMesh::OnStreamingNavDataAdded(ANavigationDataChunkActor& InActor)
 	}
 }
 
+// 与 OnStreamingNavDataAdded 相反：流式卸载时 Detach 数据块。
 void ARecastNavMesh::OnStreamingNavDataRemoved(ANavigationDataChunkActor& InActor)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMesh_OnStreamingNavDataRemoved);
@@ -3246,6 +3408,7 @@ void ARecastNavMesh::OnStreamingNavDataRemoved(ANavigationDataChunkActor& InActo
 	}
 }
 
+// 传统（非 WP）流式关卡加载回调：从 Level 取 DataChunk 并 Attach。
 void ARecastNavMesh::OnStreamingLevelAdded(ULevel* InLevel, UWorld* InWorld)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMesh_OnStreamingLevelAdded);
@@ -3260,6 +3423,7 @@ void ARecastNavMesh::OnStreamingLevelAdded(ULevel* InLevel, UWorld* InWorld)
 	}
 }
 
+// 将 DataChunk 中的 Tile 贴回 Detour NavMesh，并把涉及的路径作废 + 请求重绘。
 void ARecastNavMesh::AttachNavMeshDataChunk(URecastNavMeshDataChunk& NavDataChunk)
 {
 	const TArray<FNavTileRef> AttachedIndices = NavDataChunk.AttachTiles(*this);
@@ -3270,6 +3434,7 @@ void ARecastNavMesh::AttachNavMeshDataChunk(URecastNavMeshDataChunk& NavDataChun
 	}
 }
 
+// 非 WP 流式关卡卸载回调：从 Level 取 DataChunk 并 Detach。
 void ARecastNavMesh::OnStreamingLevelRemoved(ULevel* InLevel, UWorld* InWorld)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMesh_OnStreamingLevelRemoved);
@@ -3285,12 +3450,14 @@ void ARecastNavMesh::OnStreamingLevelRemoved(ULevel* InLevel, UWorld* InWorld)
 }
 
 #if WITH_EDITOR
+// WP NavMesh Builder 的 Tile 重叠距离：按 TileSizeUU 返回。仅编辑器。
 double ARecastNavMesh::GetWorldPartitionNavigationDataBuilderOverlap() const
 {
 	return TileSizeUU;
 }
 #endif //WITH_EDITOR
 
+// 与 Attach 相反：把 DataChunk 的 Tile 从 Detour 移除，作废影响路径并重绘。
 void ARecastNavMesh::DetachNavMeshDataChunk(URecastNavMeshDataChunk& NavDataChunk)
 {
 	const TArray<FNavTileRef> DetachedIndices = NavDataChunk.DetachTiles(*this);
@@ -3301,6 +3468,7 @@ void ARecastNavMesh::DetachNavMeshDataChunk(URecastNavMeshDataChunk& NavDataChun
 	}
 }
 
+// 把 StartLoc 按 Filter 往"可导航"方向微调一点点（偏移 0.1cm），避免后续投影落到被 Filter 排除的 Poly。
 bool ARecastNavMesh::AdjustLocationWithFilter(const FVector& StartLoc, FVector& OutAdjustedLocation, const FNavigationQueryFilter& Filter, const UObject* QueryOwner) const
 {
 	if (HasValidNavmesh() == false)
@@ -3337,6 +3505,7 @@ bool ARecastNavMesh::AdjustLocationWithFilter(const FVector& StartLoc, FVector& 
 	}
 }
 
+// 【寻路主入口】静态方法，被 NavigationSystem 通过函数指针调用。跑一次 Pimpl::FindPath 得到完整路径，支持 PartialPath。
 FPathFindingResult ARecastNavMesh::FindPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastPathfinding);
@@ -3399,6 +3568,7 @@ FPathFindingResult ARecastNavMesh::FindPath(const FNavAgentProperties& AgentProp
 	return Result;
 }
 
+// 【寻路探测】只判断连通性不构造路径；静态方法，NavigationSystem 用函数指针调用。
 bool ARecastNavMesh::TestPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query, int32* NumVisitedNodes)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastTestPath);
@@ -3429,6 +3599,7 @@ bool ARecastNavMesh::TestPath(const FNavAgentProperties& AgentProperties, const 
 	return bPathExists;
 }
 
+// 粗粒度连通性测试：默认 Filter 时走 Cluster 层级图（WITH_NAVMESH_CLUSTER_LINKS），失败回退普通 TestPath。
 bool ARecastNavMesh::TestHierarchicalPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query, int32* NumVisitedNodes)
 {
 	const ANavigationData* Self = Query.NavData.Get();
@@ -3482,6 +3653,7 @@ bool ARecastNavMesh::TestHierarchicalPath(const FNavAgentProperties& AgentProper
 	return bPathExists;
 }
 
+// NavMesh 射线检测（静态，NavigationSystem 通过函数指针调用）：沿 NavMesh 走直线直到遇墙，返回命中信息。
 bool ARecastNavMesh::NavMeshRaycast(const ANavigationData* Self, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FSharedConstNavQueryFilter QueryFilter,const UObject* QueryOwner, FRaycastResult& Result)
 {
 	check(Cast<const ARecastNavMesh>(Self));
@@ -3499,11 +3671,13 @@ bool ARecastNavMesh::NavMeshRaycast(const ANavigationData* Self, const FVector& 
 	return Result.HasHit();
 }
 
+// 指定起始 Poly 的 Raycast 重载（只转发到带 AdditionalResults 的总入口）。
 bool ARecastNavMesh::NavMeshRaycast(const ANavigationData* Self, NavNodeRef RayStartNode, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FSharedConstNavQueryFilter QueryFilter, const UObject* Querier)
 {
 	return NavMeshRaycast(Self, RayStartNode, RayStart, RayEnd, HitLocation, nullptr, QueryFilter, Querier);
 }
 
+// 指定起始 Poly 的完整版 Raycast：可输出 AdditionalResults（RayEnd 是否落在走廊内）。
 bool ARecastNavMesh::NavMeshRaycast(const ANavigationData* Self, NavNodeRef RayStartNode, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FNavigationRaycastAdditionalResults* AdditionalResults, FSharedConstNavQueryFilter QueryFilter, const UObject* QueryOwner)
 {
 	check(Cast<const ARecastNavMesh>(Self));
@@ -3530,6 +3704,7 @@ bool ARecastNavMesh::NavMeshRaycast(const ANavigationData* Self, NavNodeRef RayS
 	return Result.HasHit();
 }
 
+// 批量 NavMesh Raycast：每个 Work 先 findNearestContainingPoly 找起点 Poly，再调用 Detour::raycast。
 void ARecastNavMesh::BatchRaycast(TArray<FNavigationRaycastWork>& Workload, FSharedConstNavQueryFilter Filter, const UObject* Querier) const
 {
 	if (RecastNavMeshImpl == NULL || Workload.Num() == 0 || RecastNavMeshImpl->DetourNavMesh == NULL)
@@ -3586,6 +3761,7 @@ void ARecastNavMesh::BatchRaycast(TArray<FNavigationRaycastWork>& Workload, FSha
 	}
 }
 
+// 便捷函数：整段线段是否都在 NavMesh 可通行走廊内（未命中墙且终点在走廊）。
 bool ARecastNavMesh::IsSegmentOnNavmesh(const FVector& SegmentStart, const FVector& SegmentEnd, FSharedConstNavQueryFilter Filter, const UObject* QueryOwner) const
 {
 	FVector HitLocation;
@@ -3594,11 +3770,13 @@ bool ARecastNavMesh::IsSegmentOnNavmesh(const FVector& SegmentStart, const FVect
 	return Result.bIsRaycastEndInCorridor && !bDidHit;
 }
 
+// 对已有 PathCorridor 做 String-Pulling，产出去折的 PathPoints。转发给 Pimpl。
 bool ARecastNavMesh::FindStraightPath(const FVector& StartLoc, const FVector& EndLoc, const TArray<NavNodeRef>& PathCorridor, TArray<FNavPathPoint>& PathPoints, TArray<FNavLinkId>* CustomLinks) const
 {
 	return RecastNavMeshImpl && RecastNavMeshImpl->FindStraightPath(StartLoc, EndLoc, PathCorridor, PathPoints, CustomLinks);
 }
 
+// 调试版 FindPath：逐步输出 A* 搜索的中间状态（OpenList/ClosedList 快照），供编辑器可视化。
 int32 ARecastNavMesh::DebugPathfinding(const FPathFindingQuery& Query, TArray<FRecastDebugPathfindingData>& Steps)
 {
 	int32 NumSteps = 0;
@@ -3620,6 +3798,7 @@ int32 ARecastNavMesh::DebugPathfinding(const FPathFindingQuery& Query, TArray<FR
 	return NumSteps;
 }
 
+// 把当前 NavMeshVersion 置为 NAVMESHVER_LATEST。序列化升级用。
 void ARecastNavMesh::UpdateNavVersion() 
 { 
 	NavMeshVersion = NAVMESHVER_LATEST; 
@@ -3627,6 +3806,7 @@ void ARecastNavMesh::UpdateNavVersion()
 
 #if WITH_EDITOR
 
+// 编辑器：属性链改动（支持数组元素）。CellSize 变化会联动 TileSizeUU 和其它分辨率的 CellSize；之后触发 RebuildAll。
 void ARecastNavMesh::PostEditChangeChainProperty(FPropertyChangedChainEvent& PropertyChangedChainEvent)
 {
 	static const FName NAME_Generation = FName(TEXT("Generation"));
@@ -3712,6 +3892,7 @@ void ARecastNavMesh::PostEditChangeChainProperty(FPropertyChangedChainEvent& Pro
 	}
 }
 
+// 编辑器：普通属性改动。按 Category（Generation/Display/Query/RuntimeGeneration/TileNumberHardLimit）分支处理。
 void ARecastNavMesh::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	static const FName NAME_Generation = FName(TEXT("Generation"));
@@ -3793,6 +3974,7 @@ void ARecastNavMesh::PostEditChangeProperty(FPropertyChangedEvent& PropertyChang
 	}
 }
 
+// Undo 后如果 RecastNavMeshImpl 被删了就重新分配一个空实例。仅编辑器。
 void ARecastNavMesh::PostEditUndo()
 {
 	// ANavigationData will register again this navdata in Super::PostEditUndo(). 
@@ -3807,6 +3989,7 @@ void ARecastNavMesh::PostEditUndo()
 
 #endif // WITH_EDITOR
 
+// 是否需要（重新）构建：没 Impl / 没 Detour / 没 Tile 数据，或生成器还有剩余任务。
 bool ARecastNavMesh::NeedsRebuild() const
 {
 	bool bLooksLikeNeeded = !RecastNavMeshImpl || RecastNavMeshImpl->GetRecastMesh() == 0 || bHasNoTileData;
@@ -3818,12 +4001,13 @@ bool ARecastNavMesh::NeedsRebuild() const
 	return bLooksLikeNeeded;
 }
 
+// 是否支持运行时动态生成：RuntimeGeneration != Static。
 bool ARecastNavMesh::SupportsRuntimeGeneration() const
 {
-	// Generator should be disabled for Static navmesh
 	return (RuntimeGeneration != ERuntimeGenerationType::Static);
 }
 
+// 是否支持流式加载（Static/WorldPartition 支持；非 WP 的动态不支持，会自建）。
 bool ARecastNavMesh::SupportsStreaming() const
 {
 	// Actually nothing prevents us to support streaming with dynamic generation
@@ -3831,21 +4015,25 @@ bool ARecastNavMesh::SupportsStreaming() const
 	return (RuntimeGeneration != ERuntimeGenerationType::Dynamic) || bIsWorldPartitioned;
 }
 
+// 是 WP 下的动态 NavMesh 吗（两个条件都满足）。
 bool ARecastNavMesh::IsWorldPartitionedDynamicNavmesh() const
 {
 	return bIsWorldPartitioned && SupportsRuntimeGeneration();
 }
 
+// 工厂方法：new 一个 FRecastNavMeshGenerator。子类可覆盖以注入自定义生成器。
 FRecastNavMeshGenerator* ARecastNavMesh::CreateGeneratorInstance()
 {
 	return new FRecastNavMeshGenerator(*this);
 }
 
+// 是否启用"按 Active Tiles"模式的生成（WP 或 NavSys 显式开启）。
 bool ARecastNavMesh::IsUsingActiveTilesGeneration(const UNavigationSystemV1& NavSys) const
 {
 	return SupportsRuntimeGeneration() && (NavSys.IsActiveTilesGenerationEnabled() || bIsWorldPartitioned);
 }
 
+// PostLoad 前重建 NavLinkJumpConfigs 的 Proxy（Jump Link 生成器）。
 void ARecastNavMesh::PostLoadPreRebuild()
 {
 	// If any, unregister previous generated links proxy.
@@ -3864,6 +4052,7 @@ void ARecastNavMesh::PostLoadPreRebuild()
 	}
 }
 
+// 按需构造 NavDataGenerator（Dynamic 或编辑器下需要）；取消旧生成器并初始化新的，再设置 Active Tiles 模式。
 void ARecastNavMesh::ConditionalConstructGenerator()
 {	
 	if (NavDataGenerator.IsValid())
@@ -3892,6 +4081,7 @@ void ARecastNavMesh::ConditionalConstructGenerator()
 	}
 }
 
+// Voxel 缓存开关：异步重建下强制关闭（静态缓冲区冲突），否则看 CDO 的 bUseVoxelCache。
 bool ARecastNavMesh::IsVoxelCacheEnabled()
 {
 #if RECAST_ASYNC_REBUILDING
@@ -3904,6 +4094,7 @@ bool ARecastNavMesh::IsVoxelCacheEnabled()
 #endif
 }
 
+// 取预设的命名 Filter（ERecastNamedFilter 枚举索引）。蓝图公开用。
 const FRecastQueryFilter* ARecastNavMesh::GetNamedFilter(ERecastNamedFilter::Type FilterType)
 {
 	check(FilterType < ERecastNamedFilter::NamedFiltersCount); 
@@ -3912,12 +4103,14 @@ const FRecastQueryFilter* ARecastNavMesh::GetNamedFilter(ERecastNamedFilter::Typ
 
 #undef INITIALIZE_NAVQUERY
 
+// 广播 OnNavMeshUpdate 委托给外部监听者。
 void ARecastNavMesh::UpdateNavObject()
 {
 	OnNavMeshUpdate.Broadcast();
 }
 #endif	//WITH_RECAST
 
+// 当前 NavMesh 是否已有可用数据（Impl + Detour 非空，且 Detour 内不是空状态）。
 bool ARecastNavMesh::HasValidNavmesh() const
 {
 #if WITH_RECAST
@@ -3928,6 +4121,7 @@ bool ARecastNavMesh::HasValidNavmesh() const
 }
 
 #if WITH_RECAST
+// 指定 TileXY 是否有"完整的"Tile 数据；bStoreEmptyTileLayers 下允许空 Tile 缓存作为 failsafe。
 bool ARecastNavMesh::HasCompleteDataInTile(const int32 TileX, const int32 TileY) const
 {
 	check(RecastNavMeshImpl && RecastNavMeshImpl->DetourNavMesh);
@@ -3944,6 +4138,7 @@ bool ARecastNavMesh::HasCompleteDataInTile(const int32 TileX, const int32 TileY)
 	return true;
 }
 
+// 以 TestLocation 为圆心、TestRadius 为半径，遍历相交的 Tile 判断是否全部都"数据完整"。
 bool ARecastNavMesh::HasCompleteDataInRadius(const FVector& TestLocation, FVector::FReal TestRadius) const
 {
 	if (HasValidNavmesh() == false)
@@ -3989,6 +4184,7 @@ bool ARecastNavMesh::HasCompleteDataInRadius(const FVector& TestLocation, FVecto
 	return true;
 }
 
+// 沿 StartLocation→EndLocation 的"胶囊体"（Radius 膨胀）扫 Tile，判断途经 Tile 是否全部数据完整。
 bool ARecastNavMesh::HasCompleteDataAroundSegment(const FVector& StartLocation, const FVector& EndLocation, FVector::FReal TestRadius) const
 {
 	if (HasValidNavmesh() == false)
@@ -4036,6 +4232,8 @@ bool ARecastNavMesh::HasCompleteDataAroundSegment(const FVector& StartLocation, 
 //----------------------------------------------------------------------//
 // RecastNavMesh: Active Tiles 
 //----------------------------------------------------------------------//
+// Active Tiles 主更新逻辑：按 Invoker 的 Min/Max 半径求出要加/要删/要更新的 Tile，然后 RemoveTiles + RebuildTile。
+// 副作用：会调 UpdateNavMeshDrawing 重绘。
 void ARecastNavMesh::UpdateActiveTiles(const TArray<FNavigationInvokerRaw>& InvokerLocations)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(ARecastNavMesh::UpdateActiveTiles);
@@ -4206,6 +4404,7 @@ void ARecastNavMesh::UpdateActiveTiles(const TArray<FNavigationInvokerRaw>& Invo
 	}
 }
 
+// 批量请求移除一组 Tile（按 XY 坐标）。转发给 FRecastNavMeshGenerator::RemoveTiles。
 void ARecastNavMesh::RemoveTiles(const TArray<FIntPoint>& Tiles)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(ARecastNavMesh::RemoveTiles);
@@ -4220,6 +4419,7 @@ void ARecastNavMesh::RemoveTiles(const TArray<FIntPoint>& Tiles)
 	}
 }
 
+// 批量请求重建一组 Tile（带优先级/距离信息）。转发给 FRecastNavMeshGenerator::ReAddTiles。
 void ARecastNavMesh::RebuildTile(const TArray<FNavMeshDirtyTileElement>& Tiles)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(ARecastNavMesh::RebuildTile);
@@ -4234,6 +4434,7 @@ void ARecastNavMesh::RebuildTile(const TArray<FNavMeshDirtyTileElement>& Tiles)
 	}
 }
 
+// 把 Bounds 覆盖到的所有 Tile 全部标脏并重建：先取消旧任务，再 RemoveTiles 全部 + RebuildTile 到覆盖范围。
 void ARecastNavMesh::DirtyTilesInBounds(const FBox& Bounds)
 {
 	if (!ensureMsgf(Bounds.IsValid, TEXT("%hs Bounds is not valid"), __FUNCTION__))
@@ -4295,6 +4496,7 @@ void ARecastNavMesh::DirtyTilesInBounds(const FBox& Bounds)
 }
 
 #if RECAST_INTERNAL_DEBUG_DATA
+// RECAST_INTERNAL_DEBUG_DATA：取 Pimpl 里的 DebugDataMap 供编辑器可视化用。
 const TMap<FIntPoint, struct FRecastInternalDebugData>* ARecastNavMesh::GetDebugDataMap() const
 {
 	if (RecastNavMeshImpl)
@@ -4309,6 +4511,7 @@ const TMap<FIntPoint, struct FRecastInternalDebugData>* ARecastNavMesh::GetDebug
 // FRecastNavMeshCachedData
 //----------------------------------------------------------------------//
 
+// 从 ARecastNavMesh 快照一份生成 Tile 所需的配置（Area 列表/排序开关/Link Proxy 等），给 Generator 线程使用。
 FRecastNavMeshCachedData FRecastNavMeshCachedData::Construct(const ARecastNavMesh* RecastNavMeshActor)
 {
 	check(RecastNavMeshActor);
@@ -4348,6 +4551,7 @@ FRecastNavMeshCachedData FRecastNavMeshCachedData::Construct(const ARecastNavMes
 	return CachedData;
 }
 
+// 新增 Area 时同步更新缓存映射（AreaClass↔ID 与 FlagsPerArea）。
 void FRecastNavMeshCachedData::OnAreaAdded(const UClass* AreaClass, int32 AreaID)
 {
 	const UNavArea* DefArea = AreaClass ? ((UClass*)AreaClass)->GetDefaultObject<UNavArea>() : NULL;
@@ -4364,6 +4568,7 @@ void FRecastNavMeshCachedData::OnAreaAdded(const UClass* AreaClass, int32 AreaID
 	}		
 }
 
+// 移除 Area 时反向清理 AreaClassToIdMap 及 Flags 表。
 void FRecastNavMeshCachedData::OnAreaRemoved(const UClass* AreaClass)
 {
 	const int32* AreaID = AreaClass ? AreaClassToIdMap.Find(AreaClass) : nullptr;
@@ -4377,11 +4582,13 @@ void FRecastNavMeshCachedData::OnAreaRemoved(const UClass* AreaClass)
 	}
 }
 
+// 取 NavLink Poly 对应的 UserId（FNavLinkId）。转发给 Pimpl。
 FNavLinkId ARecastNavMesh::GetNavLinkUserId(NavNodeRef LinkPolyID) const
 {
 	return RecastNavMeshImpl ? RecastNavMeshImpl->GetNavLinkUserId(LinkPolyID) : FNavLinkId::Invalid;
 }
 
+// 取底层 dtNavMesh 指针（非 const / const 两个重载）。转发给 Pimpl。
 dtNavMesh* ARecastNavMesh::GetRecastMesh()
 {
 	return RecastNavMeshImpl ? RecastNavMeshImpl->GetRecastMesh() : nullptr;
@@ -4396,6 +4603,7 @@ const dtNavMesh* ARecastNavMesh::GetRecastMesh() const
 //----------------------------------------------------------------------//
 // BP API
 //----------------------------------------------------------------------//
+// 蓝图封装：ReplaceAreaInTileBounds 的 BP 友好版本（替换成功时请求重绘）。
 bool ARecastNavMesh::K2_ReplaceAreaInTileBounds(FBox Bounds, TSubclassOf<UNavArea> OldArea, TSubclassOf<UNavArea> NewArea, bool ReplaceLinks)
 {
 	if (!ensureMsgf(Bounds.IsValid, TEXT("%hs Attempting to use Bounds which are not valid"), __FUNCTION__))

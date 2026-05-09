@@ -1,5 +1,51 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================================================
+// ReplicationFiltering.cpp —— Filtering 三阶段调度器 FReplicationFiltering 的实现。
+// ---------------------------------------------------------------------------------------------------------------------
+// 推荐与 ReplicationFiltering.h 顶部的"流程图"对照阅读。本文件主要分区：
+//
+//   §A  全局工具
+//        - GetStaticFilterName / GetDependentObjectFilterStatus
+//        - FNetObjectFilterHandleUtil（区分 static / dynamic handle，最高位标志）
+//        - FUpdateDirtyObjectsBatchHelper（脏对象按 Filter 分桶，再批量调用 UpdateObjects）
+//
+//   §B  生命周期
+//        - Init / Deinit / SetNetObjectListsSize / OnMaxInternalNetRefIndexIncreased / OnInternalNetRefIndicesFreed
+//        - InitFilters（按 NetObjectFilterDefinitions ini 创建 Dynamic Filter 实例）
+//        - InitObjectScopeHysteresis
+//
+//   §C  主入口 Filter()
+//        每帧调度顺序：ResetRemovedConnections → InitNewConnections → UpdateObjectsInScope
+//                    → UpdateGroupExclusionFiltering → UpdateGroupInclusionFiltering（部分预处理）
+//                    → UpdateOwnerFiltering → UpdateSubObjectFilters
+//                    → PreUpdateObjectScopeHysteresis
+//                    → UpdateDynamicFilters（含 Pre/Update/Post + 调用所有 UNetObjectFilter）
+//                    → FilterNonRelevantObjects（汇总到全局 RelevantObjectsInternalIndices）
+//        若没有 dynamic filter，则在该步骤内直接拷贝 ObjectsInScopeBeforeDynamicFiltering 到 ObjectsInScope。
+//
+//   §D  连接管理
+//        - AddConnection / RemoveConnection / InitNewConnections / ResetRemovedConnections
+//
+//   §E  Owner / Connection / Group / SubObject Filter 实现
+//
+//   §F  Dynamic Filter 调度
+//        - PreUpdateDynamicFiltering / UpdateDynamicFiltering / PostUpdateDynamicFiltering
+//        - NotifyFiltersOfDirtyObjects / BatchNotifyFiltersOfDirtyObjects
+//
+//   §G  Hysteresis（PreUpdate/PostUpdate/Clear）
+//
+//   §H  PerObjectInfo 池 / Group 状态控制
+//
+//   §I  汇总 & 调试（FilterNonRelevantObjects / BuildAlwaysRelevantList / PrintFilterObjectInfo / SubObject 校验）
+//
+// 关键 cvar：
+//   - net.Iris.CullNonRelevant（默认开）：不开则跳过 FilterNonRelevantObjects 的剔除，等同于"全相关"。
+//   - net.Iris.Filtering.ValidateNobSubObjectInScopeWithFilteredOutRootObject（默认关）：每帧校验"根对象被过滤、子对象在 scope" 的孤儿现象。
+//
+// 句柄编码：FNetObjectFilterHandleUtil 用 MSB 区分 dynamic/static；low bits 在 dynamic 路径内做 DynamicFilterInfos 索引。
+// =====================================================================================================================
+
 #include "ReplicationFiltering.h"
 #include "HAL/PlatformMath.h"
 #include "HAL/IConsoleManager.h"
@@ -25,12 +71,15 @@
 namespace UE::Net::Private
 {
 
+// 总开关：开启时 FilterNonRelevantObjects 会把"对所有连接都不相关"的对象从全局 RelevantObjectsInternalIndices 中剔除。
 bool bCVarRepFilterCullNonRelevant = true;
 static FAutoConsoleVariableRef CVarRepFilterCullNonRelevant(TEXT("Net.Iris.CullNonRelevant"), bCVarRepFilterCullNonRelevant, TEXT("When enabled will cull replicated actors that are not relevant to any client."), ECVF_Default);
 
+// 校验开关：发现"根对象被过滤、子对象仍在 scope"的孤儿场景时 ensure 报错（仅诊断用，默认关闭）。
 bool bCVarRepFilterValidateNoSubObjectInScopeWithFilteredOutRootObject = false;
 static FAutoConsoleVariableRef CVarRepFilterValidateNoSubObjectInScopeWithFilteredOutRootObject(TEXT("Net.Iris.Filtering.ValidateNobSubObjectInScopeWithFilteredOutRootObject"), bCVarRepFilterValidateNoSubObjectInScopeWithFilteredOutRootObject, TEXT("Validate there are no subobjects in scope with a filtered out root object."), ECVF_Default);
 
+// 静态保留 handle → 名字（NoFilter / ToOwnerFilter / ConnectionFilter）。
 FName GetStaticFilterName(FNetObjectFilterHandle Filter)
 {
 	switch (Filter)
@@ -62,6 +111,7 @@ FName GetStaticFilterName(FNetObjectFilterHandle Filter)
 	return NAME_None;
 }
 
+// 沿依赖链向上递归：只要任一父对象在 ObjectsInScope 中，认为本对象也通过过滤（依赖对象覆盖动态过滤）。
 inline static ENetFilterStatus GetDependentObjectFilterStatus(const FNetRefHandleManager* NetRefHandleManager, const FNetBitArray& ObjectsInScope, FInternalNetRefIndex ObjectIndex)
 {
 	for (const FInternalNetRefIndex ParentObjectIndex : NetRefHandleManager->GetDependentObjectParents(ObjectIndex))
@@ -74,6 +124,7 @@ inline static ENetFilterStatus GetDependentObjectFilterStatus(const FNetRefHandl
 	return ObjectsInScope.GetBit(ObjectIndex) ? ENetFilterStatus::Allow : ENetFilterStatus::Disallow;
 }
 
+// FNetObjectFilterHandle 编码工具：最高位 = 1 表示 dynamic filter；其余位为索引/保留语义。
 class FNetObjectFilterHandleUtil
 {
 public:
@@ -93,6 +144,11 @@ private:
 // FUpdateDirtyObjectsBatchHelper
 //*************************************************************************************************
 
+/**
+ * 脏对象批处理辅助：把脏对象按"它们绑定的 dynamic filter index"分桶，
+ * 再以每桶 ≤ MaxObjectCountPerBatch 的批次调用对应 Filter::UpdateObjects。
+ * 优点：UpdateObjects 拿到的对象一定属于同一 Filter，逻辑清爽且可高效缓存命中。
+ */
 class FReplicationFiltering::FUpdateDirtyObjectsBatchHelper
 {
 public:
@@ -123,6 +179,7 @@ public:
 		}
 	}
 
+	// 把一批脏对象按 FilterIndex 分桶（同一 Filter 的对象写到该 Filter 专属的批次缓冲）。
 	void PrepareBatch(const uint32* ObjectIndices, uint32 ObjectCount, const TArray<uint8>& FilterIndices)
 	{
 		ResetBatch();
@@ -163,6 +220,7 @@ private:
 
 // Helper class instance to avoid logging redundant dependent objects more than once per object class.
 #if !UE_BUILD_SHIPPING
+// 防日志风暴：同一对象类型的"无意义依赖"只警告一次。
 static FIrisLogOnceTracker ReplicationFiltering_MootDependentObjectTracker;
 #endif
 
@@ -170,6 +228,7 @@ static FIrisLogOnceTracker ReplicationFiltering_MootDependentObjectTracker;
 // FReplicationFiltering
 //*************************************************************************************************
 
+// 构造：所有"是否有脏数据"标志归零；StaticChecks 保证编译期内的位图分桶尺寸假设。
 FReplicationFiltering::FReplicationFiltering()
 : bHasNewConnection(0)
 , bHasRemovedConnection(0)
@@ -189,6 +248,8 @@ void FReplicationFiltering::StaticChecks()
 	static_assert(sizeof(FNetBitArrayBase::StorageWordType) == sizeof(uint32), "Expected FNetBitArrayBase::StorageWordType to be four bytes in size."); 
 }
 
+// 一次性初始化：缓存依赖对象、按 MaxConnectionCount + 1 分配 ConnectionInfos、初始化所有位图与 Group 状态。
+// 最后调用 InitFilters 创建动态 Filter 实例 + InitObjectScopeHysteresis 建立 hysteresis 状态机。
 void FReplicationFiltering::Init(FReplicationFilteringInitParams& Params)
 {
 	check(Params.Connections != nullptr);
@@ -205,6 +266,7 @@ void FReplicationFiltering::Init(FReplicationFilteringInitParams& Params)
 	MaxInternalNetRefIndex = Params.MaxInternalNetRefIndex;
 
 	// Connection specifics
+	// ConnectionId 从 1 起，故位图与数组多分配 1 槽（位 0/索引 0 永不使用）。
 	ConnectionInfos.SetNum(Params.Connections->GetMaxConnectionCount() + 1U);
 	ValidConnections.Init(ConnectionInfos.Num());
 	NewConnections.Init(ConnectionInfos.Num());
@@ -227,6 +289,7 @@ void FReplicationFiltering::Init(FReplicationFilteringInitParams& Params)
 		DirtySubObjectFilterGroups.Init(InMaxGroupCount);
 	}
 
+	// PerObjectInfo 单条记录占 (FPerObjectInfo + N-1) 个 uint32：N=向上取整(连接数/32)。
 	PerObjectInfoStorageCountForConnections = Align(FPlatformMath::Max(uint32(ConnectionInfos.Num()), 1U), 32U)/32U;
 	PerObjectInfoStorageCountPerItem = sizeof(FPerObjectInfo) + PerObjectInfoStorageCountForConnections - 1U;
 
@@ -234,6 +297,7 @@ void FReplicationFiltering::Init(FReplicationFilteringInitParams& Params)
 	InitObjectScopeHysteresis();
 }
 
+// 关停：先 Deinit 所有 Dynamic Filter（断开 ReplicationSystem 引用），再缩容所有位图为 0。
 void FReplicationFiltering::Deinit()
 {
 	for (FFilterInfo& FilterInfo : DynamicFilterInfos)
@@ -245,6 +309,7 @@ void FReplicationFiltering::Deinit()
 	SetNetObjectListsSize(0);
 }
 
+// 调整所有"按对象索引"的位图与数组到指定上限。本函数在 Init / OnMaxInternalNetRefIndexIncreased 中调用。
 void FReplicationFiltering::SetNetObjectListsSize(FInternalNetRefIndex MaxInternalIndex)
 {
 	WordCountForObjectBitArrays = Align(MaxInternalIndex, sizeof(FNetBitArrayBase::StorageWordType) * 8U) / (sizeof(FNetBitArrayBase::StorageWordType) * 8U);
@@ -270,6 +335,7 @@ void FReplicationFiltering::SetNetObjectListsSize(FInternalNetRefIndex MaxIntern
 	}
 
 	// ObjectIndexToDynamicFilterIndex is initialized to a non-zero value.
+	// 注意：哨兵值不是 0 而是 InvalidDynamicFilterIndex(=255)，所以扩容部分需要 Memset。
 	{
 		const int32 PrevMaxSize = ObjectIndexToDynamicFilterIndex.Num();
 		ObjectIndexToDynamicFilterIndex.SetNumUninitialized(MaxInternalIndex);
@@ -285,10 +351,12 @@ void FReplicationFiltering::SetNetObjectListsSize(FInternalNetRefIndex MaxIntern
 	}
 
 	// Always allocated and maintained regardless of whether the feature is enabled or not.
+	// Hysteresis 相关位图始终维护（即便功能关闭，避免分支判断）。
 	HysteresisState.ObjectsToClear.SetNumBits(MaxInternalNetRefIndex);
 	HysteresisState.ObjectsExemptFromHysteresis.SetNumBits(MaxInternalNetRefIndex);
 }
 
+// 索引上限增长事件：扩展全局位图 + 每连接位图 + 各 Dynamic Filter 内部容器。
 void FReplicationFiltering::OnMaxInternalNetRefIndexIncreased(FInternalNetRefIndex NewMaxInternalIndex)
 {
 	MaxInternalNetRefIndex = NewMaxInternalIndex;
@@ -318,6 +386,7 @@ void FReplicationFiltering::OnMaxInternalNetRefIndexIncreased(FInternalNetRefInd
 	}
 }
 
+// 索引被回收事件：清"对象 → OwningConnection"映射；其它信息（filter 绑定/group 关系）由调用链上层在 StopReplicating 处显式清。
 void FReplicationFiltering::OnInternalNetRefIndicesFreed(const TConstArrayView<FInternalNetRefIndex>& FreedIndices)
 {
 	// Clear owner info just as the index is freed. We want to keep the owner info even when an object goes out of scope so that state flushing works as expected.
@@ -327,6 +396,10 @@ void FReplicationFiltering::OnInternalNetRefIndicesFreed(const TConstArrayView<F
 	}
 }
 
+// 主入口：每帧由 FReplicationSystemImpl::UpdateFiltering 调用。流程顺序遵循文件头流程图。
+//   - 若 HasDynamicFilters：UpdateDynamicFilters 内部完成"Pre/Update/Post + Inclusion + Hysteresis 调整"；
+//   - 否则直接把 ObjectsInScopeBeforeDynamicFiltering 拷入 ObjectsInScope（避免无谓的 ForAllSetBits 开销）。
+//   最后 FilterNonRelevantObjects 把"对所有连接都不相关"的对象从全局 RelevantObjectsInternalIndices 中剔除。
 void FReplicationFiltering::Filter()
 {
 #if UE_NET_IRIS_CSV_STATS
@@ -369,6 +442,10 @@ void FReplicationFiltering::Filter()
 	FilterNonRelevantObjects();
 }
 
+// 阶段 8：把"全局 AlwaysRelevant 列表"与"每连接 ObjectsInScope"做并集，写入 RelevantObjectsInternalIndices。
+//   - bCVarRepFilterCullNonRelevant 关闭：等价于"全相关"——直接 Copy 整个 Scope；
+//   - 开启：用 BuildAlwaysRelevantList 取系统级永远相关，再叠加每个连接的 ObjectsInScope。
+//   - 校验路径：bCVarRepFilterValidateNoSubObjectInScopeWithFilteredOutRootObject 时检查孤儿 SubObject。
 void FReplicationFiltering::FilterNonRelevantObjects()
 {
 	IRIS_PROFILER_SCOPE(FReplicationFiltering_FilterNonRelevantObjects);
@@ -406,6 +483,8 @@ void FReplicationFiltering::FilterNonRelevantObjects()
 	//$IRIS TODO: Need to ensure newly relevant objects are immediately polled similar to calling ForceNetUpdate.
 }
 
+// "AlwaysRelevant"判定：在 ScopeList 范围内、不属于任何 Filter（OwnerFilter / DynamicFilter / GroupFilter）的对象。
+// 用 word 级位运算：OutAlwaysRelevant = Scope & ~(WithOwner | DynamicEnabled | GroupFilteredOut)。
 void FReplicationFiltering::BuildAlwaysRelevantList(FNetBitArrayView OutAlwaysRelevantList, const FNetBitArrayView ScopeList) const
 {
 	const uint32 MaxWords = OutAlwaysRelevantList.GetNumWords();
@@ -430,6 +509,11 @@ void FReplicationFiltering::BuildAlwaysRelevantList(FNetBitArrayView OutAlwaysRe
 }
 
 /** Dynamic filters allows users to filter out objects based on arbitrary criteria. */
+// 动态过滤总流程：
+//   1) NotifyFiltersOfDirtyObjects：把脏对象按 Filter 分桶批量通知 UpdateObjects；
+//   2) PreUpdateDynamicFiltering：每个 Filter 调一次 PreFilter；
+//   3) UpdateDynamicFiltering：对每个连接调每个 Filter::Filter（可能多批），合并 OutAllowedObjects 到 per-conn 位图；
+//   4) PostUpdateDynamicFiltering：每个 Filter 调一次 PostFilter；最终把 DynamicFilteredOutObjectsHysteresisAdjusted 写入 ObjectsInScope。
 void FReplicationFiltering::UpdateDynamicFilters()
 {
 	NotifyFiltersOfDirtyObjects();
@@ -439,6 +523,10 @@ void FReplicationFiltering::UpdateDynamicFilters()
 	PostUpdateDynamicFiltering();
 }
 
+// 设置对象的 OwningConnection。
+//   - 0 视为"无所有者"（谁都不收到，等价于全连接 Disallow，但仍参与 RS 内部状态机）；
+//   - 非 0 必须是有效连接 ID；否则警告并丢弃。
+//   - 标脏 ObjectsWithDirtyOwner，等下一帧 UpdateOwnerFiltering 落地。
 void FReplicationFiltering::SetOwningConnection(FInternalNetRefIndex ObjectIndex, uint32 ConnectionId)
 {
 	// We allow valid connections as well as 0, which would prevent the object from being replicated to anyone.

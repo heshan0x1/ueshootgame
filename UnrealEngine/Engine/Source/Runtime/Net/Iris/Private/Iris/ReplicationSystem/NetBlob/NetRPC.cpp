@@ -1,5 +1,34 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NetRPC.cpp —— Iris RPC 数据载体的完整实现
+// -----------------------------------------------------------------------------
+// 阅读路线：
+//   * 序列化: Serialize / SerializeWithObject —— 写 Header(占位) → ObjectRef
+//             → FunctionLocator → Payload(已 Quantize 的参数) → 回填 Header。
+//   * 反序列化: Deserialize / DeserializeWithObject —— 读 Header(取得总位数)
+//             → ObjectRef → FunctionLocator → ResolveFunctionAndObject
+//             → Payload；若 Resolve 失败则 Seek 到 PostNetRPCPos 跳过整段，
+//             保证后续 blob 不被错位。
+//   * Create —— 发送侧把 UFunction* 与原始参数 buffer 组装成 FNetRPC 实例：
+//       1) 走 SuperFunction 链找到顶层（蓝图派生函数共享 locator）；
+//       2) NetRPC_GetFunctionLocator 在 ReplicationProtocol 状态描述符 + 成员函
+//          数描述符表中线性查找匹配的 UFunction，得到 (Descriptor,Function) 索引；
+//       3) Quantize 参数到 QuantizedBlobState（有 server 端 stomp 检测可选 Protect）；
+//       4) FNetReferenceCollector 收集 payload 内可导出的对象引用。
+//   * CallFunction —— 接收侧执行：
+//       a) 解析 root/sub 对象，校验 UFunction、是否 Net 函数、方向（Server/Client）；
+//       b) 服务器还要校验"target 是不是该 connection 拥有"（IsServerAllowedToExecuteRPC）；
+//       c) 分配栈上 FunctionParameters → Dequantize → ForwardNetRPCCallDelegate
+//          多播（外部 Hook）→ Object->ProcessEvent；
+//       d) 销毁参数。
+// 注意点：
+//   * BP 派生函数：FunctionLocator 指向 SuperFunction，但实际调用要 Object
+//     ->FindFunction(Function->GetFName()) 拿到子类覆写版本（UE-220400）。
+//   * 反序列化结束后还会校验 PostNetRPCPos 与实际位置是否一致 —— 不一致说明
+//     Payload 解析与 Header 声明的位长不匹配，将整段跳过并标错。
+// =============================================================================
+
 #include "Iris/ReplicationSystem/NetBlob/NetRPC.h"
 
 #include "HAL/IConsoleManager.h"
@@ -33,6 +62,9 @@ DEFINE_LOG_CATEGORY_STATIC(LogIrisRpc, Log, All);
 namespace UE::Net::Private
 {
 
+// 中文：调试 CVar —— 在 dedicated server 上检测 RPC 状态在 Quantize 之后、Serialize
+// 之前是否被外部代码"踩坏"。开启后 QuantizedBlobState 用 Protectable 内存分配；
+// Quantize 完成后立即 Protect()，任何写入都会立即触发 access violation 便于定位。
 static bool bEnableRPCServerStateStompDetection = false;
 static FAutoConsoleVariableRef CVarEnableRPCStateStompDetection(
 	TEXT("net.Iris.RPC.ServerStompDetectionEnabled"),
@@ -40,17 +72,26 @@ static FAutoConsoleVariableRef CVarEnableRPCStateStompDetection(
 	TEXT("If enabled we can detect if RPC state is stomped between quantization and serialization on a dedicated server.")
 );
 
+// ---- 内部辅助函数前置声明（实现在文件末尾） --------------------------------
+// 中文：在 ReplicationProtocol 中线性查找 UFunction → FFunctionLocator + 描述符。
+//       O(N) 即可，因为单个对象的描述符与函数数量都很小。
+
 static bool NetRPC_GetFunctionLocator(const UReplicationSystem* ReplicationSystem, const FNetObjectReference& ObjectReference, const UFunction* Function, FNetRPC::FFunctionLocator& OutFunctionLocator, const FReplicationStateMemberFunctionDescriptor*& OutFunctionDescriptor);
 
+// 中文：FNetObjectReference → UObject*（统一入口；带 SubObject 优先解 SubObject）。
 static UObject* NetRPC_GetObject(FNetSerializationContext& Context, const FNetObjectReference& ObjectReference);
 static UObject* NetRPC_GetObject(FNetSerializationContext& Context, const FNetObjectReference& RootObjectReference, const FNetObjectReference& SubObjectReference);
+// 中文：拿 SubObject 的根对象（用于 ForwardNetRPCCallDelegate 区分 root/sub）。
 static UObject* NetRPC_GetRootObject(FNetSerializationContext& Context, const FNetObjectReference& ObjectReference);
 
+// 中文：接收侧"对象 + 函数描述符"一站式解析（含错误处理）。
 static bool NetRPC_GetFunctionAndObject(FNetSerializationContext& Context, const FNetObjectReference& RootObjectReference, const FNetObjectReference& SubObjectReferece, const FNetRPC::FFunctionLocator& FunctionLocator, const FReplicationStateMemberFunctionDescriptor*& OutFunctionDescriptor, TWeakObjectPtr<UObject>& OutObject);
 
+// 中文：调试用——把 (Descriptor, Function) 索引映射回函数名 / 引用名。
 static FString NetRPC_GetDebugFunctionName(const UReplicationSystem* ReplicationSystem, const FNetObjectReference& ObjectReference, const FNetRPC::FFunctionLocator& FunctionLocator);
 static FString NetRPC_GetDebugObjectRefName(FNetSerializationContext& Context, const FNetObjectReference& ObjectReference, UObject* ObjectPtr = nullptr);
 
+// 中文：错误名常量（NetTrace / SetError 时使用，便于上层定位）。
 static const FName NetError_InvalidNetObjectReference("Invalid NetObjectRefererence");
 static const FName NetError_UnknownFunction("Unknown RPC");
 static const FName NetError_FunctionCallNotAllowed("RPC call not allowed");
@@ -66,11 +107,15 @@ FNetRPC::~FNetRPC()
 {
 }
 
+// 中文：返回 Create() 时收集到的可导出对象引用列表（参数中含的 ref）。
 TArrayView<const FNetObjectReference> FNetRPC::GetNetObjectReferenceExports() const
 {
 	return ReferencesToExport.IsValid() ? MakeArrayView(*ReferencesToExport) : MakeArrayView<const FNetObjectReference>(nullptr, 0);
 }
 
+// 中文：SerializeWithObject —— 上层连接已知 root RefHandle，仅写 SubObject 引用 +
+// Locator + Payload。Header 占位，全部写完再回填准确位长。任何错误立刻返回，
+// 由上层回滚整段。
 void FNetRPC::SerializeWithObject(FNetSerializationContext& Context, FNetRefHandle RefHandle) const
 {
 	UE_NET_TRACE_DYNAMIC_NAME_SCOPE(BlobDescriptor->DebugName, *Context.GetBitStreamWriter(), Context.GetTraceCollector(), ENetTraceVerbosity::Verbose);
@@ -105,6 +150,7 @@ void FNetRPC::SerializeWithObject(FNetSerializationContext& Context, FNetRefHand
 	if (!Writer.IsOverflown())
 	{
 		// Re-serialize the final size value in the header
+		// 中文：未溢出才回填实际大小；溢出时上层会回滚整段写入。
 		const uint32 RPCSize = Writer.GetPosBits() - HeaderPos;
 		FNetBitStreamWriteScope WriteScope(Writer, HeaderPos);
 		InternalSerializeHeader(Context, RPCSize);
@@ -114,9 +160,11 @@ void FNetRPC::SerializeWithObject(FNetSerializationContext& Context, FNetRefHand
 void FNetRPC::DeserializeWithObject(FNetSerializationContext& Context, FNetRefHandle RefHandle)
 {
 	// We don't know the function name until much later.
+	// 中文：解析 Locator → 拿到 Function 的 DebugName 后再回填 trace scope 名字。
 	UE_NET_TRACE_NAMED_SCOPE(TraceScope, RPC, *Context.GetBitStreamReader(), Context.GetTraceCollector(), ENetTraceVerbosity::Trace);
 
 	// Store the next valid position after the NetRPC data.
+	// 中文：HeaderPos + Header 中读出的位长 = 整个 RPC 的尾部位置。失败时用于 Seek 跳过整段。
 	const uint32 HeaderPos = Context.GetBitStreamReader()->GetPosBits();
 	const uint32 PostNetRPCPos = HeaderPos + InternalDeserializeHeader(Context);
 	if (Context.HasErrorOrOverflow())
@@ -147,6 +195,7 @@ void FNetRPC::DeserializeWithObject(FNetSerializationContext& Context, FNetRefHa
 		UE_LOG(LogIrisRpc, Error, TEXT("DeserializeWithObject::Skipping RPC due missing object or function."));
 
 		// Stop deserializing and seek past the entire payload if the resolve failed
+		// 中文：跳过整个 RPC payload，避免错位影响后续 blob。
 		Context.GetBitStreamReader()->Seek(PostNetRPCPos);
 		return;
 	}
@@ -157,6 +206,8 @@ void FNetRPC::DeserializeWithObject(FNetSerializationContext& Context, FNetRefHa
 	if (!Context.HasErrorOrOverflow())
 	{
 		// Just because the serialization didn't detect an error doesn't mean everything is ok. Validate stream position.
+		// 中文：双重保险——Payload 实际读出长度必须等于 Header 声明的长度，否则
+		// 协议结构错位（很可能 server/client 协议版本不一致），整段跳过并标错。
 		if (PostNetRPCPos != Context.GetBitStreamReader()->GetPosBits())
 		{
 			UE_LOG(LogIrisRpc, Error, TEXT("Bitstream mismatch while deserializing function %s. Actual stream position: %u Expected stream position: %u"), ToCStr(BlobDescriptor->DebugName), Context.GetBitStreamReader()->GetPosBits(), PostNetRPCPos);
@@ -164,6 +215,7 @@ void FNetRPC::DeserializeWithObject(FNetSerializationContext& Context, FNetRefHa
 			Context.GetBitStreamReader()->Seek(PostNetRPCPos);
 			Context.SetError(GNetError_BitStreamError);
 			// Make sure the RPC won't be exeuted regardless of how errors are handled.
+			// 中文：清掉 Function 防止 CallFunction 仍意外执行已无效的内容。
 			Function = nullptr;
 		}
 	}
@@ -171,6 +223,7 @@ void FNetRPC::DeserializeWithObject(FNetSerializationContext& Context, FNetRefHa
 
 void FNetRPC::Serialize(FNetSerializationContext& Context) const
 {
+	// 中文：Serialize 全量版本——上层不知道 RefHandle，需要写完整 ObjectRef。
 	UE_NET_TRACE_DYNAMIC_NAME_SCOPE(BlobDescriptor->DebugName, *Context.GetBitStreamWriter(), Context.GetTraceCollector(), ENetTraceVerbosity::Trace);
 
 	FNetBitStreamWriter& Writer = *Context.GetBitStreamWriter();
@@ -211,6 +264,8 @@ void FNetRPC::Serialize(FNetSerializationContext& Context) const
 
 void FNetRPC::Deserialize(FNetSerializationContext& Context)
 {
+	// 中文：Deserialize 全量版本——读完整 ObjectRef → Locator → 解析 → Payload。
+	// 任何阶段出错或对象/函数找不到都把读指针 Seek 到 PostNetRPCPos 跳过整段。
 	UE_NET_TRACE_NAMED_SCOPE(TraceScope, RPC, *Context.GetBitStreamReader(), Context.GetTraceCollector(), ENetTraceVerbosity::Trace);
 
 	// Store the next valid bit position after the NetRPC data.
@@ -263,6 +318,9 @@ void FNetRPC::Deserialize(FNetSerializationContext& Context)
 
 void FNetRPC::InternalSerializeHeader(FNetSerializationContext& Context, int32 PayloadSize /*= -1*/) const
 {
+	// 中文：Header 写入——分两阶段使用：
+	//   * PayloadSize=-1：占位写 0（保留 24bit 槽位）；
+	//   * 真实大小：用 FNetBitStreamWriteScope 切回原 Header 位置回填。
 	FNetBitStreamWriter* Writer = Context.GetBitStreamWriter();
 
 	// Pre-serialize the header before we know the final RPC payload size
@@ -289,6 +347,9 @@ uint32 FNetRPC::InternalDeserializeHeader(FNetSerializationContext& Context)
 
 void FNetRPC::SerializeFunctionLocator(FNetSerializationContext& Context) const
 {
+	// 中文：FunctionLocator 变长写——按两索引中的最大值算 nibble 数（4-bit 一组）：
+	//   先写 2bit 表示 (nibble 数 - 1)，随后两索引各占 nibble*4 位。
+	//   绝大多数对象 Locator ≤ 15，nibble=1 即可（总 2+4+4=10bit）。
 	FNetBitStreamWriter* Writer = Context.GetBitStreamWriter();
 	UE_NET_TRACE_SCOPE(FunctionLocator, *Writer, Context.GetTraceCollector(), ENetTraceVerbosity::Trace);
 
@@ -348,10 +409,14 @@ void FNetRPC::InternalDeserializeBlob(FNetSerializationContext& Context)
 
 bool FNetRPC::ResolveFunctionAndObject(FNetSerializationContext& Context)
 {
+	// 中文：接收侧综合解析——成功返回 true 后会设置 Function、ObjectPtr、
+	// BlobDescriptor、QuantizedBlobState；同时根据 UFunction 标志补 ENetBlobFlags。
+	// 失败返回 false，调用方会跳过整段 RPC。
 	// At this point we need a valid handle and FunctionLocator
 	if (!NetObjectReference.GetRefHandle().IsValid())
 	{
 		// This can occur if sending side had queued up rpcs to object being invalidated
+		// 中文：发送侧入队后该对象失效（Actor/组件销毁），ref 已被置无效。
 		return false;
 	}
 
@@ -364,6 +429,7 @@ bool FNetRPC::ResolveFunctionAndObject(FNetSerializationContext& Context)
 	Function = FunctionDescriptor->Function;
 
 	// Patch up NetBlobFlags based on function flags.
+	// 中文：根据 UFunction 标志位补 ENetBlobFlags，让接收端逻辑保持与发送端一致。
 	if (Function)
 	{
 		if ((Function->FunctionFlags & FUNC_NetReliable) != 0)
@@ -372,6 +438,7 @@ bool FNetRPC::ResolveFunctionAndObject(FNetSerializationContext& Context)
 		}
 
 		// The sending side will set Ordered on unicast/reliable RPCs so we're restoring that flag. Unicast RPCs are ordered with respect to other reliable and unicast RPCs whereas multicast RPCs are not.
+		// 中文：unicast RPC 与同对象其他 reliable/unicast RPC 严格保序；multicast 不要求。
 		if ((Function->FunctionFlags & FUNC_NetMulticast) == 0)
 		{
 			CreationInfo.Flags |= UE::Net::ENetBlobFlags::Ordered;
@@ -379,8 +446,10 @@ bool FNetRPC::ResolveFunctionAndObject(FNetSerializationContext& Context)
 	}
 
 	// Set the BlobDescriptor even if it has zero size so that we can trace with a meaningful name.
+	// 中文：即使无参数（InternalSize=0），也设置 Descriptor 用于 trace 命名。
 	BlobDescriptor = FunctionDescriptor->Descriptor;
 
+	// 中文：参数描述符 InternalSize=0 → 无参，跳过 Quantize 缓冲分配。
 	if (FunctionDescriptor->Descriptor->InternalSize)
 	{
 		QuantizedBlobState = FQuantizedBlobState(FunctionDescriptor->Descriptor->InternalSize, FunctionDescriptor->Descriptor->InternalAlignment);
@@ -391,6 +460,12 @@ bool FNetRPC::ResolveFunctionAndObject(FNetSerializationContext& Context)
 
 FNetRPC* FNetRPC::Create(UReplicationSystem* ReplicationSystem, const FNetBlobCreationInfo& CreationInfo, const FNetObjectReference& ObjectReference, const UFunction* Function, const void* FunctionParameters)
 {
+	// 中文：发送侧工厂——把 UFunction* + 参数 buffer 组装成 FNetRPC。
+	//   1) Walk to topmost SuperFunction —— 蓝图/原生派生 RPC 共享顶层签名，
+	//      发送时使用顶层 UFunction 才能在不同实例上 locator 索引一致。
+	//   2) NetRPC_GetFunctionLocator 在对象 ReplicationProtocol 中线性查找。
+	//   3) Quantize 函数参数（写入 QuantizedBlobState 缓冲）。
+	//   4) FNetReferenceCollector 收集 payload 中"可导出"的对象引用。
 	while (const UFunction* SuperFunction = Function->GetSuperFunction())
 	{
 		Function = SuperFunction;
@@ -423,11 +498,13 @@ FNetRPC* FNetRPC::Create(UReplicationSystem* ReplicationSystem, const FNetBlobCr
 		Context.SetInternalContext(&InternalContext);
 
 		// Quantize the function parameters
+		// 中文：将外部表示（External，UFunction 参数）→ 内部表示（Internal，紧凑 quantized）。
 		FReplicationStateOperations::Quantize(Context, QuantizedBlobState.GetStateBuffer(), static_cast<const uint8*>(FunctionParameters), BlobDescriptor);
 
 #if WITH_SERVER_CODE
 		if (MemoryAllocationFlags == FQuantizedBlobState::EMemoryAllocationFlags::Protectable)
 		{
+			// 中文：保护内存，Quantize 之后任何写入都将立即触发 access violation 便于排错。
 			QuantizedBlobState.Protect();
 		}
 #endif
@@ -441,6 +518,8 @@ FNetRPC* FNetRPC::Create(UReplicationSystem* ReplicationSystem, const FNetBlobCr
 		if (BlobDescriptor->HasObjectReference())
 		{
 			// Collect all references and add them to potential exports
+			// 中文：参数中可能含需"导出"的对象引用，发送前先收集。仅收集"可导出"
+			// 引用——内联引用、不可导出的引用不进表。
 			using namespace UE::Net::Private;
 			{
 				FNetSerializationContext LocalContext;
@@ -469,6 +548,14 @@ FNetRPC* FNetRPC::Create(UReplicationSystem* ReplicationSystem, const FNetBlobCr
 
 void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 {
+	// 中文：接收侧执行 RPC 的核心流程。
+	//   1) 解析 Object（弱引用→ObjectReferenceCache 二次解析）；
+	//   2) 校验：函数有效、对象仍在复制（HasInstanceProtocol）、是 FUNC_Net 函数、
+	//      Server/Client 方向匹配；服务器还要校验 connection ownership；
+	//   3) 在栈上分配 FunctionParameters → InitializeValue 复杂参数 → Dequantize；
+	//   4) BP override：用 Object->FindFunction 拿派生版 UFunction；
+	//   5) ForwardNetRPCCallDelegate 多播 → ProcessEvent；
+	//   6) 销毁参数。
 #if UE_NET_IRIS_CSV_STATS
 	CSV_SCOPED_TIMING_STAT_EXCLUSIVE(HandleRPC);
 #endif
@@ -505,6 +592,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 	}
 
 	// Make sure the root object has an instance protocol
+	// 中文：root object 必须仍处于复制状态（HasInstanceProtocol）。否则 RPC 是"残
+	// 留消息"——对象在本端已停止复制，丢弃避免触发死实例上的代码。
 	{
 		const FNetRefHandleManager& NetRefHandleManager = ReplicationSystem->GetReplicationSystemInternal()->GetNetRefHandleManager();
 		const FNetRefHandle RootObjectNetRefHandle = NetObjectReference.GetRefHandle();
@@ -526,6 +615,7 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 
 	if ((Function->FunctionFlags & FUNC_Net) == 0)
 	{
+		// 中文：必须是 Net 函数（FUNC_Net），否则视为协议非法，立刻 SetError。
 		UE_LOG(LogIrisRpc, Error, TEXT("Rejected %s function %s due to it not being a Net function. %s : %s"), (Function->FunctionFlags & FUNC_NetReliable ? TEXT("reliable") : TEXT("unreliable")), ToCStr(Function->GetName()), *NetObjectReference.ToString(), *Object->GetFullName());
 		Context.SetError(NetError_FunctionCallNotAllowed);
 		return;
@@ -536,6 +626,7 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 	{
 		if ((Function->FunctionFlags & (FUNC_NetClient | FUNC_NetMulticast)) != 0)
 		{
+			// 中文：服务器不应该收到 client/multicast 类型 RPC（multicast 由服务器发起）。
 			UE_LOG(LogIrisRpc, Error, TEXT("Rejected %s client RPC function %s due to this being the server. %s : %s"), (Function->FunctionFlags & FUNC_NetReliable ? TEXT("reliable") : TEXT("unreliable")), ToCStr(Function->GetName()), *NetObjectReference.ToString(), *Object->GetFullName());
 			Context.SetError(NetError_FunctionCallNotAllowed);
 			return;
@@ -543,6 +634,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 
 		if (!IsServerAllowedToExecuteRPC(Context))
 		{
+			// 中文：服务器侧 ownership 校验——只有"持有该对象的连接"才能在该对象
+			// 上发起 ServerRPC。否则视为试图代他人发 RPC，直接丢弃。
 			UE_LOG(LogIrisRpc, Verbose, TEXT("Rejected %s RPC function %s due to target not being owned by the connection. %s : %s"), (Function->FunctionFlags & FUNC_NetReliable ? TEXT("reliable") : TEXT("unreliable")), ToCStr(Function->GetName()), *NetObjectReference.ToString(), *Object->GetFullName()); 
 			return;
 		}
@@ -552,6 +645,7 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 	{
 		if ((Function->FunctionFlags & FUNC_NetServer) != 0)
 		{
+			// 中文：客户端不应该收到 server-only RPC。
 			UE_LOG(LogIrisRpc, Error, TEXT("Rejected %s server RPC function %s due to this being the client. %s : %s"), (Function->FunctionFlags & FUNC_NetReliable ? TEXT("reliable") : TEXT("unreliable")), ToCStr(Function->GetName()), *NetObjectReference.ToString(), *Object->GetFullName());
 			return;
 		}
@@ -574,6 +668,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 	}
 
 	// Setup function parameters
+	// 中文：在栈上分配参数 buffer（FMemory_Alloca），按 BlobDescriptor 描述把
+	// quantized → external，然后 ProcessEvent 即可。空 ParmsSize 直接跳过。
 	uint8* FunctionParameters = nullptr;
 	if (Function->ParmsSize > 0)
 	{
@@ -610,6 +706,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 
 	// Since the replicated FunctionLocator references the SuperFunction, we must lookup the actual function to call from the target object to properly support BP derived functions.
 	// See: JIRA: UE-220400
+	// 中文：locator 指向 SuperFunction，但 BP 派生类可能 override；必须从目标对象
+	// 拿派生版本的 UFunction* 才能正确派发 ProcessEvent。
 	const UFunction* ActualFunction = Object->FindFunction(Function->GetFName());
 	if (ActualFunction == nullptr)
 	{
@@ -617,6 +715,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 	}
 
 	// Forward function
+	// 中文：ForwardNetRPCCallDelegate Hook —— ProcessEvent 之前广播给所有订阅方
+	// （回放、anti-cheat、调试等），可记录或转发。
 	if (const FForwardNetRPCCallMulticastDelegate& Delegate = CallContext.GetForwardNetRPCCallDelegate(); Delegate.IsBound())
 	{
 		UObject* RootObject = NetRPC_GetRootObject(Context, NetObjectReference);
@@ -626,6 +726,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 
 	// Call function
 	{
+		// 中文：FScopedNetContextRPC / FScopedRemoteRPCMode 通知 UFunction 系统
+		// "正在处理一个远端 RPC"——某些函数实现里据此判断来源（如 ServerRPC 合法性）。
 #if IRIS_CLIENT_PROFILER_ENABLE
 		UE::Net::FClientProfiler::RecordRPC(ActualFunction->GetFName());
 #endif
@@ -638,7 +740,8 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 	// Deinitialize function parameters
 	if (FunctionParameters != nullptr)
 	{
-
+		// 中文：与 InitializeValue 对偶——非 trivially destructible 的参数（含 FString /
+		// 智能指针等）需要逐个 DestroyValue 释放资源。
 		if (!EnumHasAnyFlags(BlobDescriptor->Traits, EReplicationStateTraits::IsSourceTriviallyDestructible))
 		{
 			for (TFieldIterator<FProperty> ParamIt(Function); ParamIt && (ParamIt->PropertyFlags & (CPF_Parm | CPF_ReturnParm)) == CPF_Parm; ++ParamIt)
@@ -651,6 +754,9 @@ void FNetRPC::CallFunction(FNetRPCCallContext& CallContext)
 
 bool FNetRPC::IsServerAllowedToExecuteRPC(FNetSerializationContext& Context) const
 {
+	// 中文：服务器端 ownership 校验。OwningConnectionId 在 SetOwningNetConnection
+	// 时被记录；只有该 connection 才能在该对象上发起 ServerRPC。否则视为试图代他
+	// 人发 RPC，丢弃。
 	const FNetRefHandle Handle = NetObjectReference.GetRefHandle();
 	const UReplicationSystem* ReplicationSystem = Context.GetInternalContext()->ReplicationSystem;
 
@@ -662,6 +768,8 @@ bool FNetRPC::IsServerAllowedToExecuteRPC(FNetSerializationContext& Context) con
 
 static bool NetRPC_GetFunctionLocator(const UReplicationSystem* ReplicationSystem, const FNetObjectReference& ObjectReference, const UFunction* Function, FNetRPC::FFunctionLocator& OutFunctionLocator, const FReplicationStateMemberFunctionDescriptor*& OutFunctionDescriptor)
 {
+	// 中文：在对象的 ReplicationProtocol 中线性搜索匹配的 UFunction。
+	// 一个对象的描述符与函数数都很少，O(N*M) 完全够用。
 	const UObjectReplicationBridge* Bridge = Cast<UObjectReplicationBridge>(ReplicationSystem->GetReplicationBridge());
 	if (!ensure(Bridge != nullptr))
 	{
@@ -704,6 +812,8 @@ static UObject* NetRPC_GetObject(FNetSerializationContext& Context, const FNetOb
 
 static UObject* NetRPC_GetRootObject(FNetSerializationContext& Context, const FNetObjectReference& ObjectReference)
 {
+	// 中文：得到目标对象所属的"根对象"（沿 SubObjectRootIndex 反查），用于 Forward
+	// 委托区分 root/sub 参数。
 	FInternalNetSerializationContext* InternalContext = Context.GetInternalContext();
 	const FNetRefHandleManager& NetRefHandleManager = InternalContext->ReplicationSystem->GetReplicationSystemInternal()->GetNetRefHandleManager();
 	
@@ -727,6 +837,11 @@ static UObject* NetRPC_GetRootObject(FNetSerializationContext& Context, const FN
 
 static bool NetRPC_GetFunctionAndObject(FNetSerializationContext& Context, const FNetObjectReference& ObjectReference, const FNetObjectReference& SubObjectReference, const FNetRPC::FFunctionLocator& FunctionLocator, const FReplicationStateMemberFunctionDescriptor*& OutFunctionDescriptor, TWeakObjectPtr<UObject>& OutObject)
 {
+	// 中文：接收侧综合解析——返回 UFunction 描述符 + 目标 UObject。
+	//   * 找不到对象（cache 解析失败）→ 返回 false 但不 SetError，允许 RPC 静默
+	//     丢弃（仍在 streaming-in / 已销毁等情况）；
+	//   * 协议不存在 → 同上，对象已停止复制；
+	//   * Locator 越界 → SetError(NetError_UnknownFunction)，视为协议错误。
 	const UReplicationSystem* ReplicationSystem = Context.GetInternalContext()->ReplicationSystem;
 	const UObjectReplicationBridge* Bridge = Cast<UObjectReplicationBridge>(ReplicationSystem->GetReplicationBridge());
 	if (!ensure(Bridge != nullptr))

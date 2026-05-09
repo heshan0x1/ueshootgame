@@ -1,5 +1,14 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================
+// StringTokenStore.cpp —— FString 的 NetToken 化存储实现
+// -------------------------------------------------------------------------------------------------------------
+// 关键点：
+//   - HashKey = CityHash64(stringBytes)，64-bit 哈希足够避免日常使用中的碰撞；
+//   - 持久化副本由 FMemStackBase 在 16-byte 对齐下批量分配，避免 TArray<FString> 的扩容拷贝开销；
+//   - 该 Store 与 ReplicationSystem 同生命周期，因此返回的 const TCHAR* 在解析期内是稳定的。
+// =============================================================================================================
+
 #include "Iris/ReplicationSystem/StringTokenStore.h"
 #include "Iris/Core/IrisLog.h"
 #include "Iris/Serialization/NetBitStreamReader.h"
@@ -25,6 +34,9 @@
 namespace UE::Net
 {
 
+// 主入口：(TCHAR*, length) -> NetToken。
+//   1) 通过 GetOrCreatePersistentString 在哈希表中查找 KeyIndex（不命中则复制持久副本）；
+//   2) 若 KeyIndex 已绑定 Token 则返回；否则分配新本地 Token 并入库。
 FNetToken FStringTokenStore::GetOrCreateToken(const TCHAR* Name, uint32 Length)
 {
 	FNetToken Result;
@@ -47,6 +59,10 @@ FNetToken FStringTokenStore::GetOrCreateToken(const FString& String)
 	return GetOrCreateToken(ToCStr(String), String.Len());
 }
 
+// 字符串去重 + 持久化复制：
+//   - 用 CityHash64 计算稳定 64-bit 哈希；
+//   - 命中已有键 → 直接返回；
+//   - 未命中 → 通过 Allocator 复制一份字符串副本（含末尾 '\0'），并把指针存入 StoredStrings。
 FNetTokenDataStore::FNetTokenStoreKey FStringTokenStore::GetOrCreatePersistentString(const TCHAR* Name, uint32 Length)
 {
 	// Hash name
@@ -62,6 +78,7 @@ FNetTokenDataStore::FNetTokenStoreKey FStringTokenStore::GetOrCreatePersistentSt
 	if (NewKey.IsValid())
 	{
 		// Allocate memory and copy persistent string
+		// 注意：Length+1 是为了拷贝末尾 '\0'；分配大小为 NameSize + sizeof(TCHAR) 也含尾零空间。
 		TCHAR* PersistentString = (TCHAR*)Allocator.Alloc(NameSize + sizeof(TCHAR), alignof(TCHAR));
 		FCString::Strncpy((TCHAR*)PersistentString, Name, Length + 1U);
 
@@ -80,9 +97,11 @@ FStringTokenStore::FStringTokenStore(FNetTokenStore& InTokenStore)
 {
 	// As we use an array for our storage we must match the size of the StoredTokens array.
 	// We assume that Index 0 is invalid.
+	// 与基类 StoredTokens 数组对齐，Index 0 = Invalid。
 	StoredStrings.SetNum(StoredTokens.Num());
 }
 
+// 解析 Token：选择对应的状态表（Local 或 Remote），反查 KeyIndex 拿到持久化字符串指针。
 const TCHAR* FStringTokenStore::ResolveToken(FNetToken Token, const FNetTokenStoreState* NetTokenStoreState) const
 {
 	const FNetTokenStoreState* TokenStoreState = TokenStore.IsLocalToken(Token) ? TokenStore.GetLocalNetTokenStoreState() : NetTokenStoreState;

@@ -1,5 +1,22 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================
+// NetTokenDataStream.cpp —— Token Export 独立 DataStream 实现
+// -------------------------------------------------------------------------------------------------------------
+// 比特流格式（WriteData 内部）：
+//   [子流：保留 1 bit Stop 位]
+//     while (有 Token 且能塞下) {
+//        WriteBool(true);          // 1 bit "有下一个 Token"
+//        WriteNetToken(Token);     // PackedUint32(Index) + 1 bit Authority + 5 bit TypeId
+//        WriteTokenData(Token);    // 具体值（FName/FString/Struct...）
+//     }
+//   WriteBool(false);              // 终止标志
+//
+// 丢包处理：
+//   - Lost：把 NetTokenExports（in-flight）末尾 Count 个 Token 反向插回 NetTokensPendingExport 队首，下次重发；
+//   - Delivered：从 NetTokenExports 移除（不再追踪）。
+// =============================================================================================================
+
 #include "NetTokenDataStream.h"
 
 #include "Iris/IrisConstants.h"
@@ -33,6 +50,8 @@
 namespace UE::Net::Private
 {
 
+// CVar：是否在新连接接入时把"本端已分配的全部 Token"预先排入 NetTokensPendingExport，
+// 以便对端尽早拥有完整的 Token 表（牺牲启动带宽换取后续解析稳定）。默认 false。
 static bool bIrisPreExportExistingNetTokensOnConnect = false;
 static FAutoConsoleVariableRef CVarIrisPreExportExistingNetTokensOnConnect(
 	TEXT("net.Iris.IrisPreExportExistingNetTokensOnConnect"),
@@ -64,12 +83,14 @@ void UNetTokenDataStream::Init(const UDataStream::FInitParameters& Params)
 	ReplicationSystemId = Params.ReplicationSystemId;
 	ConnectionId = Params.ConnectionId;
 
+	// 通过 ReplicationSystemId 找到关联的 ReplicationSystem，从而定位 NetTokenStore + 该连接的 RemoteState。
 	UReplicationSystem* ReplicationSystem = UE::Net::GetReplicationSystem(ReplicationSystemId);
 	NetTokenStore = ReplicationSystem->GetNetTokenStore();
 	RemoteNetTokenStoreState = NetTokenStore->GetRemoteNetTokenStoreState(Params.ConnectionId);
 	NetExports = Params.NetExports;
 
 	// $IRIS $TODO: if we want to make this into a real feature we need to expose some sort of api to mark tokens for pre-export
+	// 实验性"预导出"路径：把本端已有 Token 全部入队，确保对端尽早收到（详见 CVar 注释）。
 	if (Private::bIrisPreExportExistingNetTokensOnConnect)
 	{
 		TArray<FNetToken> Tokens(NetTokenStore->GetAllNetTokens());
@@ -85,6 +106,7 @@ void UNetTokenDataStream::AddNetTokenForExplicitExport(UE::Net::FNetToken NetTok
 	NetTokensPendingExport.Add(NetToken);
 }
 
+// 数据流框架查询本流是否有数据：仅当队列非空时返回 HasMoreData，让后续 WriteData 真正运行。
 UDataStream::EWriteResult UNetTokenDataStream::BeginWrite(const FBeginWriteParameters& Params)
 {
 	if (!ensure(NetTokenStore) || NetTokensPendingExport.Num() == 0)
@@ -105,6 +127,7 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 	if (!ensure(NetTokenStore) || NetTokensPendingExport.Num() == 0 || Writer->GetBitsLeft() < 1U)
 	{
 		// If we have no pending data in-flight we can trim down our storage
+		// 既无待发送、又无 in-flight，可以收回环形缓冲未使用的内存。
 		if (NetTokenExports.Num() == 0)
 		{
 			NetTokenExports.Trim();
@@ -123,12 +146,14 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 	UE_NET_TRACE_SCOPE(NetTokenDataStream, *Writer, Context.GetTraceCollector(), ENetTraceVerbosity::Trace);
 
 	// We use a substream to reserve a stop bit
+	// 预留 1 bit 用于流末尾的"无更多 Token"停止标志（见循环结束后的 WriteBool(false)）。
 	FNetBitStreamWriter SubStream = Writer->CreateSubstream(Writer->GetBitsLeft() - 1U);
 	FNetSerializationContext SubContext = Context.MakeSubContext(&SubStream);
 
 	const bool bIsNetTokenAuthority = NetTokenStore->IsAuthority();
 	while (NetTokensPendingExport.Num())
 	{
+		// 每个 Token 的写入是原子的：失败时通过 RollbackScope 回滚 SubStream + ExportContext。
 		FNetBitStreamRollbackScope SequenceRollback(SubStream);
 		FNetExportRollbackScope ExportsRollbackScope(SubContext);
 
@@ -136,16 +161,21 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 		const FNetToken& Token = NetTokensPendingExport.GetAtIndexNoCheck(0);
 
 		// We do not need to export tokens assigned by authority unless we are the authority.
+		// 边界条件：
+		//   - 如果本端是 Client 且 Token 是 Authority 分配的，对端（Server）一定已经知道，不需要再 export；
+		//   - 如果 Token 已在 ExportContext 中标记 IsExported（同帧内已经从其它路径 export 过），跳过。
 		if (!(Token.IsAssignedByAuthority() && !bIsNetTokenAuthority) && !ExportContext->IsExported(Token))
 		{
 			UE_NET_TRACE_NAMED_SCOPE(ExportScope, NetTokenExport, SubStream, SubContext.GetTraceCollector(), ENetTraceVerbosity::Verbose);
 
+			// 1 bit "Continue" + Token + Token Data
 			SubStream.WriteBool(true);
 			NetTokenStore->WriteNetToken(SubContext, Token);
 			NetTokenStore->WriteTokenData(SubContext, Token);
 
 			if (SubStream.IsOverflown())
 			{
+				// 当前 Token 写不下：RollbackScope 自动回滚此 Token 的写入，跳出循环。
 				break;
 			}
 			else
@@ -156,6 +186,7 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 				ExportContext->AddExported(Token);
 
 				// Enqueue in our record as well for resending if we drop data
+				// 写入成功 → 加入 in-flight 列表，等待 ProcessPacketDeliveryStatus 决定 ACK / 重发。
 				NetTokenExports.Add(Token);
 				++WrittenCount;
 			}
@@ -167,10 +198,12 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 	// Commit substream
 	if (WrittenCount)
 	{
+		// 把成功写入的子流提交到主流，并补一个 0 bit 作为"无更多 Token"标志。
 		Writer->CommitSubstream(SubStream);
 		Writer->WriteBool(false);
 
 		// Store number of written batches in the external record pointer
+		// 把 WrittenCount 直接塞到 OutRecord 指针的位上（不分配对象），ProcessPacketDeliveryStatus 时直接 reinterpret 回 UPTRINT。
 		UPTRINT& OutRecordCount = *reinterpret_cast<UPTRINT*>(&OutRecord);
 		OutRecordCount = WrittenCount;
 
@@ -179,6 +212,7 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 	}
 	else
 	{
+		// 一个都没写进去 → 丢弃子流，本次空走。
 		Writer->DiscardSubstream(SubStream);
 
 		const bool bHasMoreDataToSend = NetTokensPendingExport.Num() > 0;
@@ -191,6 +225,7 @@ UDataStream::EWriteResult UNetTokenDataStream::WriteData(UE::Net::FNetSerializat
 	}
 }
 
+// 接收侧：和 WriteData 镜像——读 1 bit 决定是否还有 Token；命中则 ReadNetToken + ReadTokenData，把数据写入 Remote 状态表。
 void UNetTokenDataStream::ReadData(UE::Net::FNetSerializationContext& Context)
 {
 	using namespace UE::Net;
@@ -216,6 +251,10 @@ void UNetTokenDataStream::ReadData(UE::Net::FNetSerializationContext& Context)
 	}
 }
 
+// 丢包处理：
+//   - Lost：把 NetTokenExports 队首 Count 个 Token 反向插回 NetTokensPendingExport 队首（保持顺序），下次 Write 重发。
+//     注：Token export 的 ACK 状态本身由 FNetExports 管理；这里只关心"序列化数据"的丢失重发，所以走自己的 Pending 队列。
+//   - Delivered/其它：直接从 NetTokenExports 删除（数据已送达，不再追踪）。
 void UNetTokenDataStream::ProcessPacketDeliveryStatus(UE::Net::EPacketDeliveryStatus Status, FDataStreamRecord const* Record)
 {
 	// The Record pointer is used as storage for the number of batches to process
@@ -242,6 +281,7 @@ void UNetTokenDataStream::ProcessPacketDeliveryStatus(UE::Net::EPacketDeliverySt
 	}
 }
 
+// 当无 in-flight 也无 pending 时，本流 "已可靠送达全部数据"。
 bool UNetTokenDataStream::HasAcknowledgedAllReliableData() const
 {
 	return NetTokensPendingExport.Num() == 0 && NetTokenExports.Num() == 0;

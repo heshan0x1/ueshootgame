@@ -1,5 +1,38 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavigationData.h —— 导航数据抽象基类 ANavigationData 及核心辅助结构
+// -----------------------------------------------------------------------------
+// 本文件是 Layer 3 的"NavigationData 抽象层"的总入口。定义了：
+//
+//  - ANavigationData：一份"导航数据"的基类（AActor 形态）；
+//      派生实现：ARecastNavMesh（常用）、AAbstractNavData（占位）、ANavigationGraph。
+//      每份 ANavigationData 对应一个 FNavDataConfig/Agent，持有：
+//          * FindPathImplementation 等"函数指针"形式的查询入口（非虚，避免
+//            虚表调用成本——路径请求可能每秒几千次）；
+//          * NavDataGenerator：异步/时间切片 tile 生成器；
+//          * ActivePaths / ObservedPaths / RepathRequests：活动路径追踪；
+//          * SuspendedDirtyAreas：构建暂停期间的脏区缓冲；
+//          * SupportedAreas / AreaClassToIdMap：NavArea 类 ↔ ID 映射，
+//            让 Recast 的整数 AreaID 与 UE 的 UClass 之间可以双向查找。
+//
+//  - FNavigationPath：C++ 底层路径对象（非 UObject），路径点 + 元数据 + 观察者。
+//      与 UNavigationPath（NavigationPath.h）配合使用，后者是它的 UObject 外壳。
+//
+//  - FPathFindingResult：FindPath/TestPath 的返回类型。
+//
+//  - FSupportedAreaData / FNavPathRecalculationRequest / FAsyncPathFindingQuery
+//    等辅助结构。
+//
+// 重要"函数指针 vs 虚函数"设计：
+//   FindPathImplementation、TestPathImplementation、RaycastImplementation 等
+//   都是指向"静态函数"的 typedef 指针，在派生类构造时赋值。
+//   原因：这些函数被大量高频调用（AI 群体寻路、Crowd、BP 蓝图节点），
+//   编译器在指针调用点可以做更激进的内联/跳转预测，而虚函数每次都要过虚表。
+//
+// 架构文档参考：第 4.4 节"寻路（同步）" + 第 2 节术语表。
+// =============================================================================
+
 #pragma once
 
 #if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_4
@@ -31,6 +64,10 @@ class UPrimitiveComponent;
 class UNavigationQueryFilter;
 struct FNavigationDirtyArea;
 
+// 记录"本 NavigationData 支持的一个 NavArea 类"的元数据：
+// - AreaClassName：存盘用的字符串（避免 UClass* 依赖）
+// - AreaID：本 NavData 分配给该类的整数 ID（Recast Polygon.AreaID 使用）
+// - AreaClass：运行时解析后的 UClass 指针（transient，不存盘）
 USTRUCT()
 struct FSupportedAreaData
 {
@@ -48,6 +85,8 @@ struct FSupportedAreaData
 	NAVIGATIONSYSTEM_API FSupportedAreaData(TSubclassOf<UNavArea> NavAreaClass = {}, int32 InAreaID = INDEX_NONE);
 };
 
+// 路径"重算请求"。RequestRePath 时构造并加入 ANavigationData::RepathRequests，
+// TickActor 时批量处理。operator== 只看 Path 以保证 AddUnique 的去重效果。
 struct FNavPathRecalculationRequest
 {
 	FNavPathWeakPtr Path;
@@ -60,6 +99,7 @@ struct FNavPathRecalculationRequest
 	bool operator==(const FNavPathRecalculationRequest& Other) const { return Path == Other.Path;  }
 };
 
+// FindPath 的返回值。Result == Success 且 Path->IsPartial() 为真就是"部分路径"。
 struct FPathFindingResult
 {
 	FNavPathSharedPtr Path;
@@ -75,6 +115,7 @@ struct FPathFindingResult
 	inline bool IsPartial() const;
 };
 
+// Raycast 的附加输出：如 RayEnd 是否真正落在找到的走廊内部（高差/走廊切换等异常情况下可能为 false）
 struct FNavigationRaycastAdditionalResults
 {
 	/** When the ray is not obstructed, indicates if the projection of RayEnd is located at the end of the explored corridor.
@@ -83,6 +124,11 @@ struct FNavigationRaycastAdditionalResults
 	bool bIsRayEndInCorridor = false;
 };
 
+// FNavigationPath：非 UObject、可线程安全共享的路径对象。
+// - PathPoints：由 start 起按顺序排列的路径点（FNavPathPoint 含 Location/NodeRef/AreaFlags 等）
+// - 通过 ObserverDelegate 广播 ENavPathEvent（UpdatedDueToGoalMoved / Invalidated 等）
+// - 支持观察 GoalActor：当目标偏离 TetherDistance 时自动请求 RePath。
+// 子类通过 FNavPathType 做 RTTI-like 判等（见 CastPath<T>）。
 struct FNavigationPath : public TSharedFromThis<FNavigationPath, ESPMode::ThreadSafe>
 {
 	//DECLARE_DELEGATE_OneParam(FPathObserverDelegate, FNavigationPath*);
@@ -235,6 +281,7 @@ struct FNavigationPath : public TSharedFromThis<FNavigationPath, ESPMode::Thread
 
 	inline void DoneUpdating(ENavPathUpdateType::Type UpdateType)
 	{
+		// ENavPathUpdateType → ENavPathEvent 的映射表，按 UpdateType 取 PathEvent 广播
 		static const ENavPathEvent::Type PathUpdateTypeToPathEvent[] = {
 			ENavPathEvent::UpdatedDueToGoalMoved // GoalMoved,
 			, ENavPathEvent::UpdatedDueToNavigationChanged // NavigationChanged,
@@ -262,6 +309,10 @@ struct FNavigationPath : public TSharedFromThis<FNavigationPath, ESPMode::Thread
 
 	/** Resets all variables describing generated path before attempting new pathfinding call. 
 	  * This function will NOT reset setup variables like goal actor, filter, observer, etc */
+	// ResetForRepath：只清理"生成结果"（PathPoints/bUpToDate/bIsReady...），
+	// 保留 GoalActor / Filter / Observer / NavigationDataUsed 等"配置"字段，
+	// 使路径能 in-place 被重新填充。派生类（如 FNavMeshPath）可 override 以保留
+	// 自己的特殊字段。默认实现就是调 InternalResetNavigationPath。
 	NAVIGATIONSYSTEM_API virtual void ResetForRepath();
 
 	/** Remove points that are at the same location. */
@@ -427,21 +478,26 @@ protected:
 	* IMPORTANT: path is assumed to be valid if it contains _MORE_ than _ONE_ point
 	*	point 0 is path's starting point - if it's the only point on the path then there's no path per se
 	*/
+	// 路径点数组：0 号是起点；只有 1 个点视为"无效"（没法构成线段）。
 	TArray<FNavPathPoint> PathPoints;
 
 	/** base actor, if exist path points locations will be relative to it */
+	// 可选基座 Actor（走在电梯/载具上的场景）。有值时 PathPoints 以 Base 的局部坐标存储。
 	TWeakObjectPtr<AActor> Base;
 
 private:
 	/** if set path will observe GoalActor's location and update itself if goal moves more then
 	*	@note only actual navigation paths can use this feature, meaning the ones associated with
 	*	a NavigationData instance (meaning NavigationDataUsed != NULL) */
+	// 观察的目标 Actor 弱引用；当它偏离 TetherDistance 时触发自动 Repath
 	TWeakObjectPtr<const AActor> GoalActor;
 
 	/** cached result of GoalActor casting to INavAgentInterface */
+	// 缓存 INavAgentInterface* 避免每帧 Cast
 	const INavAgentInterface* GoalActorAsNavAgent;
 
 	/** if set will be queried for location in case of path's recalculation */
+	// 重算时使用的"起点提供者"；允许路径跟随 Pawn 持续重算
 	TWeakObjectPtr<const AActor> SourceActor;
 
 	/** cached result of PathSource casting to INavAgentInterface */
@@ -452,11 +508,13 @@ protected:
 	FSharedConstNavQueryFilter Filter;
 
 	/** type of path */
+	// 基类 Type 标签；派生类有自己的 static Type（用于 CastPath 判等）
 	static NAVIGATIONSYSTEM_API const FNavPathType Type;
 
 	FNavPathType PathType;
 
 	/** A delegate that will be called when path becomes invalid */
+	// 所有关心本路径状态变化的观察者；UNavigationPath / AIController 等都订阅它
 	FPathObserverDelegate ObserverDelegate;
 
 	/** "true" until navigation data used to generate this path has been changed/invalidated */
@@ -505,17 +563,21 @@ protected:
 	uint32 bObservingGoalActor : 1;
 
 	/** navigation data used to generate this path */
+	// 生成本路径的 NavData 弱引用。只有它非空的路径才允许 Repath / Observation。
 	TWeakObjectPtr<ANavigationData> NavigationDataUsed;
 
 	/** essential part of query used to generate this path */
+	// 重算时会用到的查询参数（Querier/Filter/CostLimit…）
 	FPathFindingQueryData PathFindingQueryData;
 
 	/** gets set during path creation and on subsequent path's updates */
+	// World time 戳：用于判定"路径是否比 NavData 的 tile 旧"等场景
 	double LastUpdateTimeStamp;
 
 private:
 	/* if GoalActor is set this is the distance we'll try to keep GoalActor from end of path. If GoalActor
 	* moves more then this from the end of the path we'll recalculate the path */
+	// 观察容忍距离的平方（比较时免去 sqrt）
 	float GoalActorLocationTetherDistanceSq;
 
 	/** last location of goal actor that was used for repaths to prevent spamming when path is partial */
@@ -525,6 +587,8 @@ private:
 /** 
  *  Supported options for runtime navigation data generation
  */
+// 运行时生成策略：Static 完全静态；DynamicModifiersOnly 仅允许 Modifier 改（不重建几何）；
+// Dynamic 几何+Modifier 都可改；LegacyGeneration 仅兼容旧数据加载。
 UENUM()
 enum class ERuntimeGenerationType : uint8
 {
@@ -542,15 +606,20 @@ enum class ERuntimeGenerationType : uint8
  *	Represents abstract Navigation Data (sub-classed as NavMesh, NavGraph, etc)
  *	Used as a common interface for all navigation types handled by NavigationSystem
  */
+// ANavigationData：任意一种"导航数据"的抽象基类（AActor 形态）。
+// 关键派生：ARecastNavMesh、AAbstractNavData、ANavigationGraph。
+// 一个 Agent（FNavAgentProperties）对应一份 ANavigationData 实例，注册在 UNavigationSystemV1::NavDataSet 里。
 UCLASS(config=Engine, defaultconfig, NotBlueprintable, abstract, MinimalAPI)
 class ANavigationData : public AActor, public INavigationDataInterface
 {
 	GENERATED_UCLASS_BODY()
 	
+	// 编辑器/运行期的可视化组件（调试线框、多边形染色等）。transient：不存盘
 	UPROPERTY(transient, duplicatetransient)
 	TObjectPtr<UPrimitiveComponent> RenderingComp;
 
 protected:
+	// Agent 参数 + 生成参数集合（cell/tile 尺寸等）
 	UPROPERTY()
 	FNavDataConfig NavDataConfig;
 
@@ -818,6 +887,10 @@ public:
 	 *
 	 *	@note don't make this function virtual! Look at implementation details and its comments for more info.
 	 */
+	// 同步寻路入口：通过"函数指针"而非虚函数调度。
+	// 为什么：FindPath 可能每秒被 AI/Crowd/蓝图 调用上千次，
+	// 虚函数查表的 pipeline 开销不可忽略；函数指针在派生类构造时赋值一次，
+	// 编译器在调用点更容易做预测/内联。
 	inline FPathFindingResult FindPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query) const
 	{
 		check(FindPathImplementation);
@@ -1043,9 +1116,11 @@ protected:
 	UPROPERTY()
 	uint32 DataVersion;
 
+	// 函数指针类型定义：寻路/测试/Raycast 的"派生类实现"。派生类构造时赋值。
+	// 注意：全部是"静态函数指针"（与 C 风格的回调签名一致），避免虚函数表开销。
 	typedef FPathFindingResult (*FFindPathPtr)(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query);
-	FFindPathPtr FindPathImplementation;
-	FFindPathPtr FindHierarchicalPathImplementation; 
+	FFindPathPtr FindPathImplementation;        // 普通 A* 寻路入口
+	FFindPathPtr FindHierarchicalPathImplementation;  // 分层寻路（若支持 cluster）入口
 	
 	typedef bool (*FTestPathPtr)(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query, int32* NumVisitedNodes);
 	FTestPathPtr TestPathImplementation;
@@ -1059,12 +1134,15 @@ protected:
 	FNavRaycastWithAdditionalResultsPtr RaycastImplementationWithAdditionalResults;
 
 protected:
+	// 生成器：tile 构建线程池、dirty tile 转化、时间切片都由它负责。
+	// SharedPtr 以便在 NavData 临时离线时仍然允许在其他地方持有。
 	TSharedPtr<FNavDataGenerator, ESPMode::ThreadSafe> NavDataGenerator;
 
 	/** caches requests to rebuild dirty areas while nav rebuilding is suspended 
 	 *	via SetRebuildingSuspended(true) call. Calling SetRebuildingSuspended(false) 
 	 *	will result in pushing SuspendedDirtyAreas contents to the nav generator 
 	 *	and clearing out of SuspendedDirtyAreas */
+	// 构建暂停期间的 DirtyArea 缓冲；Resume 时一次性下发给 Generator
 	TArray<FNavigationDirtyArea> SuspendedDirtyAreas;
 
 	/** 
@@ -1072,6 +1150,8 @@ protected:
 	 *	Is meant to be added to only on GameThread, and in fact should user should never 
 	 *	add items to it manually, @see CreatePathInstance
 	 */
+	// 跟踪所有"通过本 NavData 生成的路径"弱指针；用于 Invalidate() 时向它们广播失效。
+	// 写入只在 GameThread、通过 RegisterActivePath；读可能在工作线程，故需要 ActivePathsLock。
 	TArray<FNavPathWeakPtr> ActivePaths;
 
 	/** Synchronization object for paths registration from main thread and async pathfinding thread */
@@ -1080,9 +1160,11 @@ protected:
 	/**
 	 *	Contains paths that requested observing its goal's location. These paths will be 
 	 *	processed on a regular basis (@see ObservedPathsTickInterval) */
+	// 观察 GoalActor 位置变化的路径；在 TickActor 里 ObservedPathsTickInterval 周期内处理一次
 	TArray<FNavPathWeakPtr> ObservedPaths;
 
 	/** paths that requested re-calculation */
+	// RequestRePath 的排队缓冲，TickActor 里批量处理
 	TArray<FNavPathRecalculationRequest> RepathRequests;
 
 	/** contains how much time left to the next ObservedPaths processing */
@@ -1092,9 +1174,12 @@ protected:
 	FSharedNavQueryFilter DefaultQueryFilter;
 
 	/** Map of query filters by UNavigationQueryFilter class */
+	// 按 UNavigationQueryFilter 类缓存的运行时 FNavigationQueryFilter；
+	// GetQueryFilter 命中就复用，未命中则 InitializeFilter 一次后 Store
 	TMap<UClass*,FSharedConstNavQueryFilter > QueryFilters;
 
 	/** serialized area class - ID mapping */
+	// 存盘：每份 NavData 分配给自己的 NavArea 整数 ID，跨 session 保持一致
 	UPROPERTY()
 	TArray<FSupportedAreaData> SupportedAreas;
 

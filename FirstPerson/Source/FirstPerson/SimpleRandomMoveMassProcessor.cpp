@@ -8,8 +8,8 @@
 USimpleRandomMoveMassProcessor::USimpleRandomMoveMassProcessor() : EntityQuery(*this)
 {
 	bAutoRegisterWithProcessingPhases = true;
-	ExecutionFlags = (int32)EProcessorExecutionFlags::All;
-	//ExecutionOrder.ExecuteBefore.Add();
+	// Only run movement logic on server and standalone - clients receive replicated data
+	ExecutionFlags = (int32)(EProcessorExecutionFlags::Server | EProcessorExecutionFlags::Standalone);
 }
 
 void USimpleRandomMoveMassProcessor::ConfigureQueries(const TSharedRef<FMassEntityManager>& EntityManager)

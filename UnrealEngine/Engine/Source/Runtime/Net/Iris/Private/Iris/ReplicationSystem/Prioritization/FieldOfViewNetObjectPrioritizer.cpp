@@ -1,5 +1,39 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================================
+// 文件作用：UFieldOfViewNetObjectPrioritizer 实现：4-wide SIMD 多几何形状打分。
+//
+// 核心算法（PrioritizeBatch 内层循环）：
+// 对每个视点：
+//   ObjectDir   = ObjectPos - ViewPos
+//   distSqr     = dot(ObjectDir, ObjectDir)              // 用于内/外球判定（球用平方比较）
+//   coneDist    = dot(ObjectDir, ViewDir)                // 投影到视锥中心轴的有符号距离
+//   axisOffset  = ObjectDir - coneDist*ViewDir           // 等价 ObjectPos - (ViewPos + coneDist*ViewDir)
+//   distSqrToAxis = dot(axisOffset, axisOffset)          // 距中心轴距离平方
+//
+// 判定：
+//   InRangeMask  = (0 ≤ coneDist ≤ ConeLength)           // 投影在锥的合法长度内
+//   ConeRadius²(d) = (d * ConeRadiusFactor)²             // ConeRadiusFactor = tan(half_fov)
+//   InsideCone   = InRangeMask && (distSqrToAxis ≤ ConeRadius²(coneDist))
+//   InsideInnerCone = (coneDist ≤ InnerConeLength)
+//
+// 锥优先级（仅 InsideCone 时启用）：
+//   p_cone = InsideInnerCone ? InnerConePriority
+//                            : InnerConePriority + (DistToViewPos - InnerConeLength)/ConeLengthDiff * ConePriorityDiff
+//   注：用对 ViewPos 的真实距离（DistToViewPos）做衰减，比用 coneDist 略保守但视觉一致。
+//
+// 视线胶囊（沿中心轴的细长胶囊）：
+//   InsideLoS = InRangeMask && (distSqrToAxis ≤ LoSRadius²)
+//   p_los = InsideLoS ? LineOfSightPriority : 0
+//
+// 外/内球（不依赖方向）：
+//   InsideOuterSphere = (distSqr ≤ OuterSphereRadiusSqr) → OuterSpherePriority
+//   InsideInnerSphere = (distSqr ≤ InnerSphereRadiusSqr) → InnerSpherePriority
+//
+// 最终：result = max(OutsidePriority, p_cone, p_los, p_outerSphere, p_innerSphere)
+// 多视图：内层循环里对每视点累加 max。
+// =============================================================================================================================
+
 #include "Iris/ReplicationSystem/Prioritization/FieldOfViewNetObjectPrioritizer.h"
 #include "Iris/Core/IrisCsv.h"
 #include "Iris/Core/IrisProfiler.h"
@@ -27,6 +61,7 @@ void UFieldOfViewNetObjectPrioritizer::Prioritize(FNetObjectPrioritizationParams
 {
 	IRIS_CSV_PROFILER_SCOPE(Iris, UFieldOfViewNetObjectPrioritizer_Prioritize);
 	
+	// 与 Sphere 相同的 1024/批 + FMemStack 分配模式。
 	FMemStack& Mem = FMemStack::Get();
 	FMemMark MemMark(Mem);
 
@@ -93,6 +128,7 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 {
 	IRIS_PROFILER_SCOPE(UFieldOfViewNetObjectPrioritizer_PrioritizeBatch);
 
+	// 视点位置 + 朝向（FOV 相关）。多视图也走同一函数（视锥不可像球那样取最近，必须每个视点独立判定）。
 	TArray<VectorRegister, TInlineAllocator<16>> ViewPositions;
 	TArray<VectorRegister, TInlineAllocator<16>> ViewDirs;
 	for (const UE::Net::FReplicationView::FView& View : BatchParams.View.Views)
@@ -108,21 +144,26 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 	const int ViewCount = BatchParams.View.Views.Num();
 	for (uint32 ObjIt = 0, ObjEndIt = BatchParams.ObjectCount; ObjIt < ObjEndIt; ObjIt += 4)
 	{
+		// 起点：max(已有优先级, OutsidePriority) —— OutsidePriority 是兜底下限。
 		VectorRegister Priorities0123 = VectorMax(VectorLoadAligned(Priorities + ObjIt), BatchParams.PriorityCalculationConstants.OutsidePriority);
 		// As the cone and line of sight capsule are view direction dependent there's not a lot we can do to optimize multi-view calculations.
+		// 视锥/胶囊与视点方向相关，多视图无法用 min(d²) 合并，必须逐视点累加 max。
 		for (int ViewIt = 0, ViewEndIt = ViewCount; ViewIt < ViewEndIt; ++ViewIt)
 		{
 			const VectorRegister ViewPos = ViewPositions[ViewIt];
 			const VectorRegister ViewDir = ViewDirs[ViewIt];
+			// "-ViewDir" 用于 fused-multiply-add 形式 的轴偏移计算（见后）。
 			const VectorRegister ReverseViewDir = VectorNegate(ViewDir);
 
 			// Object directions
+			// ObjectDir = ObjectPos - ViewPos
 			const VectorRegister ObjectDir0 = VectorSubtract(Positions[ObjIt + 0], ViewPos);
 			const VectorRegister ObjectDir1 = VectorSubtract(Positions[ObjIt + 1], ViewPos);
 			const VectorRegister ObjectDir2 = VectorSubtract(Positions[ObjIt + 2], ViewPos);
 			const VectorRegister ObjectDir3 = VectorSubtract(Positions[ObjIt + 3], ViewPos);
 
 			// Calculate squared distances to ViewPos
+			// 距 ViewPos 的距离平方（用于内/外球 + 锥距离衰减）。
 			const VectorRegister DistSqrToViewPos0 = VectorDot4(ObjectDir0, ObjectDir0);
 			const VectorRegister DistSqrToViewPos1 = VectorDot4(ObjectDir1, ObjectDir1);
 			const VectorRegister DistSqrToViewPos2 = VectorDot4(ObjectDir2, ObjectDir2);
@@ -132,9 +173,11 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 			const VectorRegister DistSqrToViewPos0101 = VectorSwizzle(VectorCombineHigh(DistSqrToViewPos0, DistSqrToViewPos1), 0, 2, 1, 3);
 			const VectorRegister DistSqrToViewPos2323 = VectorSwizzle(VectorCombineHigh(DistSqrToViewPos2, DistSqrToViewPos3), 0, 2, 1, 3);
 			const VectorRegister DistSqrToViewPos0123 = VectorCombineHigh(DistSqrToViewPos0101, DistSqrToViewPos2323);
+			// 真距离（锥优先级用真距离做线性衰减）。
 			const VectorRegister DistToViewPos0123 = VectorSqrt(DistSqrToViewPos0123);
 
 			// Project object direction onto cone center axis to retrieve the distance on the cone
+			// coneDist = dot(ObjectDir, ViewDir) —— 投影到视锥中心轴的有符号距离。
 			const VectorRegister ConeDist0 = VectorDot4(ObjectDir0, ViewDir);
 			const VectorRegister ConeDist1 = VectorDot4(ObjectDir1, ViewDir);
 			const VectorRegister ConeDist2 = VectorDot4(ObjectDir2, ViewDir);
@@ -143,11 +186,16 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 			// $IRIS TODO Worth doing VectorMaskBits on ConeDistInRangeMask before doing the more expensive cone checks?
 			// Calculate the distance to the center axis at the cone distances
 			// Simplified VectorSubtract(Positions[ObjIt + N], VectorMultiplyAdd(ConeDistN, ViewDir, ViewPos)) to VectorMultiplyAdd(ConeDistN, -ViewDir, ObjectDirN)
+			// 化简：原始公式 axisOffset = ObjPos - (ViewPos + coneDist*ViewDir)
+			//             = (ObjPos - ViewPos) - coneDist*ViewDir
+			//             = ObjectDir + coneDist*(-ViewDir)
+			//   → 一次 fused multiply-add 完成。
 			VectorRegister DistSqrToConeCenterAxis0 = VectorMultiplyAdd(ConeDist0, ReverseViewDir, ObjectDir0);
 			VectorRegister DistSqrToConeCenterAxis1 = VectorMultiplyAdd(ConeDist1, ReverseViewDir, ObjectDir1);
 			VectorRegister DistSqrToConeCenterAxis2 = VectorMultiplyAdd(ConeDist2, ReverseViewDir, ObjectDir2);
 			VectorRegister DistSqrToConeCenterAxis3 = VectorMultiplyAdd(ConeDist3, ReverseViewDir, ObjectDir3);
 
+			// 转成距离平方（继续 SIMD）。
 			DistSqrToConeCenterAxis0 = VectorDot4(DistSqrToConeCenterAxis0, DistSqrToConeCenterAxis0);
 			DistSqrToConeCenterAxis1 = VectorDot4(DistSqrToConeCenterAxis1, DistSqrToConeCenterAxis1);
 			DistSqrToConeCenterAxis2 = VectorDot4(DistSqrToConeCenterAxis2, DistSqrToConeCenterAxis2);
@@ -164,11 +212,13 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 			const VectorRegister DistSqrToConeCenterAxis0123 = VectorCombineHigh(DistSqrToConeCenterAxis0101, DistSqrToConeCenterAxis2323);
 
 			// Validate that the cone distances fall into the valid range [0, OuterConeLength]
+			// coneDist ≥ 0：投影在锥的"前方"；coneDist ≤ ConeLength：未超出锥端。
 			const VectorRegister ConeDistGEZeroMask = VectorCompareGE(ConeDist0123, VectorZeroVectorRegister());
 			const VectorRegister ConeDistLEDistMask = VectorCompareLE(ConeDist0123, BatchParams.PriorityCalculationConstants.ConeLength);
 			const VectorRegister ConeDistInRangeMask = VectorBitwiseAnd(ConeDistGEZeroMask, ConeDistLEDistMask);
 
 			// Validate that projected points fall within the cone radius at their respective distances
+			// 锥半径在该距离处的值：coneDist * ConeRadiusFactor（ConeRadiusFactor = tan(half_fov)）。再平方便于与 distSqrToAxis 比较。
 			VectorRegister ConeRadiusAtDistSqr = VectorMultiply(ConeDist0123, BatchParams.PriorityCalculationConstants.ConeRadiusFactor);
 			ConeRadiusAtDistSqr = VectorMultiply(ConeRadiusAtDistSqr, ConeRadiusAtDistSqr);
 
@@ -178,14 +228,20 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 			// Cone priorities.
 			// Use the distance to the view pos for the cone priorities. It's more correct versus using the distance along the center axis but costs a VectorSqrt.
 			// InsideConeMask are for positions inside the cone. However the cone priorities starts getting lower at InnerConeLength. For distances shorter than InnerConeLength the priority is InnerConePriority.
+			// 在锥内（轴距 ≤ 锥半径）且投影在 [0, ConeLength]。
 			const VectorRegister InsideConeMask = VectorBitwiseAnd(VectorCompareLE(DistSqrToConeCenterAxis0123, ConeRadiusAtDistSqr), ConeDistInRangeMask);
+			// 在内锥（投影 ≤ InnerConeLength）：直接用 InnerConePriority（=MaxConePriority）。
 			const VectorRegister InsideInnerConeMask = VectorCompareLE(ConeDist0123, BatchParams.PriorityCalculationConstants.InnerConeLength);
+			// 否则线性衰减：factor = (DistToViewPos - InnerConeLength) / ConeLengthDiff
+			//          p = InnerConePriority + factor * (OuterConePriority - InnerConePriority)
 			const VectorRegister ConeLengthFactor = VectorMultiply(VectorSubtract(DistToViewPos0123, BatchParams.PriorityCalculationConstants.InnerConeLength), BatchParams.PriorityCalculationConstants.InvConeLengthDiff);
 			VectorRegister ConePriorities0123 = VectorMultiplyAdd(ConeLengthFactor, BatchParams.PriorityCalculationConstants.ConePriorityDiff, BatchParams.PriorityCalculationConstants.InnerConePriority);
 			ConePriorities0123 = VectorSelect(InsideInnerConeMask, BatchParams.PriorityCalculationConstants.InnerConePriority, ConePriorities0123);
+			// 不在锥内的对象，把锥优先级"按位与"成 0（VectorBitwiseAnd 配合 mask 实现条件清零）。
 			ConePriorities0123 = VectorBitwiseAnd(ConePriorities0123, InsideConeMask);
 
 			// Line of sight priorities.
+			// 胶囊内（轴距 ≤ LoSRadius）且在锥的合法长度内。
 			const VectorRegister InsideLineOfSightMask = VectorBitwiseAnd(VectorCompareLE(DistSqrToConeCenterAxis0123, BatchParams.PriorityCalculationConstants.LineOfSightRadiusSqr), ConeDistInRangeMask);
 			const VectorRegister LoSPriorities0123 = VectorBitwiseAnd(InsideLineOfSightMask, BatchParams.PriorityCalculationConstants.LineOfSightPriority);
 
@@ -198,11 +254,13 @@ void UFieldOfViewNetObjectPrioritizer::PrioritizeBatch(FBatchParams& BatchParams
 			const VectorRegister InsideSpherePriorities0123 = VectorBitwiseAnd(InsideInnerSphereMask, BatchParams.PriorityCalculationConstants.InnerSpherePriority);
 
 			// Compute max value of all priorities
+			// 最终结果取所有几何形状的最大值（已与 OutsidePriority 取过 max 作为起点）。
 			Priorities0123 = VectorMax(Priorities0123, VectorMax(ConePriorities0123, LoSPriorities0123));
 			Priorities0123 = VectorMax(Priorities0123, VectorMax(OuterSpherePriorities0123, InsideSpherePriorities0123));
 		}
 
 		// Store our calculated priority which takes into account the priorities prior to the above calculations.
+		// 写回（与原始 priorities 已通过 OutsidePriority 起点取过 max）。
 		VectorStoreAligned(Priorities0123, Priorities + ObjIt);
 	}
 }
@@ -243,19 +301,25 @@ void UFieldOfViewNetObjectPrioritizer::SetupCalculationConstants(FPriorityCalcul
 	VectorRegister ConeLength = VectorSetFloat1(Config->ConeLength);
 	VectorRegister ConeLengthDiff = VectorSubtract(ConeLength, InnerConeLength);
 	VectorRegister InvConeLengthDiff = VectorReciprocalAccurate(ConeLengthDiff);
+	// 锥端面半径 = ConeLength * tan(half_fov)
+	// ConeRadiusFactor = ConeRadius / ConeLength = tan(half_fov)
 	VectorRegister ConeRadius = VectorSetFloat1(Config->ConeLength*FMath::Tan(0.5f*FMath::DegreesToRadians(Config->ConeFieldOfViewDegrees)));
 	VectorRegister ConeRadiusFactor = VectorDivide(ConeRadius, ConeLength);
+	// 注意：内锥端用 MaxConePriority（在内锥近端给最高值），外锥端用 MinConePriority（远端给最低值）。
+	// 名字 InnerConePriority/OuterConePriority 是几何意义上的"锥的内端/外端"，与 Min/Max 命名稍有混淆。
 	VectorRegister InnerConePriority = VectorSetFloat1(Config->MaxConePriority); 
 	VectorRegister OuterConePriority = VectorSetFloat1(Config->MinConePriority);
 	VectorRegister ConePriorityDiff = VectorSubtract(OuterConePriority, InnerConePriority);
 
 	// Inner and outer sphere constants
+	// 球用半径平方比较，避免 sqrt。
 	VectorRegister InnerSphereRadiusSqr = VectorSetFloat1(FMath::Square(Config->InnerSphereRadius));
 	VectorRegister OuterSphereRadiusSqr = VectorSetFloat1(FMath::Square(Config->OuterSphereRadius));
 	VectorRegister InnerSpherePriority = VectorSetFloat1(Config->InnerSpherePriority);
 	VectorRegister OuterSpherePriority = VectorSetFloat1(Config->OuterSpherePriority);
 
 	// Line of sight constants
+	// 胶囊半径 = LineOfSightWidth / 2，平方便于比较。
 	VectorRegister LineOfSightRadiusSqr = VectorSetFloat1(FMath::Square(0.5f*Config->LineOfSightWidth));
 	VectorRegister LineOfSightPriority = VectorSetFloat1(Config->LineOfSightPriority);
 

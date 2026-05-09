@@ -1,5 +1,14 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================
+// NameTokenStore.cpp —— FName 的 NetToken 化存储实现
+// -------------------------------------------------------------------------------------------------------------
+// 序列化路径：
+//   Iris  ：WriteString / ReadString（NetBitStreamUtil）
+//   FArchive：UPackageMap::StaticSerializeName（保留旧 NetSerialize 兼容性）
+// 后续优化（注释中已记录 JIRA：UE-221753）：可以利用 FName 的 String/Number 拆分来进一步压缩。
+// =============================================================================================================
+
 #include "Iris/ReplicationSystem/NameTokenStore.h"
 #include "Iris/Core/IrisLog.h"
 #include "Iris/Serialization/NetBitStreamReader.h"
@@ -23,6 +32,10 @@
 namespace UE::Net
 {
 
+// 主入口：FName -> NetToken
+//   1) 通过 GetOrCreateTokenStoreKey 在本地数组中"复用 / 新建" KeyIndex；
+//   2) 若该 KeyIndex 还没有绑定 NetToken（即首次出现），则通过 CreateAndStoreTokenForKey 分配本地 Token；
+//   3) 否则直接返回已绑定的 Token（可能是本地 Token，也可能是已被替换为权威 Token，详见 NetTokenStore::ValidateAndStoreNetTokenData）。
 FNetToken FNameTokenStore::GetOrCreateToken(FName Name)
 {
 	FNetTokenStoreKey Key = GetOrCreateTokenStoreKey(Name);
@@ -46,6 +59,7 @@ FNetToken FNameTokenStore::GetOrCreateToken(FName Name)
 	return FNetToken();
 }
 
+// FName -> KeyIndex 反查；找不到时分配新 KeyIndex 并把 FName 写入双向数组。
 FNetTokenDataStore::FNetTokenStoreKey FNameTokenStore::GetOrCreateTokenStoreKey(FName Name)
 {
 	if (const FNetTokenStoreKey* ExistingKey = FNameToKey.Find(Name))
@@ -70,9 +84,13 @@ FNameTokenStore::FNameTokenStore(FNetTokenStore& InTokenStore)
 {
 	// As we use an array for our storage we must match the size of the StoredTokens array.
 	// We assume that Index 0 is invalid.
+	// 必须与基类 StoredTokens 数组对齐（基类已预占 Index 0 为 Invalid）。
 	StoredFNames.SetNum(StoredTokens.Num());
 }
 
+// 解析 Token：
+//   - "本地 Token"（与本端权威性相同）：用 LocalNetTokenStoreState 反查；
+//   - "远端 Token"：必须传入对端的 RemoteTokenStoreState（来自 FNetTokenStore::GetRemoteNetTokenStoreState）。
 FName FNameTokenStore::ResolveToken(FNetToken Token, const FNetTokenStoreState* NetTokenStoreState) const
 {
 	const FNetTokenStoreState* TokenStoreState = TokenStore.IsLocalToken(Token) ? TokenStore.GetLocalNetTokenStoreState() : NetTokenStoreState;
@@ -92,6 +110,7 @@ FName FNameTokenStore::ResolveToken(FNetToken Token, const FNetTokenStoreState* 
 	return FName();
 }
 
+// 把 KeyIndex 对应的 FName 写入比特流（Iris 路径）：当前实现为完整字符串导出。
 void FNameTokenStore::WriteTokenData(FNetSerializationContext& Context, FNetTokenStoreKey TokenStoreKey) const
 {
 	UE_NET_TRACE_DYNAMIC_NAME_SCOPE(StoredFNames[TokenStoreKey.GetKeyIndex()], *Context.GetBitStreamWriter(), Context.GetTraceCollector(), ENetTraceVerbosity::VeryVerbose);
@@ -100,6 +119,7 @@ void FNameTokenStore::WriteTokenData(FNetSerializationContext& Context, FNetToke
 	WriteString(Context.GetBitStreamWriter(), StoredFNames[TokenStoreKey.GetKeyIndex()].ToString());
 }
 
+// FArchive 兼容路径：通过 UPackageMap::StaticSerializeName 走 NetGUID 化的 FName 序列化（Hardcoded / Lookup-table 等）。
 void FNameTokenStore::WriteTokenData(FArchive& Ar, FNetTokenStoreKey TokenStoreKey, UPackageMap* Map /*= nullptr*/) const
 {
 	UE_NET_TRACE_DYNAMIC_NAME_SCOPE(StoredFNames[TokenStoreKey.GetKeyIndex()], static_cast<FNetBitWriter&>(Ar), GetTraceCollector(static_cast<FNetBitWriter&>(Ar)), ENetTraceVerbosity::VeryVerbose);
@@ -108,6 +128,8 @@ void FNameTokenStore::WriteTokenData(FArchive& Ar, FNetTokenStoreKey TokenStoreK
 	UPackageMap::StaticSerializeName(Ar, Name);
 }
 
+// 接收侧：读到字符串 → FName → 在本端的 FNameToKey 表中查找/插入，返回 KeyIndex。
+// 注意此处并不直接绑定 LocalToken，绑定由 FNetTokenStore::ValidateAndStoreNetTokenData 完成。
 FNetTokenDataStore::FNetTokenStoreKey FNameTokenStore::ReadTokenData(FNetSerializationContext& Context, const FNetToken& NetToken)
 {
 	UE_NET_TRACE_NAMED_DYNAMIC_NAME_SCOPE(TokenScope, FName(), *Context.GetBitStreamReader(), Context.GetTraceCollector(), ENetTraceVerbosity::VeryVerbose);

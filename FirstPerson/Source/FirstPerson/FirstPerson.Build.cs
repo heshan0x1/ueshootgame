@@ -19,6 +19,12 @@ public class FirstPerson : ModuleRules
 			"GameplayStateTreeModule",
 			"MassEntity",
 			"MassCommon",
+			"MassReplication",
+			"MassRepresentation",
+			"MassSpawner",
+			"MassLOD",
+			"MassGameplayDebug",
+			"NetCore",
 			"StructUtils",
 			"UMG",
 			"Slate"

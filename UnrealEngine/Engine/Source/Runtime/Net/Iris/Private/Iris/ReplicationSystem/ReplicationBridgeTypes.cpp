@@ -1,8 +1,14 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ReplicationBridgeTypes.cpp
+// 角色：ReplicationBridgeTypes.h 中枚举的 LexToString 实现（仅日志/诊断用）。
+// =====================================================================================
+
 #include "Iris/ReplicationSystem/ReplicationBridgeTypes.h"
 
 
+// 将多个位标志按出现顺序拼接成 "Flag1,Flag2,..."；None 单独返回 "None"。
 FString LexToString(EEndReplicationFlags EndReplicationFlags)
 {
 	
@@ -46,6 +52,7 @@ FString LexToString(EEndReplicationFlags EndReplicationFlags)
 	return Flags;
 }
 
+// 销毁原因 -> 文本（DoNotDestroy / TearOff / Destroy）。
 const TCHAR* LexToString(EReplicationBridgeDestroyInstanceReason Reason)
 {
 	switch (Reason)
@@ -69,6 +76,7 @@ const TCHAR* LexToString(EReplicationBridgeDestroyInstanceReason Reason)
 	}
 }
 
+// 销毁标志 -> 文本（仅 None / AllowDestroyInstanceFromRemote）。
 const TCHAR* LexToString(EReplicationBridgeDestroyInstanceFlags DestroyFlags)
 {
 	switch (DestroyFlags)

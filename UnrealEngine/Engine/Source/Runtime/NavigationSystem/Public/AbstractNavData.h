@@ -1,5 +1,19 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// AbstractNavData.h —— "空壳"导航数据实现
+// -----------------------------------------------------------------------------
+// 文件职责：
+//   - 当某个 Agent 的 NavData 尚未就绪（例如世界里没有 ARecastNavMesh），
+//     NavigationSystem 仍需要一个占位对象来接收 FindPath 请求而不崩溃；
+//   - 本文件提供 AAbstractNavData（派生 ANavigationData）与它所产生的
+//     FAbstractNavigationPath（派生 FNavigationPath）——返回"起点→终点直线"
+//     的平凡路径，所有几何/投影/随机点查询均返回无效；
+//   - FAbstractQueryFilter 实现空 INavigationQueryFilterInterface。
+//
+// 使用者：UNavigationSystemV1::CreateAbstractNavData / RequestAbstractNavData。
+// =============================================================================
+
 #pragma once
 
 #include "AI/Navigation/NavQueryFilter.h"
@@ -26,15 +40,18 @@ class UClass;
 class UObject;
 struct FPathFindingQuery;
 
+// 抽象路径：只有两个点（起点、终点），用于无真实 NavMesh 的场景。
 struct FAbstractNavigationPath : public FNavigationPath
 {
 	typedef FNavigationPath Super;
 
 	NAVIGATIONSYSTEM_API FAbstractNavigationPath();
 
+	// 路径类型标签（用于 RTTI-like 判等），所有 FAbstractNavigationPath 共享同一个 Type 实例。
 	static NAVIGATIONSYSTEM_API const FNavPathType Type;
 };
 
+// 空过滤器：全部接口返回默认值，配合 FAbstractNavigationPath 使用。
 class FAbstractQueryFilter : public INavigationQueryFilterInterface
 {
 public:
@@ -56,6 +73,8 @@ public:
 	NAVIGATIONSYSTEM_API virtual INavigationQueryFilterInterface* CreateCopy() const override;
 };
 
+// 占位 NavData：所有查询 API 返回"无效"；FindPath 仅返回起终点两点路径。
+// 构造时把 FindPathImplementation 指向 FindPathAbstract 静态函数指针。
 UCLASS(MinimalAPI)
 class AAbstractNavData : public ANavigationData
 {
@@ -64,6 +83,7 @@ class AAbstractNavData : public ANavigationData
 public:
 	NAVIGATIONSYSTEM_API AAbstractNavData(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
+	// PostLoad：标记 RF_Transient 与 MarkAsGarbage，防止存盘与多实例
 	NAVIGATIONSYSTEM_API virtual void PostLoad() override;
 
 #if WITH_EDITOR
@@ -93,8 +113,13 @@ public:
 	virtual bool IsNodeRefValid(NavNodeRef NodeRef) const override { return true; };
 	// End ANavigationData overrides
 
+	// 静态 FindPath：返回只包含起点 + 终点的 FAbstractNavigationPath。
+	// 用作 ANavigationData::FindPathImplementation 函数指针。
 	static NAVIGATIONSYSTEM_API FPathFindingResult FindPathAbstract(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query);
+	// 始终返回 false（抽象实现不做真正测试）
 	static NAVIGATIONSYSTEM_API bool TestPathAbstract(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query, int32* NumVisitedNodes);
+	// 旧签名：转调新签名，AdditionalResults 传 nullptr
 	static NAVIGATIONSYSTEM_API bool RaycastAbstract(const ANavigationData* NavDataInstance, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FSharedConstNavQueryFilter QueryFilter, const UObject* Querier);
+	// 始终返回 false，无射线遮挡
 	static NAVIGATIONSYSTEM_API bool RaycastAbstract(const ANavigationData* NavDataInstance, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FNavigationRaycastAdditionalResults* AdditionalResults, FSharedConstNavQueryFilter QueryFilter, const UObject* Querier);
 };

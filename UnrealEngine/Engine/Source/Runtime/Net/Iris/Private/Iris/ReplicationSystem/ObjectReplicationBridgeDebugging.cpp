@@ -1,5 +1,30 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ObjectReplicationBridgeDebugging.cpp（≈ 1450 行）
+// 角色：UObjectReplicationBridge 的"调试 / 诊断 / 控制台命令"实现集合。
+//
+// 主要内容：
+//   * 控制台命令注册（FAutoConsoleCommandWithWorldArgs / FAutoConsoleCommand 等），
+//     例如：
+//        Net.Iris.PrintReplicatedObjects
+//        Net.Iris.PrintAlwaysRelevantObjects
+//        Net.Iris.PrintRelevantObjects
+//        Net.Iris.PrintRelevantObjectsForConnections
+//        Net.Iris.PrintNetCullDistances
+//        Net.Iris.PrintPushBasedStatuses
+//        Net.Iris.PrintDynamicFilterClassConfig
+//        Net.Iris.PrintObjectInfo
+//   * 公共方法实现：UObjectReplicationBridge::PrintXxx —— 由命令路由进来 + 也可被代码直接调用。
+//   * IrisDebugHelper 系列：导出给调试器（VS Watch 窗口）的 extern "C" 函数，便于
+//     在 break 时通过 watch "PrintNetRefHandle((UObjectReplicationBridge*)Bridge, Handle)"
+//     快速查看对象关联信息。
+//
+// 注意：本文件不影响功能性代码，仅用于离线 / 实时诊断。
+//        命令实现普遍走 ReplicationSystemInternal -> 各子系统，注意线程上下文：
+//        所有 console 命令均在 GameThread，可直接读 RS 内部状态而不用加锁。
+// =====================================================================================
+
 #include "Iris/ReplicationSystem/ObjectReplicationBridge.h"
 
 #include "HAL/IConsoleManager.h"

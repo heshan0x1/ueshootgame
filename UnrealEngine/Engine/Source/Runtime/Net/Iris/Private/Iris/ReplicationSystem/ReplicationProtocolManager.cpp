@@ -1,4 +1,34 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+﻿// Copyright Epic Games, Inc. All Rights Reserved.
+
+// =============================================================================
+// ReplicationProtocolManager.cpp —— 协议工厂/缓存/校验/失效级联 实现
+// -----------------------------------------------------------------------------
+// 核心流程：
+//  1) CalculateProtocolIdentifier
+//     依据 Fragments 的 (DescriptorIdentifier.Value, DefaultStateHash) 列表做 CityHash32。
+//     —— 这是跨连接/跨端识别"形态"的唯一标识，Server 与 Client 必须计算结果一致。
+//  2) CreateInstanceProtocol（每实例）
+//     单次连续分配（FReplicationInstanceProtocol + FragmentData[] + Fragments[]）。
+//     • 收集 PushModel owner 唯一集（>1 → IsMultiObjectInstance，目前不支持 PushModel）；
+//     • 累积 traits（NeedsPoll / NeedsPreSendUpdate / HasObjectReference / HasPushBased*）；
+//     • DeleteWithInstanceProtocol 标记的 Fragment 在 DestroyInstanceProtocol 时随实例销毁。
+//  3) CreateReplicationProtocol（每形态共享）
+//     • 可选校验 ProtocolId（bValidateProtocolId）—— 若失配则警告+ensure；
+//     • 必须确保不重复创建（GetReplicationProtocol 返回 nullptr）；
+//     • 为每个 PushModel owner 构造 RepIndex→FragmentIndex 表（按 Descriptor 的 RepIndex 反查）；
+//     • 单次连续分配整个 Protocol（含 Descriptor 数组 + PushModel 表 + 表 entry 数据）；
+//     • 计算 InternalSize/Alignment、ChangeMaskBitCount、合并 traits（Conditional/DynamicState/
+//       ConnectionSpecific/HasObjectReference/SupportsDeltaCompression/HasPushBased*）；
+//     • HasConditionalChangeMask 时在 InternalBuffer 末尾追加 conditional changemask 区域；
+//     • 加入主缓存 (RegisteredProtocols, ProtocolToInfoMap) 与 (DescriptorToProtocolMap)。
+//  4) ValidateReplicationProtocol
+//     比对 Protocol->ReplicationStateDescriptors 与传入 Fragments 的 Descriptor 指针/Identifier，
+//     用于 Server/Client 接到陌生 Protocol 时的 mismatch 检测。
+//  5) InvalidateDescriptor / DestroyReplicationProtocol
+//     • InvalidateDescriptor —— Descriptor 失效时（如 class GC/Hot-reload）级联销毁所有引用它的 Protocol；
+//     • DestroyReplicationProtocol 把 Protocol 移到 PendingDestroyProtocols，等 RefCount=0 真正释放
+//       —— 因为可能还有 in-flight RecordInfo/NetObject 持有引用。
+// =============================================================================
 
 #include "Iris/ReplicationSystem/ReplicationProtocolManager.h"
 #include "CoreTypes.h"
@@ -18,6 +48,7 @@
 
 #ifndef UE_NET_ENABLE_PROTOCOLMANAGER_LOG
 // Default is to enable protocol logs in non-shipping
+// 非 Shipping 默认开启协议日志（创建/销毁/失配等）。
 #	define UE_NET_ENABLE_PROTOCOLMANAGER_LOG !(UE_BUILD_SHIPPING)
 #endif
 
@@ -32,6 +63,7 @@
 namespace UE::Net::Private
 {
 
+// CVar：开启后，每次创建协议都打印完整 Fragments 列表（hash + 名字），方便调试形态不一致问题。
 static bool bIrisLogReplicationProtocols = false;
 static FAutoConsoleVariableRef CVarIrisLogReplicationProtocols(
 	TEXT("net.Iris.LogReplicationProtocols"),
@@ -39,21 +71,30 @@ static FAutoConsoleVariableRef CVarIrisLogReplicationProtocols(
 	TEXT("If true, log all created replication protocols."
 	));
 
+// 计算 Fragment traits 的"累积值"和"共有值"。
+//  - Accumulated：任一 fragment 含某 trait → 含；用于决定"是否需要走某路径"；
+//  - Shared：全部 fragment 都含 → 含；用于决定"能否一刀切走优化路径"（如 FullPushBasedDirtiness）。
 static void GetInstanceTraits(const FReplicationFragments& Fragments, EReplicationFragmentTraits& OutAccumulatedTraits, EReplicationFragmentTraits& OutSharedTraits, const EReplicationFragmentTraits InObjectTraits)
 {
 	EReplicationFragmentTraits AccumulatedTraits = InObjectTraits;
+	// 初始 SharedTraits = 全 1（无 fragment 时 = None），用 AND 收敛
 	EReplicationFragmentTraits SharedTraits = Fragments.Num() > 0 ? ~EReplicationFragmentTraits::None : EReplicationFragmentTraits::None;
 	for (const FReplicationFragmentInfo& Info : Fragments)
 	{
 		const EReplicationFragmentTraits FragmentTraits = Info.Fragment->GetTraits();
-		AccumulatedTraits |= FragmentTraits;
-		SharedTraits &= FragmentTraits;
+		AccumulatedTraits |= FragmentTraits; // 任一含 → 含
+		SharedTraits &= FragmentTraits;      // 全部含 → 含
 	}
 
 	OutAccumulatedTraits = AccumulatedTraits;
 	OutSharedTraits = SharedTraits;
 }
 
+// ---------------------------------------------------------------------------
+// CreateInstanceProtocol —— 每实例的 Fragment 表；单次连续分配 + 在位构造。
+// 内存布局（一次 MallocZeroed）：
+//   [ FReplicationInstanceProtocol | FragmentData[] | Fragments[] ]
+// ---------------------------------------------------------------------------
 FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtocol(const FReplicationFragments& Fragments, UE::Net::EReplicationFragmentTraits ObjectTraits)
 {
 	const uint32 FragmentCount = Fragments.Num();
@@ -63,6 +104,7 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 	}
 
 	// We want to keep this as a single allocation so we first build a layout and allocate enough space for the InstanceProtocol and its data
+	// 构建内存布局：先用 FMemoryLayoutUtil 累计偏移/对齐，最后单次分配。
 	struct FReplicationInstanceProtocolLayoutData
 	{
 		FMemoryLayoutUtil::FOffsetAndSize ReplicationInstanceProtocolSizeAndOffset;
@@ -80,12 +122,14 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 	uint8* Buffer = static_cast<uint8*>(FMemory::MallocZeroed(Layout.CurrentOffset, static_cast<uint32>(Layout.MaxAlignment)));
 
 	// Init FReplicationInstanceProtocol
+	// placement new 在分配区头部构造 FReplicationInstanceProtocol，FragmentData/Fragments 指向后续区域
 	FReplicationInstanceProtocol* InstanceProtocol = new (Buffer) FReplicationInstanceProtocol;
 	InstanceProtocol->FragmentData = reinterpret_cast<FReplicationInstanceProtocol::FFragmentData*>(Buffer + LayoutData.FragmentDataSizeAndOffset.Offset);
 	InstanceProtocol->Fragments = reinterpret_cast<FReplicationFragment* const *>(Buffer + LayoutData.FragmentsSizeAndOffset.Offset);
 	InstanceProtocol->FragmentCount = static_cast<uint16>(FragmentCount);
 
 	// Setup owner collector
+	// PushModel 多 owner 检测：最多收集 2 个不同 Owner，>1 则不再支持 PushModel
 	constexpr uint32 MaxFragmentOwnerCount = 2U;
 	UObject* FragmentOwnersForPushBasedFragments[MaxFragmentOwnerCount] = {};
 	FReplicationStateOwnerCollector UniquePushBasedOwners(FragmentOwnersForPushBasedFragments, MaxFragmentOwnerCount);
@@ -95,11 +139,13 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 
 	for (const FReplicationFragmentInfo& Info : Fragments)
 	{
+		// 关键：ExternalSrcBuffer 指向 UObject 的属性首址 —— 这是 Iris 与 UE Property 系统的连接点
 		InstanceProtocol->FragmentData[FragmentIt].ExternalSrcBuffer = reinterpret_cast<uint8*>(Info.SrcReplicationStateBuffer);
 		InstanceProtocol->FragmentData[FragmentIt].Traits = Info.Fragment->GetTraits();
 		const_cast<FReplicationFragment**>(InstanceProtocol->Fragments)[FragmentIt] = Info.Fragment;
 
 		// We collect unique owners with properties that are pushbased
+		// PushModel 标脏需要按 owner 维度做 RepIndex 反查；此处只统计含成员且启用 PushBased 的 fragment
 		if (Info.Descriptor->MemberCount > 0 && EnumHasAnyFlags(Info.Fragment->GetTraits(), EReplicationFragmentTraits::HasPushBasedDirtiness))
 		{
 			Info.Fragment->CollectOwner(&UniquePushBasedOwners);		
@@ -113,6 +159,7 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 	GetInstanceTraits(Fragments, AccumulatedTraits, SharedTraits, ObjectTraits);
 
 	// Init instance traits
+	// 把 fragment-level traits 翻译成 instance-level traits（位含义不同，独立两套）。
 	EReplicationInstanceProtocolTraits InstanceTraits = EReplicationInstanceProtocolTraits::None;
 	if (EnumHasAnyFlags(AccumulatedTraits, EReplicationFragmentTraits::NeedsPoll))
 	{
@@ -131,6 +178,7 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 		InstanceTraits |= EReplicationInstanceProtocolTraits::HasObjectReference;
 	}
 	// Currently we do not support push based dirtiness for protocols with multiple pushbased fragments with different owners.
+	// 多 owner 实例：暂不支持 PushBased（标脏路径无法在多个 owner 间复用 RepIndex 表）
 	if (UniquePushBasedOwners.GetOwnerCount() > 1U)
 	{
 		InstanceTraits |= EReplicationInstanceProtocolTraits::IsMultiObjectInstance;
@@ -139,6 +187,7 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 	else if (EnumHasAnyFlags(AccumulatedTraits, EReplicationFragmentTraits::HasPushBasedDirtiness))
 	{
 		InstanceTraits |= EReplicationInstanceProtocolTraits::HasPushBasedDirtiness;
+		// FullPushBased：所有 fragment 都共有该 trait → 可彻底跳过 Poll 阶段
 		if (EnumHasAnyFlags(SharedTraits, EReplicationFragmentTraits::HasFullPushBasedDirtiness))
 		{
 			InstanceTraits |= EReplicationInstanceProtocolTraits::HasFullPushBasedDirtiness;
@@ -150,6 +199,8 @@ FReplicationInstanceProtocol* FReplicationProtocolManager::CreateInstanceProtoco
 	return InstanceProtocol;
 }
 
+// 销毁实例协议：先析构带 DeleteWithInstanceProtocol 的 fragment（fragment 自身可能含动态资源），
+// 再 Free 整块单次分配的内存。
 void FReplicationProtocolManager::DestroyInstanceProtocol(FReplicationInstanceProtocol* InstanceProtocol)
 {
 	FReplicationFragment* const * Fragments = InstanceProtocol->Fragments;
@@ -167,6 +218,11 @@ void FReplicationProtocolManager::DestroyInstanceProtocol(FReplicationInstancePr
 	FMemory::Free(InstanceProtocol);
 }
 
+// ---------------------------------------------------------------------------
+// CalculateProtocolIdentifier —— 协议唯一 ID（CityHash32）
+// 包含 DescriptorIdentifier.Value（结构形态）+ DefaultStateHash（默认值），
+// 默认值变化也算不同形态以避免静默不一致。
+// ---------------------------------------------------------------------------
 FReplicationProtocolIdentifier FReplicationProtocolManager::CalculateProtocolIdentifier(const FReplicationFragments& Fragments)
 {
 	TArray<uint64, TInlineAllocator<32>> IdBuffer;
@@ -183,6 +239,11 @@ FReplicationProtocolIdentifier FReplicationProtocolManager::CalculateProtocolIde
 	return ProtocolIdentifier;
 }
 
+// ---------------------------------------------------------------------------
+// ValidateReplicationProtocol —— Server/Client 形态匹配校验
+// 对每个 fragment 同时比对 Descriptor 指针（应来自同一 Registry）和 DescriptorIdentifier
+// （内容标识，跨进程也可比对）。任一失配返回 false 并写日志。
+// ---------------------------------------------------------------------------
 bool FReplicationProtocolManager::ValidateReplicationProtocol(const FReplicationProtocol* Protocol, const FReplicationFragments& Fragments, bool bLogFragmentErrors)
 {
 	bool bResult = true;
@@ -225,6 +286,8 @@ bool FReplicationProtocolManager::ValidateReplicationProtocol(const FReplication
 	return bResult;
 }
 
+// 主缓存查找：(ProtocolId, TemplateKey) → Protocol
+// MultiMap 因为同 ProtocolId 可能撞到不同 TemplateKey（不同 UClass 但 fragment 集合 hash 相同）。
 const FReplicationProtocol* FReplicationProtocolManager::GetReplicationProtocol(FReplicationProtocolIdentifier ProtocolId, FObjectKey TemplateKey)
 {
 	for (auto It = RegisteredProtocols.CreateConstKeyIterator(ProtocolId); It; ++It)
@@ -238,6 +301,7 @@ const FReplicationProtocol* FReplicationProtocolManager::GetReplicationProtocol(
 	return nullptr;
 }
 
+// 调试：把 Fragments 列表序列化成可读字符串（含 hash），用于失配时的诊断输出。
 void FReplicationProtocolManager::FragmentListToString(FStringBuilderBase& StringBuilder, const FReplicationFragments& Fragments)
 {
 	StringBuilder << TEXT("Fragments:\n");
@@ -251,10 +315,23 @@ void FReplicationProtocolManager::FragmentListToString(FStringBuilderBase& Strin
 	}
 }
 
+// ---------------------------------------------------------------------------
+// CreateReplicationProtocol —— 创建/注册一份共享 FReplicationProtocol
+// 大流程：
+//   1. 校验 ProtocolId（可选）+ TemplateKey 有效性 + 不可重复创建；
+//   2. 构造 PushModel owner 的 RepIndex→FragmentIndex 表（按 Descriptor 反查）；
+//   3. 用 FMemoryLayoutUtil 单次分配整块（Protocol + Descriptor[] + PushModelTable + TableData）；
+//   4. 累计 InternalSize/Alignment/ChangeMaskBitCount + LifetimeConditional 统计；
+//   5. 合并 traits（CombinedStateTraits→ProtocolTraits）；
+//   6. 必要时为 ConditionalChangeMask 在 InternalSize 末尾追加位图区域；
+//   7. 把 Protocol 加入 RegisteredProtocols + ProtocolToInfoMap + DescriptorToProtocolMap；
+//   8. 调试日志。
+// ---------------------------------------------------------------------------
 const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtocol(const FReplicationProtocolIdentifier ProtocolId, const FReplicationFragments& Fragments, const TCHAR* DebugName, const FCreateReplicationProtocolParameters& Params)
 {
 	if (Params.bValidateProtocolId)
 	{
+		// 校验：传入 ProtocolId 必须等于按 Fragments 重算得到的 hash
 		const FReplicationProtocolIdentifier NewProtocolId = CalculateProtocolIdentifier(Fragments);
 		if (NewProtocolId != ProtocolId)
 		{
@@ -274,6 +351,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	}
 
 	// Template key should be valid unless the protocol doesn't use one.
+	// TemplateKey（通常是 UClass*）是缓存复用的第二维度，必须有效（除非协议明确说明无 TemplateKey）。
 	if (Params.bHasTemplateKey && !IsValid(Params.TemplateKey))
 	{
 		UE_LOG(LogIris, Error, TEXT("Cannot create replication protocol %s due to invalid template"), DebugName);
@@ -292,6 +370,8 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	}
 
 	// Build table to map from RepIndex to fragment
+	// 第 1 步：为 PushModel 构造每个 owner 的 RepIndex→FragmentIndex 表
+	//        当 MARK_PROPERTY_DIRTY 走 RepIndex 标脏时，能 O(1) 反查到对应 Fragment。
 	TArray<TArray<FReplicationProtocol::FRepIndexToFragmentIndex, TInlineAllocator<128>>> OwnerRepIndicesToFragment;
 	{
 		// $TODO: Remove when we change FReplicationFragment::GetOwner()
@@ -321,6 +401,8 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 				OwnerRepIndicesToFragment.SetNum(Owners.Num());
 				OwnerRepIndicesToFragment[OwnerId].SetNum(FPlatformMath::Max(Info.Descriptor->RepIndexCount, (uint16)OwnerRepIndicesToFragment[OwnerId].Num()));
 
+				// 遍历 Descriptor 内的 MemberRepIndexToMemberIndexDescriptor 表，
+				// 把每个有效 RepIndex 映射到当前 FragmentIndex
 				for (const FReplicationStateMemberRepIndexToMemberIndexDescriptor& MemberIndex : MakeArrayView(Info.Descriptor->MemberRepIndexToMemberIndexDescriptors, Info.Descriptor->RepIndexCount))
 				{
 					const int32 RepIndex = static_cast<int32>(&MemberIndex - Info.Descriptor->MemberRepIndexToMemberIndexDescriptors);
@@ -335,6 +417,9 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	}
 
 	// We want to keep this as a single allocation so we first build a layout and allocate enough space for the InstanceProtocol and its data
+	// 第 2 步：构造 Protocol 内存布局：
+	//   [ FReplicationProtocol | const FReplicationStateDescriptor*[FragmentCount] |
+	//     FRepIndexToFragmentIndexTable[OwnerCount] | FRepIndexToFragmentIndex[Sum-of-RepIndexCount] ]
 	struct FReplicationProtocolLayoutData
 	{
 		FMemoryLayoutUtil::FOffsetAndSize ReplicationProtocolSizeAndOffset;
@@ -364,6 +449,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 
 	// Allocate memory for the protocol, the replication protocol must be refcounted by all NetObjects
 	// We could also choose to explicitly control the lifetime 
+	// 单次分配整块（清零）。Protocol 由所有引用它的 NetObject 通过 RefCount 管理生命周期。
 	uint8* Buffer = static_cast<uint8*>(FMemory::MallocZeroed(Layout.CurrentOffset, static_cast<uint32>(Layout.MaxAlignment)));
 
 	// Init FReplicationInstanceProtocol
@@ -372,6 +458,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	Protocol->ReplicationStateCount = FragmentCount;
 
 	// Fill in the data for the the RepIndex -> Fragment lookup tables.
+	// 把上面构造的 OwnerRepIndicesToFragment 内容平铺到分配区
 	{
 		// Setup table pointer and count
 		FReplicationProtocol::FRepIndexToFragmentIndexTable* RepIndexToFragmentIndexTables = OwnerCount ? reinterpret_cast<FReplicationProtocol::FRepIndexToFragmentIndexTable*>(Buffer + LayoutData.PushModelOwnerTableSizeAndOffset.Offset) : nullptr;
@@ -396,6 +483,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	}
 
 	// Cached data
+	// 第 3 步：累计 InternalSize/Alignment、ChangeMaskBitCount，并合并 ProtocolTraits
 	uint32 MaxExternalSize = 0;
 	uint32 MaxExternalAlign = 0;
 	uint32 InternalAlign = 0;
@@ -410,6 +498,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	GetInstanceTraits(Fragments, AccumulatedTraits, SharedTraits, EReplicationFragmentTraits::None);
 
 	// Fill in data for the protocol
+	// LifetimeConditional 信息（用于 Conditionals 模块在按连接生成 conditional changemask 时定位起点）
 	uint32 FirstLifetimeConditionalsStateIndex = ~0U;
 	uint32 LifetimeConditionalsStateCount = 0;
 	uint32 FirstLifetimeConditionalsChangeMaskOffset = ~0U;
@@ -420,9 +509,11 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 
 		const FReplicationStateDescriptor* Descriptor = Info.Descriptor;
 		Protocol->ReplicationStateDescriptors[FragmentIt] = Descriptor;
+		// 协议持有 Descriptor 引用计数（Descriptor 也是 RefCount 管理的不可变对象）
 		Descriptor->AddRef();
 
 		// We track all protocols using a descriptor in order to be able to detect when we have to invalidate a protocol due to the descriptor being unloaded
+		// 反向跟踪：用于 InvalidateDescriptor 级联失效
 		DescriptorToProtocolMap.AddUnique(Descriptor, Protocol);
 
 		MaxExternalSize = FMath::Max<uint32>(MaxExternalSize, Descriptor->ExternalSize);
@@ -435,6 +526,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 		// Traits
 		CombinedStateTraits |= Descriptor->Traits;
 
+		// LifetimeConditional：触发 HasConditionalChangeMask（必须在内部 buffer 中放置 condition 位图）
 		if (EnumHasAnyFlags(Descriptor->Traits, EReplicationStateTraits::HasLifetimeConditionals))
 		{
 			ProtocolTraits |= EReplicationProtocolTraits::HasLifetimeConditionals | EReplicationProtocolTraits::HasConditionalChangeMask;
@@ -443,6 +535,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 			if (LifetimeConditionalsStateCount == 1U)
 			{
 				FirstLifetimeConditionalsStateIndex = FragmentIt;
+				// 注意：FirstLifetimeConditionalsChangeMaskOffset 是 bit 偏移
 				FirstLifetimeConditionalsChangeMaskOffset = ChangeMaskBitCount - Descriptor->ChangeMaskBitCount;
 				checkSlow(FirstLifetimeConditionalsChangeMaskOffset <= 65535);
 			}
@@ -451,6 +544,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 		++FragmentIt;
 	}
 
+	// 把 state-level traits 提升到 protocol-level traits
 	if (EnumHasAnyFlags(CombinedStateTraits, EReplicationStateTraits::HasDynamicState))
 	{
 		ProtocolTraits |= EReplicationProtocolTraits::HasDynamicState;
@@ -468,6 +562,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 
 	if (EnumHasAnyFlags(CombinedStateTraits, EReplicationStateTraits::SupportsDeltaCompression))
 	{
+		// 空协议（无任何成员）不开启 DeltaCompression（没意义）
 		if (InternalSize > 0)
 		{
 			ProtocolTraits |= EReplicationProtocolTraits::SupportsDeltaCompression;
@@ -475,6 +570,9 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	}
 
 	// Allocate conditional change mask if required.
+	// 在 InternalBuffer 末尾追加 conditional changemask 区域：
+	//  - 4 字节对齐（FNetBitArrayView 的 word 对齐）；
+	//  - InternalChangeMasksOffset 记录字节偏移，运行时按 ChangeMaskBitCount 解读。
 	if (EnumHasAnyFlags(ProtocolTraits, EReplicationProtocolTraits::HasConditionalChangeMask))
 	{
 		InternalAlign = FPlatformMath::Max(InternalAlign, 4U);
@@ -490,6 +588,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	}
 
 	// Setup Pushbased traits
+	// 协议级 PushModel：累积位 = 部分启用；共有位 = 全部启用 → FullPushBased
 	if (EnumHasAnyFlags(AccumulatedTraits, EReplicationFragmentTraits::HasPushBasedDirtiness))
 	{
 		ProtocolTraits |= EReplicationProtocolTraits::HasPushBasedDirtiness;
@@ -537,6 +636,7 @@ const FReplicationProtocol* FReplicationProtocolManager::CreateReplicationProtoc
 	return Protocol;
 }
 
+// 销毁入口：从主缓存移除并加入待销毁队列；触发一次 Prune（若立即可销毁则当帧释放）。
 void FReplicationProtocolManager::DestroyReplicationProtocol(const FReplicationProtocol* ReplicationProtocol)
 {
 	FRegisteredProtocolInfo Info;
@@ -549,6 +649,7 @@ void FReplicationProtocolManager::DestroyReplicationProtocol(const FReplicationP
 	PruneProtocolsPendingDestroy();
 }
 
+// 真正释放：解除对所有 Descriptor 的引用 + 从反查表移除 + Free 整块。
 void FReplicationProtocolManager::InternalDestroyReplicationProtocol(const FReplicationProtocol* Protocol)
 {
 	if (Protocol)
@@ -565,11 +666,14 @@ void FReplicationProtocolManager::InternalDestroyReplicationProtocol(const FRepl
 	}
 }
 
+// 延迟销毁：把 Protocol 加入待销毁队列。等到 RefCount 归零才真正释放。
 void FReplicationProtocolManager::InternalDeferDestroyReplicationProtocol(const FReplicationProtocol* Protocol)
 {
 	PendingDestroyProtocols.Add(Protocol);
 }
 
+// 扫描待销毁队列，对 RefCount=0 的执行真正释放。
+// 此函数在每次 DestroyReplicationProtocol 后调用，因此分摊到每次销毁操作。
 void FReplicationProtocolManager::PruneProtocolsPendingDestroy()
 {
 	for (auto It = PendingDestroyProtocols.CreateIterator(); It; ++It)
@@ -583,6 +687,8 @@ void FReplicationProtocolManager::PruneProtocolsPendingDestroy()
 	}
 }
 
+// Descriptor 失效（class 卸载/Hot-reload）→ 找出引用它的所有 Protocol 并级联销毁。
+// 这是保证"形态"一致性的兜底机制。
 void FReplicationProtocolManager::InvalidateDescriptor(const FReplicationStateDescriptor* InvalidatedReplicationStateDescriptor)
 {
 	// Destroy all protocols that referenced the descriptor (or ensure that they are still valid)
@@ -601,6 +707,7 @@ void FReplicationProtocolManager::InvalidateDescriptor(const FReplicationStateDe
 	}
 }
 
+// 析构：清空主缓存与待销毁队列，确保所有 Protocol 释放（不管 RefCount —— 因为 Manager 也走了）。
 FReplicationProtocolManager::~FReplicationProtocolManager()
 {
 	// Cleanup protocols
@@ -614,6 +721,5 @@ FReplicationProtocolManager::~FReplicationProtocolManager()
 		InternalDestroyReplicationProtocol(Protocol);
 	}
 }
-
 
 }

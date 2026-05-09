@@ -1,5 +1,20 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// ============================================================================
+// NavigationOctree.cpp —— FNavigationOctree / FNavigationOctreeSemantics 的实现。
+// 关键要点：
+//   1) AddNode / AppendToNode / UpdateNode / RemoveNode 都要保持
+//      ElementToOctreeId 反查表与底层 TOctree2 节点的一一对应；
+//   2) 节点插入时由 FNavigationOctreeSemantics::SetElementId 回调写入反查表，
+//      所以 AddElement 一定要在 Element.Data 填充完毕后再调；
+//   3) DemandLazyDataGathering 处理两类懒数据：Geometry 与 Modifier，
+//      成功采集后 Shrink 回收多余容量，并同步 NodesMemory 计数；
+//   4) !UE_BUILD_SHIPPING 下可用 console 开关
+//      'ai.debug.nav.validateConsistencyWhenAddingOctreeNode' 校验
+//      "FNavigationElement 入队时拍下的快照" 与 "真正入 Octree 时 NavRelevantInterface
+//      返回的最新值" 是否一致（Bounds / Parent）——不一致通常意味着某处忘记 UpdateElement。
+// ============================================================================
+
 #include "NavigationOctree.h"
 #include "AI/Navigation/NavRelevantInterface.h"
 #include "AI/Navigation/NavigationElement.h"
@@ -29,6 +44,7 @@ FAutoConsoleVariableRef ConsoleVariables[] =
 //----------------------------------------------------------------------//
 // FNavigationOctree
 //----------------------------------------------------------------------//
+// 构造：透传 TOctree2 的 (Origin, Radius)，初始化默认 gather 模式 = Instant。
 FNavigationOctree::FNavigationOctree(const FVector& Origin, FVector::FReal Radius)
 	: TOctree2<FNavigationOctreeElement, FNavigationOctreeSemantics>(Origin, Radius)
 	, DefaultGeometryGatheringMode(ENavDataGatheringMode::Instant)
@@ -42,6 +58,7 @@ FNavigationOctree::FNavigationOctree(const FVector& Origin, FVector::FReal Radiu
 }
 
 PRAGMA_DISABLE_DEPRECATION_WARNINGS
+// 析构：清掉 ElementToOctreeId 反查表；底层 TOctree2 由基类析构回收节点。
 FNavigationOctree::~FNavigationOctree()
 {
 	DEC_DWORD_STAT_BY( STAT_NavigationMemory, sizeof(*this) );
@@ -51,6 +68,7 @@ FNavigationOctree::~FNavigationOctree()
 }
 PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
+// 只有 Invalid 不允许；其它值转成 ENavDataGatheringMode 枚举值保存。
 void FNavigationOctree::SetDataGatheringMode(ENavDataGatheringModeConfig Mode)
 {
 	check(Mode != ENavDataGatheringModeConfig::Invalid);
@@ -62,6 +80,11 @@ void FNavigationOctree::SetNavigableGeometryStoringMode(ENavGeometryStoringMode 
 	bGatherGeometry = (NavGeometryMode == FNavigationOctree::StoreNavGeometry);
 }
 
+// 对 Pending Lazy 的元素做补采集：
+//   - Geometry 部分（若不是 slice 方式）调用 GeometryExportDelegate 同步拉满
+//   - Modifier 部分调用 NavigationDataExportDelegate 收集 NavArea / Link 等
+// 完成后 ValidateAndShrink，并把 NodesMemory 差值同步到统计量。
+// 调用者：Recast tile 生成前、或 FNavigationDataHandler::DemandLazyDataGathering。
 void FNavigationOctree::DemandLazyDataGathering(FNavigationRelevantData& ElementData)
 {
 	LLM_SCOPE_BYTAG(NavigationOctree);
@@ -69,6 +92,7 @@ void FNavigationOctree::DemandLazyDataGathering(FNavigationRelevantData& Element
 	bool bShrink = false;
 	const int32 OrgElementMemory = IntCastChecked<int32>(ElementData.GetGeometryAllocatedSize());
 
+	// 分支：本元素支持"几何切片"（一次一小块）的话，这里不必再整体拉；让 tile 生成走 slice 接口
 	if (ElementData.IsPendingLazyGeometryGathering() == true && ElementData.SupportsGatheringGeometrySlices() == false)
 	{
 		QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_LazyGeometryExport);
@@ -117,6 +141,7 @@ void FNavigationOctree::DemandLazyDataGathering(FNavigationRelevantData& Element
 		ElementData.ValidateAndShrink();
 	}
 
+	// 统计内存变化（可能为负——Shrink 之后）
 	const int32 ElementMemoryChange = IntCastChecked<int32>(ElementData.GetGeometryAllocatedSize()) - OrgElementMemory;
 	NodesMemory += ElementMemoryChange;
 	INC_MEMORY_STAT_BY(STAT_Navigation_CollisionTreeMemory, ElementMemoryChange);
@@ -174,6 +199,15 @@ void FNavigationOctree::AddNode(UObject* ElementOb, INavRelevantInterface* NavEl
 	}
 }
 
+// AddNode：把新元素插入 Octree。
+// 顺序要点：
+//   1) 校验 Bounds 合法（Invalid 或体积接近 0 直接跳过）；
+//   2) 把 Bounds 写到 OctreeElement.Bounds；
+//   3) 若 Data 还空：按 bGatherGeometry + bDoInstantGathering 立刻 export
+//      或者打上 Pending 标记延后；
+//   4) ValidateAndShrink 回收多余容量；
+//   5) AddElement → 底层 TOctree2 插入 → 触发 SetElementId → 写 ElementToOctreeId。
+// 第 5 步保证了"节点入树"与"Handle→Id 反查表更新"是原子一体的。
 void FNavigationOctree::AddNode(const FBox& Bounds, FNavigationOctreeElement& OctreeElement)
 {
 	LLM_SCOPE_BYTAG(NavigationOctree);
@@ -184,6 +218,7 @@ void FNavigationOctree::AddNode(const FBox& Bounds, FNavigationOctreeElement& Oc
 	UE_LOG(LogNavigation, VeryVerbose, TEXT("%hs: '%s' bounds: [%s]"), __FUNCTION__, *SourceElement.GetName(), *Bounds.ToString());
 
 #if !UE_BUILD_SHIPPING
+	// 调试一致性校验：FNavigationElement 入队时的快照 vs. 真正入 Octree 时 interface 返回的最新值
 	if (UE::NavigationOctree::Private::bValidateConsistencyWhenAddingNode)
 	{
 		if (const INavRelevantInterface* NavRelevantInterface = Cast<INavRelevantInterface>(SourceElement.GetWeakUObject().Get()))
@@ -208,6 +243,7 @@ void FNavigationOctree::AddNode(const FBox& Bounds, FNavigationOctreeElement& Oc
 	}
 #endif // !UE_BUILD_SHIPPING
 
+	// 防御：非法/空 Bounds 不入树，避免污染 Octree 统计与后续 Dirty 扩散
 	if (UNLIKELY(!Bounds.IsValid || Bounds.GetSize().IsNearlyZero()))
 	{
 		UE_LOG(LogNavigation, Warning, TEXT("%hs: %s bounds, ignoring %s."), __FUNCTION__, !Bounds.IsValid ? TEXT("Invalid") : TEXT("Empty"), *SourceElement.GetFullName());
@@ -223,6 +259,7 @@ void FNavigationOctree::AddNode(const FBox& Bounds, FNavigationOctreeElement& Oc
 	{
 		const bool bDoInstantGathering = !IsLazyGathering(SourceElement);
 
+		// 几何：优先走 Delegate 立即采集；否则打上 Lazy 标记等 tile 生成时补
 		if (bGatherGeometry)
 		{
 			if (bDoInstantGathering)
@@ -237,6 +274,7 @@ void FNavigationOctree::AddNode(const FBox& Bounds, FNavigationOctreeElement& Oc
 		}
 
 		SCOPE_CYCLE_COUNTER(STAT_Navigation_GatheringNavigationModifiersSync);
+		// Modifier：同样的立即/延后分支
 		if (bDoInstantGathering)
 		{
 #if !UE_BUILD_SHIPPING
@@ -275,6 +313,7 @@ void FNavigationOctree::AddNode(const FBox& Bounds, FNavigationOctreeElement& Oc
 	NodesMemory += ElementMemory;
 	INC_MEMORY_STAT_BY(STAT_Navigation_CollisionTreeMemory, ElementMemory);
 
+	// 真正插入底层 Octree；TOctree2 回调 FNavigationOctreeSemantics::SetElementId → 写反查表
 	AddElement(OctreeElement);
 }
 
@@ -287,6 +326,15 @@ void FNavigationOctree::AppendToNode(const FOctreeElementId2& Id, INavRelevantIn
 	}
 }
 
+// AppendToNode：把子元素的"导出数据"合并到父节点上。
+// 流程：
+//   1) 复制原节点 → Element（用于"先改后写"）；
+//   2) Bounds 取并集；
+//   3) 根据子元素的 gather 模式做即采/延后；
+//   4) ValidateAndShrink 并更新 NodesMemory delta；
+//   5) RemoveElement + AddElement：TOctree2 不支持原地更新 Bounds，
+//      所以这里一定是"移除旧 → 加新"的序列，中间 ElementToOctreeId 会在
+//      AddElement 回调中重写。
 void FNavigationOctree::AppendToNode(const FOctreeElementId2& Id, const TSharedRef<const FNavigationElement>& ElementRef, const FBox& Bounds, FNavigationOctreeElement& Element)
 {
 	LLM_SCOPE_BYTAG(NavigationOctree);
@@ -311,6 +359,7 @@ void FNavigationOctree::AppendToNode(const FOctreeElementId2& Id, const TSharedR
 	// it will be reallocated when adding to octree and RemoveNode will have different value returned by GetAllocatedSize()
 	Element.ValidateAndShrink();
 
+	// 内存统计按 delta 校正，避免重复计数
 	const int32 OrgElementMemory = OrgData.GetAllocatedSize();
 	const int32 NewElementMemory = Element.GetAllocatedSize();
 	const int32 MemoryDelta = NewElementMemory - OrgElementMemory;
@@ -322,6 +371,8 @@ void FNavigationOctree::AppendToNode(const FOctreeElementId2& Id, const TSharedR
 	AddElement(Element);
 }
 
+// 仅改 Bounds 的原子操作：RemoveElement + AddElement（保持 Data 原样）。
+// 注意这里并不调用 ValidateAndShrink / NodesMemory 校正，因为 Data 没改。
 void FNavigationOctree::UpdateNode(const FOctreeElementId2& Id, const FBox& NewBounds)
 {
 	FNavigationOctreeElement ElementCopy = GetElementById(Id);
@@ -330,6 +381,9 @@ void FNavigationOctree::UpdateNode(const FOctreeElementId2& Id, const FBox& NewB
 	AddElement(ElementCopy);
 }
 
+// 节点移除：先扣 NodesMemory 统计，再 RemoveElement。
+// 注意：ElementToOctreeId 反查表的清理由 FNavigationOctreeController::RemoveNode 完成，
+// 本方法仅处理 TOctree2 内部状态。
 void FNavigationOctree::RemoveNode(const FOctreeElementId2& Id)
 {
 	const FNavigationOctreeElement& Element = GetElementById(Id);
@@ -350,6 +404,8 @@ FNavigationRelevantData* FNavigationOctree::GetMutableDataForID(const FOctreeEle
 	return Id.IsValidId() ? &*GetElementById(Id).Data : nullptr;
 }
 
+// 反查表写入：由 FNavigationOctreeSemantics::SetElementId 回调。
+// 本函数是 AddElement → 回调 → 反查表 的最后一环，保障 Handle→Id 一致性。
 void FNavigationOctree::SetElementIdImpl(const FNavigationElementHandle ElementHandle, const FOctreeElementId2 Id)
 {
 	ElementToOctreeId.Add(ElementHandle, Id);
@@ -361,6 +417,7 @@ void FNavigationOctree::SetElementIdImpl(const FNavigationElementHandle ElementH
 #if NAVSYS_DEBUG
 FORCENOINLINE
 #endif // NAVSYS_DEBUG
+// TOctree2 的回调：把每次 AddElement 分配到的 Id 交给我们维护的反查表。
 void FNavigationOctreeSemantics::SetElementId(FOctree& OctreeOwner, const FNavigationOctreeElement& Element, const FOctreeElementId2 Id)
 {
 	static_cast<FNavigationOctree&>(OctreeOwner).SetElementIdImpl(Element.Data.Get().SourceElement.Get().GetHandle(), Id);

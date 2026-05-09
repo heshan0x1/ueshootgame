@@ -22,10 +22,18 @@
 namespace UE::Net
 {
 
+// 编译期校验：公开的 FObjectNetSerializerQuantizedReferenceStorage 尺寸与对齐必须能容纳 FQuantizedObjectReference。
+// 若内部 FQuantizedObjectReference 发生扩容，需同步调整公开结构 Storage[24] 大小。
 // Validate size & alignment of public quantized storage type
 static_assert(sizeof(FObjectNetSerializerQuantizedReferenceStorage) >= sizeof(FQuantizedObjectReference), "FObjectNetSerializerQuantizedReferenceStorage::Storage must be large enough to store FQuantizedObjectReference");
 static_assert(alignof(FObjectNetSerializerQuantizedReferenceStorage) >= alignof(FQuantizedObjectReference), "FObjectNetSerializerQuantizedReferenceStorage::Storage must be aligned to store FQuantizedObjectReference");
 
+/**
+ * 向 BitStream 写入 FNetRefHandle：
+ *   - 无效句柄 → 写 1 bit false；
+ *   - 有效句柄 → 写 1 bit true + PackedUint64(Id)；绝大多数 Id 只占用 8 bits。
+ * 这是 Iris 中"最小粒度的对象标识"序列化，不携带 PathName/Class 等完整引用信息。
+ */
 void WriteNetRefHandle(FNetSerializationContext& Context, const FNetRefHandle Handle)
 {
 	FNetBitStreamWriter* Writer = Context.GetBitStreamWriter();
@@ -50,18 +58,25 @@ FNetRefHandle ReadNetRefHandle(FNetSerializationContext& Context)
 		const uint64 NetId = ReadPackedUint64(Reader);
 		if (!Reader->IsOverflown())
 		{
+			// 通过 FNetRefHandleManager 的 friend 接口从 NetId 还原出 FNetRefHandle；保证与本进程的句柄生成策略一致。
 			return Private::FNetRefHandleManager::MakeNetRefHandleFromId(NetId);
 		}
 	}
 	return FNetRefHandle();
 }
 
+/**
+ * 读取一条完整的对象引用（Full Reference）。
+ * 完整引用内嵌 PathName/Outer/Class 等数据，便于对端在没有预先导出上下文时仍可解析。
+ * 适用场景：RPC 参数、Polymorphic Struct 嵌套字段等无法保证对端已 ACK 过引用的情况。
+ */
 void ReadFullNetObjectReference(FNetSerializationContext& Context, FNetObjectReference& Reference)
 {
 	// Read full ref for now
 	Context.GetInternalContext()->ObjectReferenceCache->ReadFullReference(Context, Reference);
 }
 
+/** 对应的写入版本。详见 FObjectReferenceCache::WriteFullReference。 */
 void WriteFullNetObjectReference(FNetSerializationContext& Context, const FNetObjectReference& Reference)
 {
 	// Write full ref for now
@@ -73,6 +88,12 @@ void WriteFullNetObjectReference(FNetSerializationContext& Context, const FNetOb
 namespace UE::Net::Private
 {
 
+/**
+ * 内部辅助：读取一条 FNetObjectReference。
+ *   - 常规路径 (bInlineObjectReferenceExports == 0)：写入端仅写索引（或压缩句柄），实际 PathName 通过
+ *     ExportContext 在批量包尾部/后续包中附送；接收端若此时尚未 ACK，则引用变为 "Pending"。
+ *   - 内联路径：直接把完整 PathName 写在当前引用位置（RPC/InstancedStruct/Polymorphic 嵌套等场景）。
+ */
 static void ReadNetObjectReference(FNetSerializationContext& Context, FNetObjectReference& Reference)
 {
 	FInternalNetSerializationContext* InternalContext = Context.GetInternalContext();

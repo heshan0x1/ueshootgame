@@ -1,5 +1,34 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：NetRefHandleManager.cpp（≈ 1250 行）
+// 角色：FNetRefHandleManager 的全部实现：从外部 Handle 到内部紧凑索引的映射、
+//       per-object 元数据数组维护、SubObject / Dependent 拓扑、内部索引分配/回收、
+//       帧循环钩子（OnPreSendUpdate / OnPostSendUpdate）、销毁队列推进。
+//
+// 内部索引分配策略：
+//   * 静态/动态 Handle 各自维护一个递增 NextStaticHandleIndex / NextDynamicHandleIndex；
+//     最低位编码 static/dynamic（参考 FNetRefHandle）。
+//   * GetNextFreeInternalIndex 在 [1, CurrentMaxInternalNetRefIndex] 内寻找首个空闲位；
+//     找不到时调 GrowNetObjectLists() 扩容（每次按 InternalNetRefIndexGrowSize）。
+//   * 索引被回收时，触发 OnInternalNetRefIndicesFreed 多播，所有依赖该索引的 BitArray
+//     都会得到通知去清理对应位。
+//
+// 关键流程：
+//   * CreateNetObject(Local) / CreateNetObjectFromRemote :
+//       分配 InternalIndex -> 写 ReplicatedObjectData -> 注册 RefHandleToInternalIndex
+//       -> 设置 GlobalScopableInternalIndices 位 -> 触发协议引用计数 +1
+//   * AttachInstanceProtocol / DetachInstanceProtocol : 绑定/解绑实例与 InstanceProtocol
+//   * OnPreSendUpdate  : 把 GlobalScopable 当前快照拷贝到 ScopeFrameData.CurrentFrame，
+//                        交换 Prev/Current 形成 diff 基础
+//   * OnPostSendUpdate : 清理 ScopeFrameData，DirtyObjectsToQuantize / PolledObjects 复位
+//   * DestroyObjectsPendingDestroy : 把 PendingDestroyInternalIndices 队列里 refcount=0
+//                                    的对象释放——回收 InternalIndex、协议引用-1。
+//
+// SubObject 拓扑：FNetDependencyData 维护 SubObjects / ChildSubObjects / DependentParents
+//                 三类邻接关系；AddSubObject 同时维护 SubObjectInternalIndices 位图。
+// =====================================================================================
+
 #include "NetRefHandleManager.h"
 
 #include "Iris/Core/IrisLog.h"

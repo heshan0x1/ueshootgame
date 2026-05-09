@@ -1,5 +1,24 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavigationSystem.cpp  ── 模块最大的 cpp（~6500 行）
+// -----------------------------------------------------------------------------
+// 本文件是 UNavigationSystemV1 的实现主体。注释范围覆盖：
+//   - 文件头 + 关键全局状态（bNavigationAutoUpdateEnabled 等）
+//   - UNavigationSystemV1 生命周期：Ctor / PostInitProperties / FinishDestroy /
+//                                   ConditionalPopulateNavOctree / ConstructNavOctree
+//   - 主 Tick：Tick/RebuildDirtyAreas/PerformAsyncQueries/UpdateInvokers
+//   - 寻路：FindPathSync / FindPathAsync / TestPathSync / ProjectPointToNavigation / GetRandomPoint
+//   - NavData 注册链：RequestRegistrationDeferred / ProcessRegistrationCandidates /
+//                    RegisterNavData / CreateNavigationDataInstanceInLevel
+//   - Octree 链：OnComponentRegistered / UpdateComponentInNavOctree /
+//               UpdateActorAndComponentsInNavOctree / AddElementToNavOctree
+//   - 脏区域：AddDirtyArea / AddDirtyAreas
+//   - Invoker：RegisterInvoker / UpdateInvokers / UpdateNavDataActiveTiles / DirtyTilesInBuildBounds
+//   - Custom Link：RegisterCustomLink / UpdateCustomLink / RequestCustomLink*
+// 架构参考：Runtime/NavigationSystem/DevDocs/NavigationSystem_Architecture_CN.md
+// =============================================================================
+
 #include "NavigationSystem.h"
 #include "AbstractNavData.h"
 #include "AI/NavDataGenerator.h"
@@ -955,6 +974,8 @@ UNavigationSystemV1::UNavigationSystemV1(const FObjectInitializer& ObjectInitial
 	}
 }
 
+// UObject 销毁尾声：保险 CleanUp（CleanupUnsafe 模式不依赖 World 仍然有效）。
+// 通常此时 CleanUp 已被 OnBeginTearingDown 调用过，bCleanUpDone=true 直接返回。
 void UNavigationSystemV1::FinishDestroy()
 {
 	if (HasAnyFlags(RF_ClassDefaultObject) == false)
@@ -964,6 +985,7 @@ void UNavigationSystemV1::FinishDestroy()
 	Super::FinishDestroy();
 }
 
+// 给 OnScreen Debug HUD（按 Apostrophe）补充导航统计：Repository / NavData / Octree 节点数 / 待办瓦片任务等。
 void UNavigationSystemV1::GatherDebugLabels(TArray<FString>& InOutDebugLabels) const
 {
 	if (Repository)
@@ -1013,17 +1035,23 @@ void UNavigationSystemV1::GatherDebugLabels(TArray<FString>& InOutDebugLabels) c
 	InOutDebugLabels.Add(TEXT("")); // empty line
 }
 
+// 把本 NavSystem 切到/退出"静态模式"：bStaticRuntimeNavigation 决定，
+// 同时关掉 Component 变化通知（静态模式下不需要监听）。
+// 由 UNavigationSystemModuleConfig::CreateAndConfigureNavigationSystem 调用。
 void UNavigationSystemV1::ConfigureAsStatic(bool bEnableStatic)
 {
 	bStaticRuntimeNavigation = bEnableStatic;
 	SetWantsComponentChangeNotifies(!bEnableStatic);
 }
 
+// 控制 Component 属性变化时是否自动同步到 NavOctree。关闭后开发者需自己手动调 Update。
 void UNavigationSystemV1::SetUpdateNavOctreeOnComponentChange(bool bNewUpdateOnComponentChange)
 {
 	bUpdateNavOctreeOnComponentChange = bNewUpdateOnComponentChange;
 }
 
+// 一次性初始化：UpdateAbstractNavData + CreateCrowdManager + 订阅 Repository 事件。
+// 由 OnInitializeActors / OnWorldInitDone 调用，幂等（bInitialSetupHasBeenPerformed 守护）。
 void UNavigationSystemV1::DoInitialSetup()
 {
 	if (bInitialSetupHasBeenPerformed)
@@ -1039,6 +1067,8 @@ void UNavigationSystemV1::DoInitialSetup()
 	bInitialSetupHasBeenPerformed = true;
 }
 
+// 确保 World 中存在唯一的 AAbstractNavData 实例（用于直线/直接路径不依赖具体 NavMesh）。
+// 没有则在 PersistentLevel 上 Spawn 一份并标 RF_Transient。
 void UNavigationSystemV1::UpdateAbstractNavData()
 {
 	if (IsValid(AbstractNavData))
@@ -1071,6 +1101,8 @@ void UNavigationSystemV1::UpdateAbstractNavData()
 	}
 }
 
+// 给指定 SupportedAgent 设置 NavData 子类（同时同步 PreferredNavData）。
+// 编辑器下若不是 CDO 调用，会同步把变更写到 CDO，让 Project Settings 里也能正确显示。
 void UNavigationSystemV1::SetSupportedAgentsNavigationClass(int32 AgentIndex, TSubclassOf<ANavigationData> NavigationDataClass)
 {
 	const bool bCDOInEditor =
@@ -1111,6 +1143,14 @@ void UNavigationSystemV1::SetSupportedAgentsNavigationClass(int32 AgentIndex, TS
 #endif // WITH_EDITOR
 }
 
+// UObject 初始化末尾钩子：此时所有 UPROPERTY 已反序列化完毕。
+// 本方法：
+//   - 收集场景中已加载的 UNavArea 派生类并注册
+//   - 应用 SupportedAgentsMask 过滤 SupportedAgents
+//   - 给每个 Agent 设置 NavigationDataClass
+//   - 配置 Dirty Area 警告阈值
+//   - 应用 InitialNavBuildingLockFlags（可能包括 InitialLock/NoUpdateInEditor 等）
+//   - 订阅 ActorMoved / PostLoadMapWithWorld / NavigationDirtyEvent / ReloadComplete
 void UNavigationSystemV1::PostInitProperties()
 {
 	Super::PostInitProperties();
@@ -1158,6 +1198,8 @@ void UNavigationSystemV1::PostInitProperties()
 	}
 }
 
+// 真正 new FNavigationOctree 实例：中心 = 可导航世界 AABB 的中心，半径 = AABB 最大半径，
+// 默认 64000（UE 单位，约 640m）。数据收集模式 + Modifier 警告时间阈值也在这里配给 Octree。
 void UNavigationSystemV1::ConstructNavOctree()
 {
 	// Default values to keep previous behavior.
@@ -1175,6 +1217,11 @@ void UNavigationSystemV1::ConstructNavOctree()
 	NavHandler.ConstructNavOctree(NavOctreeCenter, NavOctreeRadius, DataGatheringMode, GatheringNavModifiersWarningLimitTime);
 }
 
+// 条件性构造 NavOctree：
+//   1) 查 RequiresNavOctree() ——若所有 NavData 都 Static 则不创建（节省内存）。
+//   2) 构造 NavOctree 并根据运行时生成类型决定是否存储几何。
+//   3) 若未锁 Octree，则注册当前 World 的所有 Level 碰撞 + Repository 里已有元素。
+// 期间产生的 DirtyAreas 会被丢弃（TGuardValue），否则会引发一次无意义的全量重建。
 bool UNavigationSystemV1::ConditionalPopulateNavOctree()
 {
 	// Discard all navigation updates caused by octree construction
@@ -1240,6 +1287,9 @@ bool UNavigationSystemV1::ConditionalPopulateNavOctree()
 }
 
 #if WITH_EDITOR
+// 编辑器：属性链改动回调（监听到 SupportedAgents[i].NavDataClass / bAllowClientSideNavigation）。
+//   - NavDataClass 改：调 SetSupportedAgentsNavigationClass + SaveConfig 写回 ini
+//   - AllowClientSideNavigation 改（CDO 上）：同步给所有 ModuleConfig 实例
 void UNavigationSystemV1::PostEditChangeChainProperty(FPropertyChangedChainEvent& PropertyChangedEvent)
 {
 	static const FName NAME_NavDataClass = FNavDataConfig::GetNavigationDataClassPropertyName();
@@ -1272,6 +1322,9 @@ void UNavigationSystemV1::PostEditChangeChainProperty(FPropertyChangedChainEvent
 	}
 }
 
+// 编辑器：单属性变更回调。
+//   - bGenerateNavigationOnlyAroundNavigationInvokers 切换 → 通知所有 NavData
+//   - AgentRadius 改 → 在 World Partition 地图弹提示，需要 ResaveActorsBuilder 让分区生效
 void UNavigationSystemV1::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	static const FName NAME_GenerateNavigationOnlyAroundNavigationInvokers = GET_MEMBER_NAME_CHECKED(UNavigationSystemV1, bGenerateNavigationOnlyAroundNavigationInvokers);
@@ -1304,11 +1357,14 @@ void UNavigationSystemV1::PostEditChangeProperty(FPropertyChangedEvent& Property
 }
 #endif // WITH_EDITOR
 
+// World 初始化阶段（关卡 Actor 已加载/初始化）的钩子，本类无逻辑——保留为子类扩展点。
 void UNavigationSystemV1::OnInitializeActors()
 {
 	
 }
 
+// FWorldDelegates::OnWorldBeginTearDown 回调：World 即将销毁时调 CleanUp（CleanupWithWorld 模式）。
+// 必须在 World 仍可访问时执行，因为 CleanUp 内会 ResetUniqueId 等需要 World 信息的操作。
 void UNavigationSystemV1::OnBeginTearingDown(UWorld* World)
 {
 	// If the world being torn down is my world context
@@ -1318,6 +1374,8 @@ void UNavigationSystemV1::OnBeginTearingDown(UWorld* World)
 	}
 }
 
+// World 初始化完成时调用：标记 bWorldInitDone、广播 OnNavigationInitDone，
+// 根据 RunMode 决定是否立即 RebuildAll / 释放 InitialLock。
 void UNavigationSystemV1::OnWorldInitDone(FNavigationSystemRunMode Mode)
 {
 	UNavigationSystemBase::OnNavigationInitStartStaticDelegate().Broadcast(*this);
@@ -1495,6 +1553,8 @@ void UNavigationSystemV1::OnWorldInitDone(FNavigationSystemRunMode Mode)
 	UNavigationSystemBase::OnNavigationInitDoneStaticDelegate().Broadcast(*this);
 }
 
+// 扫描 World 里已存在的 ANavigationData Actor（包括子 Level 里的）并推入注册队列。
+// 在 OnWorldInitDone 里调；后续 Tick 的 ProcessRegistrationCandidates 真正完成注册。
 void UNavigationSystemV1::RegisterNavigationDataInstances()
 {
 	UWorld* World = GetWorld();
@@ -1515,6 +1575,8 @@ void UNavigationSystemV1::RegisterNavigationDataInstances()
 	}
 }
 
+// 创建 Crowd Manager 实例：按配置的 CrowdManagerClass 实例化并 SetCrowdManager。
+// CrowdManager 负责群体避让/局部避障；类未配置时整个步骤跳过。
 void UNavigationSystemV1::CreateCrowdManager()
 {
 	UClass* CrowdManagerClassInstance = CrowdManagerClass.Get();
@@ -1527,6 +1589,8 @@ void UNavigationSystemV1::CreateCrowdManager()
 	}
 }
 
+// 替换 CrowdManager：旧实例先 RemoveAgent 全部 Agent 后释放，再赋新实例。
+// 传入 nullptr 表示彻底关闭群体管理（CleanUp 时使用）。
 void UNavigationSystemV1::SetCrowdManager(UCrowdManagerBase* NewCrowdManager)
 {
 	if (NewCrowdManager == CrowdManager.Get())
@@ -1545,6 +1609,8 @@ void UNavigationSystemV1::SetCrowdManager(UCrowdManagerBase* NewCrowdManager)
 	}
 }
 
+// 收集所有 NavData Generator 的"时间切片"信息：每个 NavData 是否启用切片、剩余瓦片任务数、当前已用切片时长。
+// 用于 NavRegenTimeSliceManager 在多个 NavData 间动态分配下一帧可用预算。
 void UNavigationSystemV1::CalcTimeSlicedUpdateData(TArray<double>& OutCurrentTimeSlicedBuildTaskDurations, TArray<bool>& OutIsTimeSlicingArray, bool& bOutAnyNonTimeSlicedGenerators, TArray<int32, TInlineAllocator<8>>& OutNumTimeSlicedRemainingBuildTasksArray)
 {
 	OutNumTimeSlicedRemainingBuildTasksArray.SetNumZeroed(NavDataSet.Num());
@@ -1578,6 +1644,14 @@ void UNavigationSystemV1::CalcTimeSlicedUpdateData(TArray<double>& OutCurrentTim
 	}
 }
 
+// NavigationSystem 的主 Tick。每帧：
+//   1) CalcAverageDeltaTime 维持时间切片的移动平均
+//   2) 消费 PendingNavBoundsUpdates → PerformNavigationBoundsUpdate
+//   3) 按 DirtyAreasUpdateFreq 周期把 Dirty Areas 推给各 NavData（RebuildDirtyAreas）
+//   4) 派发上一帧异步寻路结果（DispatchAsyncQueriesResults），发起新一轮（TriggerAsyncQueries）
+//   5) 按 ActiveTilesUpdateInterval 更新 Invokers + UpdateNavDataActiveTiles
+//   6) 处理 NavDataRegistrationQueue、PendingOctreeUpdates
+// 线程：GameThread。
 void UNavigationSystemV1::Tick(float DeltaSeconds)
 {
 	SET_DWORD_STAT(STAT_Navigation_ObservedPathsCount, 0);
@@ -1783,6 +1857,8 @@ void UNavigationSystemV1::Tick(float DeltaSeconds)
 	}
 }
 
+// GC 引用收集：把 CrowdManager 和（运行时模式下）NavAreaClasses 加入引用集，避免被回收。
+// 编辑器非 PIE 模式下不锁 NavAreaClasses，方便热重载/CDO 替换。
 void UNavigationSystemV1::AddReferencedObjects(UObject* InThis, FReferenceCollector& Collector)
 {
 	Super::AddReferencedObjects(InThis, Collector);
@@ -1830,6 +1906,7 @@ void UNavigationSystemV1::SetNavigationAutoUpdateEnabled(bool bNewEnable, UNavig
 //----------------------------------------------------------------------//
 // Public querying interface
 //----------------------------------------------------------------------//
+// 同步寻路主入口（带 Agent 版）：按 AgentProperties 选 NavData → 调同步版本。
 FPathFindingResult UNavigationSystemV1::FindPathSync(const FNavAgentProperties& AgentProperties, FPathFindingQuery Query, EPathFindingMode::Type Mode)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_PathfindingSync);
@@ -1856,6 +1933,9 @@ FPathFindingResult UNavigationSystemV1::FindPathSync(const FNavAgentProperties& 
 	return Result;
 }
 
+// 同步寻路：Query.NavData 已指定。最终落到 ANavigationData::FindPath（函数指针），
+// ARecastNavMesh 的函数指针指向自己的静态方法 ARecastNavMesh::FindPath（RecastNavMesh.cpp:~3509）→ FPImplRecastNavMesh::FindPath。
+// 阻塞 GameThread；高频路径查询请使用 FindPathAsync。
 FPathFindingResult UNavigationSystemV1::FindPathSync(FPathFindingQuery Query, EPathFindingMode::Type Mode)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_PathfindingSync);
@@ -1882,6 +1962,8 @@ FPathFindingResult UNavigationSystemV1::FindPathSync(FPathFindingQuery Query, EP
 	return Result;
 }
 
+// 同步路径存在性测试：与 FindPathSync 区别在于不构造完整路径，只判断是否可达，
+// 可选返回访问节点数。开销显著低于 FindPathSync，适合 AI 决策中的"能否到达"判定。
 bool UNavigationSystemV1::TestPathSync(FPathFindingQuery Query, EPathFindingMode::Type Mode, int32* NumVisitedNodes) const
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_PathfindingSync);
@@ -1908,12 +1990,16 @@ bool UNavigationSystemV1::TestPathSync(FPathFindingQuery Query, EPathFindingMode
 	return bExists;
 }
 
+// 把异步寻路 Query 加入待处理队列；下一帧 Tick 的 TriggerAsyncQueries 会批量派发到后台线程。
+// 必须在 GameThread 调用。
 void UNavigationSystemV1::AddAsyncQuery(const FAsyncPathFindingQuery& Query)
 {
 	check(IsInGameThread());
 	AsyncPathFindingQueries.Add(Query);
 }
 
+// 异步寻路入口：把 Query+ResultDelegate 塞进 AsyncPathFindingQueries，返回递增 RequestID。
+// 下一帧 Tick 里 TriggerAsyncQueries 会 snapshot 并启一个后台 Graph 任务处理。
 uint32 UNavigationSystemV1::FindPathAsync(const FNavAgentProperties& AgentProperties, FPathFindingQuery Query, const FNavPathQueryDelegate& ResultDelegate, EPathFindingMode::Type Mode)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RequestingAsyncPathfinding);
@@ -1938,6 +2024,8 @@ uint32 UNavigationSystemV1::FindPathAsync(const FNavAgentProperties& AgentProper
 	return INVALID_NAVQUERYID;
 }
 
+// 通过 RequestID 取消尚未派发的异步寻路请求；若该 ID 已经进入后台执行则无法取消。
+// 必须在 GameThread 调用。
 void UNavigationSystemV1::AbortAsyncFindPathRequest(uint32 AsynPathQueryID)
 {
 	check(IsInGameThread());
@@ -1961,6 +2049,7 @@ FAutoConsoleTaskPriority CPrio_TriggerAsyncQueries(
 	);
 
 
+// 启动后台寻路 Graph 任务：拷贝 PathFindingQueries 给 PerformAsyncQueries（在 AnyHiPriThreadNormalTask 线程池跑）
 void UNavigationSystemV1::TriggerAsyncQueries(TArray<FAsyncPathFindingQuery>& PathFindingQueries)
 {
 	DECLARE_CYCLE_STAT(TEXT("FSimpleDelegateGraphTask.NavigationSystem batched async queries"),
@@ -1972,6 +2061,8 @@ void UNavigationSystemV1::TriggerAsyncQueries(TArray<FAsyncPathFindingQuery>& Pa
 		GET_STATID(STAT_FSimpleDelegateGraphTask_NavigationSystemBatchedAsyncQueries), nullptr, CPrio_TriggerAsyncQueries.Get());
 }
 
+// 当后台异步寻路任务正在跑时，置位中止标志并阻塞等待其完成（剩余 Query 顺延到下一帧）。
+// 用于在 NavData 重建/关卡切换等场景下避免后台任务访问到失效数据。
 void UNavigationSystemV1::PostponeAsyncQueries()
 {
 	if (AsyncPathFindingTask.GetReference() && !AsyncPathFindingTask->IsComplete())
@@ -1982,6 +2073,8 @@ void UNavigationSystemV1::PostponeAsyncQueries()
 	}
 }
 
+// 在 GameThread 上派发已完成的异步寻路结果：逐条触发用户绑定的 OnDoneDelegate。
+// 由 Tick 在合并完成队列后调用，保证回调在主线程执行。
 void UNavigationSystemV1::DispatchAsyncQueriesResults(const TArray<FAsyncPathFindingQuery>& PathFindingQueries) const
 {
 	if (PathFindingQueries.Num() > 0)
@@ -1996,6 +2089,9 @@ void UNavigationSystemV1::DispatchAsyncQueriesResults(const TArray<FAsyncPathFin
 	}
 }
 
+// 真正在后台线程执行寻路：对每条 Query 调 NavData->FindPath，结果回塞给 CompletedQueries。
+// 可被 bAbortAsyncQueriesRequested 中途取消；剩余 Query 会顺延到下一帧。
+// 线程：非 GameThread。
 void UNavigationSystemV1::PerformAsyncQueries(TArray<FAsyncPathFindingQuery> PathFindingQueries)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_PathfindingAsync);
@@ -2049,6 +2145,8 @@ void UNavigationSystemV1::PerformAsyncQueries(TArray<FAsyncPathFindingQuery> Pat
 	UE_LOG(LogNavigation, Log, TEXT("Async pathfinding queries: %d completed, %d postponed to next frame"), NumProcessed, NumPostponed);
 }
 
+// 在 NavData 上随机取一个可达点（任一可达多边形随机点）。NavData 为 null 时回退到 MainNavData。
+// 同步阻塞调用；常用于 AI 巡逻/初始位置选择。
 bool UNavigationSystemV1::GetRandomPoint(FNavLocation& ResultLocation, ANavigationData* NavData, FSharedConstNavQueryFilter QueryFilter)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_QueriesTimeSync);
@@ -2067,6 +2165,8 @@ bool UNavigationSystemV1::GetRandomPoint(FNavLocation& ResultLocation, ANavigati
 	return false;
 }
 
+// 以 Origin 为中心、Radius 半径内随机选一可达点（要求从 Origin 真的能走到）。
+// 比 GetRandomPointInNavigableRadius 更"准"但更贵——内部含一次寻路可达性检测。
 bool UNavigationSystemV1::GetRandomReachablePointInRadius(const FVector& Origin, float Radius, FNavLocation& ResultLocation, ANavigationData* NavData, FSharedConstNavQueryFilter QueryFilter) const
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_QueriesTimeSync);
@@ -2079,6 +2179,8 @@ bool UNavigationSystemV1::GetRandomReachablePointInRadius(const FVector& Origin,
 	return NavData != nullptr && NavData->GetRandomReachablePointInRadius(Origin, Radius, ResultLocation, QueryFilter);
 }
 
+// 以 Origin 为中心、Radius 半径内随机选一可导航点（不要求与 Origin 连通）。
+// 仅做几何相交筛选，比 GetRandomReachablePointInRadius 便宜。
 bool UNavigationSystemV1::GetRandomPointInNavigableRadius(const FVector& Origin, float Radius, FNavLocation& ResultLocation, ANavigationData* NavData, FSharedConstNavQueryFilter QueryFilter) const
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_QueriesTimeSync);
@@ -2127,6 +2229,8 @@ ENavigationQueryResult::Type UNavigationSystemV1::GetPathLengthAndCost(const FVe
 	return NavData != nullptr ? NavData->CalcPathLengthAndCost(PathStart, PathEnd, OutPathLength, OutPathCost, QueryFilter) : ENavigationQueryResult::Error;
 }
 
+// 把任意 Point 投影到导航网格上（双重作用：① 修正/吸附位置为可走点；② 顺带挑出对应 NavData）。
+// Extent 为搜索盒；为零时使用 NavData 的 DefaultQueryExtent。命中失败返回 false。
 bool UNavigationSystemV1::ProjectPointToNavigation(const FVector& Point, FNavLocation& OutLocation, const FVector& Extent, const ANavigationData* NavData, FSharedConstNavQueryFilter QueryFilter) const
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_QueriesTimeSync);
@@ -2216,11 +2320,15 @@ UNavigationPath* UNavigationSystemV1::FindPathToLocationSynchronously(UObject* W
 	return ResultPath;
 }
 
+// 沿导航网格做"射线"测试（沿表面行走是否被阻挡）：被阻挡返回 true，HitLocation 写入碰撞点。
+// 转发到带 AdditionalResults 的重载。
 bool UNavigationSystemV1::NavigationRaycast(UObject* WorldContextObject, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, TSubclassOf<UNavigationQueryFilter> FilterClass, AController* Querier)
 {
 	return NavigationRaycastWithAdditionalResults(WorldContextObject, RayStart, RayEnd, HitLocation, nullptr, FilterClass, Querier);
 }
 
+// 导航射线检测的全功能版：根据 Querier 选 NavData → 调用 NavData->Raycast。
+// AdditionalResults 可拿到"终点是否落在走廊内"等附加信息，用于平滑路径/可见性判断。
 bool UNavigationSystemV1::NavigationRaycastWithAdditionalResults(UObject* WorldContextObject, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FNavigationRaycastAdditionalResults* AdditionalResults, TSubclassOf<UNavigationQueryFilter> FilterClass, AController* Querier)
 {
 	UWorld* World = nullptr;
@@ -2273,6 +2381,11 @@ void UNavigationSystemV1::GetNavAgentPropertiesArray(TArray<FNavAgentProperties>
 	AgentToNavDataMap.GetKeys(OutNavAgentProperties);
 }
 
+// 按 Agent 匹配 NavData（const 版，可选位置 + Extent）。
+// 基本策略：
+//   1) 先查 AgentToNavDataMap 缓存
+//   2) 遍历 NavDataSet，比对 Agent 半径/高度等（受 bSkipAgentHeightCheckWhenPickingNavData 影响）
+//   3) 若配置了 Preferred NavData Class 优先匹配
 ANavigationData* UNavigationSystemV1::GetNavDataForProps(const FNavAgentProperties& AgentProperties, const FVector& AgentLocation, const FVector& Extent) const
 {
 	return const_cast<ANavigationData*>(GetNavDataForProps(AgentProperties));
@@ -2373,6 +2486,8 @@ ANavigationData* UNavigationSystemV1::GetNavDataForAgentName(const FName AgentNa
 	return Result;
 }
 
+// 取整个世界中可导航区域的总包围盒。bWholeWorldNavigable 时遍历所有 nav-relevant Actor，
+// 否则只汇总 RegisteredNavBounds（NavMeshBoundsVolume / 注册的导航边界）。
 FBox UNavigationSystemV1::GetNavigableWorldBounds() const
 {
 	return GetWorldBounds();
@@ -2410,6 +2525,8 @@ FBox UNavigationSystemV1::ComputeNavDataBounds() const
 	return Bounds;
 }
 
+// World Partition 流式：把一个 NavigationDataChunkActor 携带的瓦片广播到所有 NavData，
+// 由 NavData 自行 attach/恢复对应的瓦片数据。
 void UNavigationSystemV1::AddNavigationDataChunk(ANavigationDataChunkActor& DataChunkActor)
 {
 	for (ANavigationData* NavData : NavDataSet)
@@ -2421,6 +2538,7 @@ void UNavigationSystemV1::AddNavigationDataChunk(ANavigationDataChunkActor& Data
 	}
 }
 
+// 与 AddNavigationDataChunk 配对：通知所有 NavData 卸载该 ChunkActor 携带的瓦片数据。
 void UNavigationSystemV1::RemoveNavigationDataChunk(ANavigationDataChunkActor& DataChunkActor)
 {
 	for (ANavigationData* NavData : NavDataSet)
@@ -2432,6 +2550,8 @@ void UNavigationSystemV1::RemoveNavigationDataChunk(ANavigationDataChunkActor& D
 	}
 }
 
+// World Partition 烘焙阶段：把 QueryBounds 范围内的 NavData 瓦片打包写入 DataChunkActor，
+// 并返回实际包含的瓦片包围盒（OutTilesBounds），用于序列化到 chunk。
 void UNavigationSystemV1::FillNavigationDataChunkActor(const FBox& QueryBounds, ANavigationDataChunkActor& DataChunkActor, FBox& OutTilesBounds)
 {
 	for (const ANavigationData* NavData : NavDataSet)
@@ -2443,6 +2563,8 @@ void UNavigationSystemV1::FillNavigationDataChunkActor(const FBox& QueryBounds, 
 	}
 }
 
+// 返回 MainNavData（缺省路径）。若没有且允许创建，则 Spawn 一份 AbstractNavData 兜底。
+// NavAgentProperties 默认寻路走这条路径。
 ANavigationData* UNavigationSystemV1::GetDefaultNavDataInstance(FNavigationSystem::ECreateIfMissing CreateNewIfNoneFound)
 {
 	checkSlow(IsInGameThread() == true);
@@ -2482,6 +2604,7 @@ ANavigationData* UNavigationSystemV1::GetDefaultNavDataInstance(FNavigationSyste
 	return MainNavData;
 }
 
+// 拷贝 MainNavData 的默认查询过滤器：用户拿到副本后可改 AreaCost 等而不影响原配置。
 FSharedNavQueryFilter UNavigationSystemV1::CreateDefaultQueryFilterCopy() const 
 { 
 	return MainNavData ? MainNavData->GetDefaultQueryFilter()->GetCopy() : nullptr; 
@@ -2550,6 +2673,8 @@ bool UNavigationSystemV1::IsThereAnywhereToBuildNavigation() const
 	return bCreateNavigation;
 }
 
+// 判断 Actor 是否对导航有"贡献"：Actor 自身或其任一组件实现 INavRelevantInterface 且为 relevant。
+// 用于决定是否将该 Actor 加入 NavOctree、是否参与导航重算。
 bool UNavigationSystemV1::IsNavigationRelevant(const AActor* TestActor) const
 {
 	const INavRelevantInterface* NavInterface = Cast<const INavRelevantInterface>(TestActor);
@@ -2631,6 +2756,8 @@ const TSet<FNavigationBounds>& UNavigationSystemV1::GetNavigationBounds() const
 	return RegisteredNavBounds;
 }
 
+// World Origin Rebasing：当世界原点平移时同步移动注册的导航边界，并按需重建 NavMesh。
+// 动态生成时整体重建；静态时通知所有 NavData->ApplyWorldOffset 做就地偏移。
 void UNavigationSystemV1::ApplyWorldOffset(const FVector& InOffset, bool bWorldShift)
 {
 	// Move the navmesh bounds by the offset
@@ -2680,6 +2807,8 @@ void UNavigationSystemV1::ApplyWorldOffset(const FVector& InOffset, bool bWorldS
 //----------------------------------------------------------------------//
 // Bookkeeping 
 //----------------------------------------------------------------------//
+// 推入待注册队列：典型调用者是 ANavigationData::PostRegisterAllComponents（Actor 刚从关卡加载）。
+// 真正注册发生在下一次 ProcessRegistrationCandidates（Tick 里）。
 void UNavigationSystemV1::RequestRegistrationDeferred(ANavigationData& NavData)
 {
 	FScopeLock RegistrationLock(&NavDataRegistrationSection);
@@ -2694,6 +2823,8 @@ void UNavigationSystemV1::RequestRegistrationDeferred(ANavigationData& NavData)
 	}
 }
 
+// 处理注册候选队列：逐个调 RegisterNavData；若成功会从队列移除。
+// 失败 (Agent 重复/不支持等) 会打 Log 并可能销毁 Actor。Tick 中驱动。
 void UNavigationSystemV1::ProcessRegistrationCandidates()
 {
 	FScopeLock RegistrationLock(&NavDataRegistrationSection);
@@ -2740,6 +2871,8 @@ void UNavigationSystemV1::ProcessRegistrationCandidates()
 	}
 }
 
+// 把延迟到 NavigationObjectRepository 上的 CustomLink 一次性 flush 到本 NavSystem。
+// 在 NavSystem 初始化完毕后调用，以处理"Repository 早于 NavSystem 收集"的链接。
 void UNavigationSystemV1::ProcessCustomLinkPendingRegistration()
 {
 	if (Repository == nullptr)
@@ -2756,6 +2889,12 @@ void UNavigationSystemV1::ProcessCustomLinkPendingRegistration()
 	}
 }
 
+// NavData 注册核心逻辑。步骤：
+//   1) 防呆：PendingKill / Agent 不匹配 SupportedAgents → 返回相应失败码
+//   2) 查是否已有同 Agent 的注册实例 → Agent 重复时按 bForceRebuildOnLoad 规则决定替换
+//   3) 分配 DataIDs，设置 NavDataConfig，把 NavData 放进 NavDataSet[SupportedAgentIndex]
+//   4) 更新 MainNavData（若当前 DefaultAgentName 匹配）
+//   5) 广播 OnNavDataRegisteredEvent
 UNavigationSystemV1::ERegistrationResult UNavigationSystemV1::RegisterNavData(ANavigationData* NavData)
 {
 	UE_LOG(LogNavigation, Verbose, TEXT("%hs %s"), __FUNCTION__, *GetFullNameSafe(NavData));
@@ -2883,6 +3022,8 @@ UNavigationSystemV1::ERegistrationResult UNavigationSystemV1::RegisterNavData(AN
 	return Result;
 }
 
+// 反注册 NavData：从 NavDataSet/AgentToNavDataMap/RegistrationQueue 移除，调用 OnUnregistered，
+// 并通知 CrowdManager。重置 NavRegenTimeSliceManager 的瓦片等待数组。
 void UNavigationSystemV1::UnregisterNavData(ANavigationData* NavData)
 {
 	UE_LOG(LogNavigation, Verbose, TEXT("%hs %s"), __FUNCTION__, *GetFullNameSafe(NavData));
@@ -2912,6 +3053,11 @@ void UNavigationSystemV1::UnregisterNavData(ANavigationData* NavData)
 	}
 }
 
+// SmartLink / 其它 Custom Link 注册。
+// 步骤：
+//   1) 生成/校验 FNavLinkId（若已存在冲突则 UpdateLinkId 重分配）
+//   2) 写入 CustomNavLinksMap
+//   3) 通知所有 NavData —— ARecastNavMesh 会登记 OffMeshConnection 触发 Tile 重建
 void UNavigationSystemV1::RegisterCustomLink(INavLinkCustomInterface& CustomLink)
 {
 	ensureMsgf(CustomLink.GetLinkOwner() == nullptr || GetWorld() == CustomLink.GetLinkOwner()->GetWorld(),
@@ -2977,6 +3123,7 @@ void UNavigationSystemV1::RegisterCustomLink(INavLinkCustomInterface& CustomLink
 	CustomNavLinksMap.Add(CustomLink.GetId(), FNavigationSystem::FCustomLinkOwnerInfo(&CustomLink));
 }
 
+// CustomLink 反注册：仅从 CustomNavLinksMap 移除条目。Tile 重建由调用方按需追加 dirty area。
 void UNavigationSystemV1::UnregisterCustomLink(INavLinkCustomInterface& CustomLink)
 {
 	CustomNavLinksMap.Remove(CustomLink.GetId());
@@ -2988,6 +3135,8 @@ INavLinkCustomInterface* UNavigationSystemV1::GetCustomLink(FNavLinkId UniqueLin
 	return (LinkInfo && LinkInfo->IsValid()) ? LinkInfo->LinkInterface : nullptr;
 }
 
+// 通知所有 NavData 更新链接状态（例如 SmartLink 的 Area Class 切换）。
+// ARecastNavMesh 实现里只改对应 OffMeshConnection 的 areaId / flags，不重建 Tile —— 因此切 Enable/Disable 很便宜。
 void UNavigationSystemV1::UpdateCustomLink(const INavLinkCustomInterface* CustomLink)
 {
 	for (TMap<FNavAgentProperties, TWeakObjectPtr<ANavigationData> >::TIterator It(AgentToNavDataMap); It; ++It)
@@ -3000,6 +3149,8 @@ void UNavigationSystemV1::UpdateCustomLink(const INavLinkCustomInterface* Custom
 	}
 }
 
+// 把 CustomLink 注册请求转交给 NavigationObjectRepository（World 级单例）。
+// Repository 在 NavSystem 真正可用时再调用 RegisterCustomLink，解耦初始化顺序。
 void UNavigationSystemV1::RequestCustomLinkRegistering(INavLinkCustomInterface& CustomLink, UObject* Owner)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3014,6 +3165,7 @@ void UNavigationSystemV1::RequestCustomLinkRegistering(INavLinkCustomInterface& 
 	}
 }
 
+// 反注册请求：同样走 NavigationObjectRepository，避免 Owner 销毁顺序与 NavSystem 不一致带来的悬挂注册。
 void UNavigationSystemV1::RequestCustomLinkUnregistering(INavLinkCustomInterface& CustomLink, UObject* Owner)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3028,6 +3180,8 @@ void UNavigationSystemV1::RequestCustomLinkUnregistering(INavLinkCustomInterface
 	}
 }
 
+// 用 LinkOwner 的世界变换把链接两端点 A/B 投到世界空间，包成 FBox。
+// 用于在 RegisterCustomLink 检测到 ID 冲突时把链接覆盖区域标脏。
 FBox UNavigationSystemV1::ComputeCustomLinkBounds(const INavLinkCustomInterface& CustomLink)
 {
 	const UObject* CustomLinkOb = CustomLink.GetLinkOwner();
@@ -3051,6 +3205,8 @@ FBox UNavigationSystemV1::ComputeCustomLinkBounds(const INavLinkCustomInterface&
 	return LinkBounds;
 }
 
+// 全局静态入口：广播到所有 NavSystem 实例（多 World 场景）调用 UnregisterNavAreaClass。
+// 由 UNavArea CDO 析构 / 蓝图重编译触发。
 void UNavigationSystemV1::RequestAreaUnregistering(UClass* NavAreaClass)
 {
 	for (TObjectIterator<UNavigationSystemV1> NavSysIt; NavSysIt; ++NavSysIt)
@@ -3059,6 +3215,8 @@ void UNavigationSystemV1::RequestAreaUnregistering(UClass* NavAreaClass)
 	}
 }
 
+// 将一个 NavArea 子类从 NavAreaClasses 中移除并触发 ENavAreaEvent::Unregistered。
+// 所有 NavData 会重排 AreaID/移除该 area 的 cost 配置；并广播全局 OnNavAreaUnregisteredDelegate。
 void UNavigationSystemV1::UnregisterNavAreaClass(UClass* NavAreaClass)
 {
 	// remove from known areas
@@ -3076,6 +3234,8 @@ void UNavigationSystemV1::UnregisterNavAreaClass(UClass* NavAreaClass)
 	}
 }
 
+// 全局静态入口：把 NavArea CDO 注册广播到所有 NavSystem 实例。
+// 通常在 UNavArea CDO 构造完成 / 蓝图编译完成时触发。
 void UNavigationSystemV1::RequestAreaRegistering(UClass* NavAreaClass)
 {
 	for (TObjectIterator<UNavigationSystemV1> NavSysIt; NavSysIt; ++NavSysIt)
@@ -3084,6 +3244,9 @@ void UNavigationSystemV1::RequestAreaRegistering(UClass* NavAreaClass)
 	}
 }
 
+// 把 AreaClass CDO 加入 NavAreaClasses 集合并通知所有 NavData 重排 AreaID/同步 area cost。
+// 过滤：抽象类、蓝图骨架类、Developers 目录下的蓝图、已注册的类全部 skip。
+// 副作用：调用 InitializeArea 初始化 flags；广播 OnNavAreaRegisteredDelegate。
 void UNavigationSystemV1::RegisterNavAreaClass(UClass* AreaClass)
 {
 	// can't be null
@@ -3149,6 +3312,7 @@ void UNavigationSystemV1::RegisterNavAreaClass(UClass* AreaClass)
 	}
 }
 
+// 把 NavArea 注册/反注册事件转发给所有有效的 NavData（让其重排内部 AreaID 表）。
 void UNavigationSystemV1::OnNavigationAreaEvent(UClass* AreaClass, ENavAreaEvent::Type Event)
 {
 	// notify existing nav data
@@ -3198,6 +3362,8 @@ int32 UNavigationSystemV1::GetSupportedAgentIndex(const FNavAgentProperties& Nav
 	return INDEX_NONE;
 }
 
+// 编辑器辅助：用 UEnum 的显示名填充 IncludeFlags/ExcludeFlags 16 个 bool 的 DisplayName 元数据。
+// 让 UNavigationQueryFilter 编辑器面板上的 NavFlag0..15 显示成游戏自定义名字。
 void UNavigationSystemV1::DescribeFilterFlags(UEnum* FlagsEnum) const
 {
 #if WITH_EDITOR
@@ -3215,6 +3381,8 @@ void UNavigationSystemV1::DescribeFilterFlags(UEnum* FlagsEnum) const
 #endif
 }
 
+// DescribeFilterFlags 数组版：直接给定 16 个名字。空名字位置会清掉 CPF_Edit（在面板隐藏）。
+// 自动把"Navigation link"专用位（ARecastNavMesh::GetNavLinkFlag()）保留为系统名。
 void UNavigationSystemV1::DescribeFilterFlags(const TArray<FString>& FlagsDesc) const
 {
 #if WITH_EDITOR
@@ -3272,6 +3440,8 @@ void UNavigationSystemV1::DescribeFilterFlags(const TArray<FString>& FlagsDesc) 
 #endif
 }
 
+// 让所有 NavData 丢弃名为 FilterClass 的查询过滤器缓存。
+// 通常在 FilterClass CDO 属性变更后调用，强制下次查询重新构造。
 void UNavigationSystemV1::ResetCachedFilter(TSubclassOf<UNavigationQueryFilter> FilterClass)
 {
 	for (int32 NavDataIndex = 0; NavDataIndex < NavDataSet.Num(); NavDataIndex++)
@@ -3283,6 +3453,8 @@ void UNavigationSystemV1::ResetCachedFilter(TSubclassOf<UNavigationQueryFilter> 
 	}
 }
 
+// CDO 静态查询：判断给定 World 是否需要创建本类型的 NavSystem 实例。
+// 默认规则：World 有效 + (允许客户端导航 || 非客户端模式)。
 bool UNavigationSystemV1::ShouldCreateNavigationSystemInstance(const UWorld* World) const
 {
 	ensureMsgf(IsTemplate(), TEXT("This method is expected to only be called on Template objects"
@@ -3311,6 +3483,9 @@ UNavigationSystemV1* UNavigationSystemV1::CreateNavigationSystem(UWorld* WorldOw
 	return NavSys;
 }
 
+// 接管 World 初始化（FWorldDelegates::OnPostWorldInitialization 等）：
+// 标记运行模式（Editor/PIE/Game/Inactive），完成 Octree 创建、AbstractNavData 生成、订阅事件。
+// 实质转发到 OnWorldInitDone，这里仅是桥接 NavigationSystemBase 接口。
 void UNavigationSystemV1::InitializeForWorld(UWorld& World, FNavigationSystemRunMode Mode)
 {
 	OnWorldInitDone(Mode);
@@ -3352,6 +3527,8 @@ TSharedPtr<const FNavigationElement> UNavigationSystemV1::GetNavigationElementFo
 	return Repository->GetNavigationElementForUObject(Object);
 }
 
+// UObject 形式的 NavRelevant 对象（非 Component/Actor）注册入口。
+// 通常来自 NavigationObjectRepository 的通知。
 void UNavigationSystemV1::OnNavRelevantObjectRegistered(UObject& Object)
 {
 	if (IsNavigationSystemStatic())
@@ -3365,6 +3542,11 @@ void UNavigationSystemV1::OnNavRelevantObjectRegistered(UObject& Object)
 	}
 }
 
+// 把 ActorComponent 注册进 NavOctree。前置条件：
+//   - NavSystem 非 Static
+//   - 不需要等 Owner Actor 自身先注册（否则跳过；后续 Actor 注册会带它进来）
+//   - Owner 视该 Component 为导航相关（IsComponentRelevantForNavigation）
+// 命中后转发到 RegisterNavRelevantObjectStatic，最终走 NavigationDataHandler 加进 Octree。
 void UNavigationSystemV1::RegisterComponentToNavOctree(UActorComponent* Comp)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3391,6 +3573,8 @@ void UNavigationSystemV1::RegisterComponentToNavOctree(UActorComponent* Comp)
 	}
 }
 
+// 给定 World 是否支持运行时动态修改导航（要求 NavSystem 非 Static 且需要 NavOctree）。
+// 静态烘焙模式下返回 false，调用方据此跳过运行时增量更新逻辑。
 bool UNavigationSystemV1::SupportsDynamicChanges(UWorld* World)
 {
 	if (IsNavigationSystemStatic())
@@ -3402,6 +3586,8 @@ bool UNavigationSystemV1::SupportsDynamicChanges(UWorld* World)
 	return NavSys && NavSys->RequiresNavOctree();
 }
 
+// 程序化构造 FNavigationElement 加入导航：通过 World 的 NavigationObjectRepository 落库，
+// 返回稳定句柄供 Remove/Update 使用。Static NavSystem 直接返回 Invalid。
 FNavigationElementHandle UNavigationSystemV1::AddNavigationElement(UWorld* World, FNavigationElement&& Element)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3422,6 +3608,8 @@ FNavigationElementHandle UNavigationSystemV1::AddNavigationElement(UWorld* World
 	return FNavigationElementHandle::Invalid;
 }
 
+// 与 AddNavigationElement 配对：从 NavigationObjectRepository 移除句柄对应元素，
+// Repository 内部会通知 NavOctree 反注册并标脏对应区域。
 void UNavigationSystemV1::RemoveNavigationElement(UWorld* World, const FNavigationElementHandle ElementHandle)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3437,11 +3625,15 @@ void UNavigationSystemV1::RemoveNavigationElement(UWorld* World, const FNavigati
 	}
 }
 
+// NavRelevantObject 反注册回调（来自 NavigationObjectRepository）：转 UnregisterNavRelevantObjectStatic，
+// 把对象从所有活跃 NavSystem 的 Octree 中移除。
 void UNavigationSystemV1::OnNavRelevantObjectUnregistered(UObject& Object)
 {
 	UnregisterNavRelevantObjectStatic(Object);
 }
 
+// Component 反注册：跳过 IsComponentRelevantForNavigation 检查（删除路径不需要），
+// 直接走 UnregisterNavRelevantObjectStatic 把元素从 Octree 移除。
 void UNavigationSystemV1::UnregisterComponentToNavOctree(UActorComponent* Comp)
 {
 	// skip IsComponentRelevantForNavigation check, it's only for adding new stuff
@@ -3474,16 +3666,24 @@ void UNavigationSystemV1::AddDirtyAreas(const TArray<FBox>& NewAreas, int32 Flag
 	AddDirtyAreas(NewAreas, static_cast<ENavigationDirtyFlag>(Flags), DebugReason);
 }
 
+// AddDirtyArea 实际实现（ENavigationDirtyFlag 版）：委托 DefaultDirtyAreasController。
+// 触发时机：Octree 元素添加/更新/删除；Brush/Modifier 改动；关卡加载等。
+// Flag 决定下游 NavData 应该做哪种类型的重建（Geometry / Modifier / All）。
+// 把"包围盒+脏标志"打入 DirtyAreasController 的累积队列。
+// 该队列在 Tick 由 ProcessDirtyAreas 派发到 NavData 触发瓦片重建。
 void UNavigationSystemV1::AddDirtyArea(const FBox& NewArea, const ENavigationDirtyFlag Flags, const FName& DebugReason /*= NAME_None*/)
 {
 	DefaultDirtyAreasController.AddArea(NewArea, Flags, nullptr, nullptr, DebugReason);
 }
 
+// AddDirtyArea 的延迟元素提供版：传入 lambda，仅在真正消费 dirty area 时取得 FNavigationElement，
+// 用于元素生命周期与 dirty area 提交时机不一致的场景，避免悬挂引用。
 void UNavigationSystemV1::AddDirtyArea(const FBox& NewArea, const ENavigationDirtyFlag Flags, const TFunction<const TSharedPtr<const FNavigationElement>()>& ElementProviderFunc, const FName& DebugReason /*= NAME_None*/)
 {
 	DefaultDirtyAreasController.AddArea(NewArea, Flags, ElementProviderFunc, /*DirtyElement*/ nullptr, DebugReason);
 }
 
+// 批量打入 dirty areas：逐个转 AddDirtyArea。Flags 为 None 时直接返回（保护用）。
 void UNavigationSystemV1::AddDirtyAreas(const TArray<FBox>& NewAreas, const ENavigationDirtyFlag Flags, const FName& DebugReason /*= NAME_None*/)
 {
 	if (Flags == ENavigationDirtyFlag::None)
@@ -3507,12 +3707,16 @@ bool UNavigationSystemV1::HasDirtyAreasQueued() const
 	return DefaultDirtyAreasController.IsDirty();
 }
 
+// 把 FNavigationElement 注册进 NavOctree（新版接口，基于共享指针元素）。
+// 由 NavigationDataHandler 桥接，最终 AddElementToNavOctree + 标脏。
 FSetElementId UNavigationSystemV1::RegisterNavigationElementWithNavOctree(const TSharedRef<const FNavigationElement>& Element, const int32 UpdateFlags)
 {
 	return FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).RegisterElementWithNavOctree(Element, UpdateFlags);
 }
 
 // Deprecated
+// 已废弃（基于 UObject + INavRelevantInterface 的旧接口）：
+// 内部包装为 FNavigationElement 后转发到新版 RegisterElementWithNavOctree。
 FSetElementId UNavigationSystemV1::RegisterNavOctreeElement(UObject* ElementOwner, INavRelevantInterface* ElementInterface, int32 UpdateFlags)
 {
 	return (ElementOwner && ElementInterface) 
@@ -3520,11 +3724,17 @@ FSetElementId UNavigationSystemV1::RegisterNavOctreeElement(UObject* ElementOwne
 		: FSetElementId();
 }
 
+// 真正把元素插入 Octree。由 ProcessPendingOctreeUpdates 逐个消费 PendingUpdates 调用。
+// 内部会：
+//   1) 把 Element 加入 FNavigationOctree（TOctree2 插入）
+//   2) 计算 DirtyBounds + Flags 并 AddDirtyArea（除非 bSkipDirtyAreaOnAddOrRemove）
 void UNavigationSystemV1::AddElementToNavOctree(const FNavigationDirtyElement& DirtyElement)
 {
 	FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).AddElementToNavOctree(DirtyElement);
 }
 
+// 取 Element 在 Octree 中已缓存的 DirtyFlags 与 DirtyBounds（如果存在）。
+// 用于复用脏区计算，避免上层重复推算包围盒。
 bool UNavigationSystemV1::GetNavOctreeElementData(const FNavigationElementHandle Element, ENavigationDirtyFlag& OutDirtyFlags, FBox& OutDirtyBounds)
 {
 	return DefaultOctreeController.GetNavOctreeElementData(Element, OutDirtyFlags, OutDirtyBounds);
@@ -3540,6 +3750,7 @@ bool UNavigationSystemV1::GetNavOctreeElementData(const UObject& NodeOwner, int3
 }
 
 // Deprecated
+// 旧接口：通过 (Owner+Interface) 反注册 NavOctree 元素，最终走 UnregisterNavRelevantObjectInternal。
 void UNavigationSystemV1::UnregisterNavOctreeElement(UObject* ElementOwner, INavRelevantInterface* ElementInterface, int32 UpdateFlags)
 {
 	if (ElementOwner && ElementInterface)
@@ -3548,6 +3759,7 @@ void UNavigationSystemV1::UnregisterNavOctreeElement(UObject* ElementOwner, INav
 	}
 }
 
+// 新接口：把 FNavigationElement 从 NavOctree 反注册（含标脏其覆盖区）。
 void UNavigationSystemV1::UnregisterNavigationElementWithOctree(const TSharedRef<const FNavigationElement>& Element, const int32 UpdateFlags)
 {
 	FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).UnregisterElementWithNavOctree(Element, UpdateFlags);
@@ -3565,11 +3777,14 @@ void UNavigationSystemV1::RemoveNavOctreeElementId(const FOctreeElementId2& Elem
 	RemoveFromNavOctree(ElementId, UpdateFlags);
 }
 
+// 按 Octree ElementId 删除元素并按需标脏（内部接口，已知精确节点位置时使用）。
 void UNavigationSystemV1::RemoveFromNavOctree(const FOctreeElementId2& ElementId, const int32 UpdateFlags)
 {
 	FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).RemoveFromNavOctree(ElementId, UpdateFlags);
 }
 
+// 触发 Lazy 收集：在真正需要数据时，调用元素的 GatherNavigationData 把 Modifier/几何信息填入 ElementData。
+// 配合 FNavigationOctree::bGatherGeometry / bGatherDataLazily 使用，节省内存。
 void UNavigationSystemV1::DemandLazyDataGathering(FNavigationRelevantData& ElementData)
 {
 	FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).DemandLazyDataGathering(ElementData);
@@ -3597,6 +3812,8 @@ FNavigationRelevantData* UNavigationSystemV1::GetMutableDataForElement(const FNa
 	return DefaultOctreeController.GetMutableDataForElement(Element);
 }
 
+// 全局静态注册：从 Object 的 World 找到 NavigationObjectRepository，把对象登记进去。
+// Repository 会按需通知本 World 的 NavSystem，把元素加入 NavOctree。
 void UNavigationSystemV1::RegisterNavRelevantObjectStatic(const INavRelevantInterface& NavRelevantObject, const UObject& Object)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3612,6 +3829,8 @@ void UNavigationSystemV1::RegisterNavRelevantObjectStatic(const INavRelevantInte
 	}
 }
 
+// 实例方法：直接使用本 NavSystem 缓存的 Repository 注册（避免再走 World->Subsystem 查表）。
+// 仅用于内部已知 NavSystem 实例的快速路径。
 void UNavigationSystemV1::RegisterNavRelevantObjectInternal(const INavRelevantInterface& NavRelevantObject, const UObject& Object)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3629,6 +3848,7 @@ void UNavigationSystemV1::RegisterNavRelevantObjectInternal(const INavRelevantIn
 	Repository->RegisterNavRelevantObject(NavRelevantObject);
 }
 
+// 全局静态反注册：从 Object 的 World 找到 Repository，将其登记移除（并触发 Octree 反注册）。
 void UNavigationSystemV1::UnregisterNavRelevantObjectStatic(const UObject& Object)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3644,6 +3864,7 @@ void UNavigationSystemV1::UnregisterNavRelevantObjectStatic(const UObject& Objec
 	}
 }
 
+// 实例方法：通过本 NavSystem 缓存的 Repository 反注册对象（快速路径）。
 void UNavigationSystemV1::UnregisterNavRelevantObjectInternal(const UObject& Object)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3661,6 +3882,8 @@ void UNavigationSystemV1::UnregisterNavRelevantObjectInternal(const UObject& Obj
 	Repository->UnregisterNavRelevantObject(&Object);
 }
 
+// 通用更新入口：把对象在 Repository 中刷新成新的 FNavigationElement，再对找到的 NavSystem 调用 InCallback
+// （通常是 UpdateNavOctreeElement）。NavSystem 不可用时退化为静态注册，等系统初始化后再补登。
 void UNavigationSystemV1::UpdateNavRelevantObjectInNavOctreeStatic(
 	const INavRelevantInterface& InNavRelevantObject,
 	const UObject& InObject,
@@ -3720,6 +3943,8 @@ void UNavigationSystemV1::UpdateNavRelevantObjectInNavOctree(UObject& Object)
 	}
 }
 
+// FNavigationElement 直接更新入口（非 UObject 路径）：找到 World 上的 NavSystem 并调 UpdateNavOctreeElement，
+// 用于程序化构造的导航元素（无 UObject 包装）变更通知。
 void UNavigationSystemV1::OnNavigationElementUpdated(UWorld* World, const FNavigationElementHandle ElementHandle, FNavigationElement&& Element)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3740,6 +3965,9 @@ void UNavigationSystemV1::UpdateActorInNavOctree(AActor& Actor)
 	UpdateNavRelevantObjectInNavOctree(Actor);
 }
 
+// 更新组件在 Octree 里的登记（Bounds/数据变化）。
+// 委托 FNavigationDataHandler::UpdateNavOctreeElement（走 PendingUpdates 队列）。
+// 典型触发：UNavRelevantComponent::RefreshNavigationModifiers、Primitive Transform 变化。
 void UNavigationSystemV1::UpdateComponentInNavOctree(UActorComponent& Comp)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3812,6 +4040,9 @@ void UNavigationSystemV1::UpdateComponentInNavOctree(UActorComponent& Comp)
 	}
 }
 
+// 更新 Actor 整体 + 其所有相关组件在 Octree 里的登记。
+// 典型触发：Actor 被移动 / 子组件关系变化 / 编辑器 Tab 切换。
+// bUpdateAttachedActors=true 时会连带更新所有挂接的子 Actor（递归）。
 void UNavigationSystemV1::UpdateActorAndComponentsInNavOctree(AActor& Actor, const bool bUpdateAttachedActors)
 {
 	SCOPE_CYCLE_COUNTER(STAT_NavOctreeBookkeeping);
@@ -3893,6 +4124,8 @@ void UNavigationSystemV1::UpdateActorAndComponentsInNavOctree(AActor& Actor, con
 	}
 }
 
+// 当 SceneComponent 移动后被调用：仅在它是 Owner 的根组件时，整个 Actor + 子 Actor 全更新一遍。
+// 非根组件不进入这里（其自身 OnRegister 路径会走）。
 void UNavigationSystemV1::UpdateNavOctreeAfterMove(USceneComponent* Comp)
 {
 	AActor* OwnerActor = Comp->GetOwner();
@@ -3924,6 +4157,8 @@ int32 UNavigationSystemV1::GetAllAttachedActors(const AActor& RootActor, TArray<
 	return OutAttachedActors.Num();
 }
 
+// 收集 RootActor 下所有挂接（含递归）的子 Actor 后，逐个 UpdateActorAndComponentsInNavOctree。
+// 用于父对象变换时把子层级跟着同步到 Octree。
 void UNavigationSystemV1::UpdateAttachedActorsInNavOctree(AActor& RootActor)
 {
 	TArray<AActor*> UniqueAttachedActors;
@@ -3936,6 +4171,8 @@ void UNavigationSystemV1::UpdateAttachedActorsInNavOctree(AActor& RootActor)
 	}
 }
 
+// 让 Actor 内所有 NavRelevant 组件重新计算自身的导航包围盒（INavRelevantInterface::UpdateNavigationBounds）。
+// 通常在组件 transform/parent 变化、bCanEverAffectNavigation 翻转后调用。
 void UNavigationSystemV1::UpdateNavOctreeBounds(AActor* Actor)
 {
 	for (UActorComponent* Component : Actor->GetComponents())
@@ -3948,6 +4185,8 @@ void UNavigationSystemV1::UpdateNavOctreeBounds(AActor* Actor)
 	}
 }
 
+// 一次性把 Actor + 其所有组件从 Octree 中移除（销毁/卸载场景）。
+// 内部走 OnActorUnregistered + 逐组件 OnComponentUnregistered。
 void UNavigationSystemV1::ClearNavOctreeAll(AActor* Actor)
 {
 	if (Actor)
@@ -3965,6 +4204,7 @@ void UNavigationSystemV1::ClearNavOctreeAll(AActor* Actor)
 }
 
 // Deprecated
+// 已废弃 UObject 重载：经 Repository 找句柄→构造 FNavigationElement→走新版 UpdateNavOctreeElement。
 void UNavigationSystemV1::UpdateNavOctreeElement(UObject* ElementOwner, INavRelevantInterface* ElementInterface, int32 UpdateFlags)
 {
 	if (IsNavigationSystemStatic())
@@ -3984,6 +4224,8 @@ void UNavigationSystemV1::UpdateNavOctreeElement(UObject* ElementOwner, INavRele
 	}
 }
 
+// Octree 元素更新核心：替换 Element 数据 + 计算新旧并集脏区 + 标脏。
+// UpdateFlags 控制是否合并/跳过几何重收集等。委托 FNavigationDataHandler 实现。
 void UNavigationSystemV1::UpdateNavOctreeElement(const FNavigationElementHandle Handle, const TSharedRef<const FNavigationElement>& Element, const int32 UpdateFlags)
 {
 	if (IsNavigationSystemStatic())
@@ -3995,6 +4237,7 @@ void UNavigationSystemV1::UpdateNavOctreeElement(const FNavigationElementHandle 
 }
 
 // Deprecated
+// 已废弃：沿父链向上传播更新（用于子组件 bounds 变化需要让父 Actor 一起重算的旧路径）。
 void UNavigationSystemV1::UpdateNavOctreeParentChain(UObject* ElementOwner, bool bSkipElementOwnerUpdate)
 {
 	PRAGMA_DISABLE_DEPRECATION_WARNINGS
@@ -4006,6 +4249,8 @@ void UNavigationSystemV1::UpdateNavOctreeParentChain(UObject* ElementOwner, bool
 }
 
 // Deprecated
+// 已废弃 UObject 重载：仅更新 Octree 中元素的 Bounds（不重新收集几何/Modifier），
+// 并附加 DirtyAreas 数组（额外需要标脏的区域）。从 Repository 取句柄后转新版。
 bool UNavigationSystemV1::UpdateNavOctreeElementBounds(UObject& Object, const FBox& NewBounds, TConstArrayView<FBox> DirtyAreas)
 {
 	if (Repository == nullptr)
@@ -4022,6 +4267,8 @@ bool UNavigationSystemV1::UpdateNavOctreeElementBounds(UObject& Object, const FB
 	return false;
 }
 
+// 仅更新 Octree 元素 Bounds 的轻量路径：先同步到 FNavigationElement::SetBounds，
+// 再调 NavigationDataHandler 把新 Bounds 与额外 DirtyAreas 标脏（不重收数据）。
 bool UNavigationSystemV1::UpdateNavOctreeElementBounds(const FNavigationElementHandle Handle, const FBox& NewBounds, const TConstArrayView<FBox> DirtyAreas)
 {
 	if (IsNavigationSystemStatic())
@@ -4038,6 +4285,8 @@ bool UNavigationSystemV1::UpdateNavOctreeElementBounds(const FNavigationElementH
 }
 
 // Deprecated
+// 已废弃 UObject 重载：把 Octree 中 Object 对应元素中所有 OldArea 的 Modifier 替换为 NewArea。
+// bReplaceChildClasses=true 时也匹配 OldArea 的子类。从 Repository 解析句柄后转新版。
 bool UNavigationSystemV1::ReplaceAreaInOctreeData(const UObject& Object, TSubclassOf<UNavArea> OldArea, TSubclassOf<UNavArea> NewArea, bool bReplaceChildClasses)
 {
 	if (Repository == nullptr)
@@ -4053,6 +4302,8 @@ bool UNavigationSystemV1::ReplaceAreaInOctreeData(const UObject& Object, TSubcla
 	return false;
 }
 
+// 同上，基于句柄的版本：在 Octree 数据里把 OldArea 替换为 NewArea；
+// 用于运行时 NavArea 切换（如 SmartLink Enable/Disable）而不必重收几何。
 bool UNavigationSystemV1::ReplaceAreaInOctreeData(const FNavigationElementHandle Handle, const TSubclassOf<UNavArea> OldArea, const TSubclassOf<UNavArea> NewArea, const bool bReplaceChildClasses)
 {
 	if (IsNavigationSystemStatic())
@@ -4063,6 +4314,8 @@ bool UNavigationSystemV1::ReplaceAreaInOctreeData(const FNavigationElementHandle
 	return FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).ReplaceAreaInOctreeData(Handle, OldArea, NewArea, bReplaceChildClasses);
 }
 
+// 组件注册的静态入口（UNavRelevantComponent::OnRegister 会调到这里）。
+// 从组件所在 World 找 NavigationSystem，委托走 FNavigationDataHandler::RegisterElementWithNavOctree。
 void UNavigationSystemV1::OnComponentRegistered(UActorComponent* Comp)
 {
 	RegisterComponentToNavOctree(Comp);
@@ -4073,6 +4326,7 @@ void UNavigationSystemV1::OnComponentUnregistered(UActorComponent* Comp)
 	UnregisterComponentToNavOctree(Comp);
 }
 
+// 同 OnComponentRegistered 的对外别名，转发到 RegisterComponentToNavOctree。
 void UNavigationSystemV1::RegisterComponent(UActorComponent* Comp)
 {
 	RegisterComponentToNavOctree(Comp);
@@ -4083,6 +4337,8 @@ void UNavigationSystemV1::UnregisterComponent(UActorComponent* Comp)
 	UnregisterComponentToNavOctree(Comp);
 }
 
+// Actor 级别的注册：枚举 Actor 所有 NavRelevant 组件，逐个登记到 Octree。
+// 另外把 Actor 本身（若实现 INavRelevantInterface）也登记一次。
 void UNavigationSystemV1::OnActorRegistered(AActor* Actor)
 {
 	if (IsNavigationSystemStatic())
@@ -4115,6 +4371,7 @@ void UNavigationSystemV1::OnActorRegistered(AActor* Actor)
 	}
 }
 
+// Actor 反注册：把 Actor 自身从 Repository 中移除（其组件由 OnComponentUnregistered 各自处理）。
 void UNavigationSystemV1::OnActorUnregistered(AActor* Actor)
 {
 	if (IsNavigationSystemStatic())
@@ -4128,16 +4385,22 @@ void UNavigationSystemV1::OnActorUnregistered(AActor* Actor)
 	}
 }
 
+// 在 NavOctree 中按 QueryBox + Filter 查找元素，结果填入 Elements。
+// 给 NavData 生成器（如 RecastTileGenerator）拿瓦片相关元素用。
 void UNavigationSystemV1::FindElementsInNavOctree(const FBox& QueryBox, const FNavigationOctreeFilter& Filter, TArray<FNavigationOctreeElement>& Elements)
 {	
 	FNavigationDataHandler(DefaultOctreeController, DefaultDirtyAreasController).FindElementsInNavOctree(QueryBox, Filter, Elements);
 }
 
+// 解除"初始构建锁"：World 初始化期间为避免重复重建会上 InitialLock，加载完毕后调本函数解锁。
+// 解锁后累积的 dirty areas 才会真正派发到 NavData 生成器。
 void UNavigationSystemV1::ReleaseInitialBuildingLock()
 {
 	RemoveNavigationBuildLock(ENavigationBuildLock::InitialLock);
 }
 
+// World 初始化时把已可见 Level 上的世界静态碰撞导入 Octree。仅执行一次（bInitialLevelsAdded）。
+// 后续 Level 流式加载由 OnLevelAddedToWorld 处理。
 void UNavigationSystemV1::InitializeLevelCollisions()
 {
 	if (IsNavigationSystemStatic())
@@ -4164,6 +4427,8 @@ void UNavigationSystemV1::InitializeLevelCollisions()
 }
 
 #if WITH_EDITOR
+// 编辑器：Level 几何变了重新拉一遍——先 OnLevelRemovedFromWorld 再 OnLevelAddedToWorld。
+// 简单暴力但确保所有 nav-relevant 元素被刷新。
 void UNavigationSystemV1::UpdateLevelCollision(ULevel* InLevel)
 {
 	if (InLevel != nullptr)
@@ -4175,6 +4440,8 @@ void UNavigationSystemV1::UpdateLevelCollision(ULevel* InLevel)
 }
 #endif
 
+// NavMeshBoundsVolume 几何变化（缩放/移动）后回调：根据有无有效 AreaBox 决定 Updated/Removed，
+// 入队 PendingNavBoundsUpdates 等下一帧 PerformNavigationBoundsUpdate 处理。
 void UNavigationSystemV1::OnNavigationBoundsUpdated(ANavMeshBoundsVolume* NavVolume)
 {
 	if (NavVolume == nullptr || IsNavigationSystemStatic())
@@ -4202,6 +4469,8 @@ void UNavigationSystemV1::OnNavigationBoundsUpdated(ANavMeshBoundsVolume* NavVol
 	AddNavigationBoundsUpdateRequest(UpdateRequest);
 }
 
+// NavMeshBoundsVolume 注册时回调：构造 Added 类型 UpdateRequest 入队。
+// 副作用：可能在 World Partition 模式下被 CheckToLimitNavigationBoundsToLoadedRegions 截短。
 void UNavigationSystemV1::OnNavigationBoundsAdded(ANavMeshBoundsVolume* NavVolume)
 {
 	if (NavVolume == nullptr || IsNavigationSystemStatic())
@@ -4221,6 +4490,7 @@ void UNavigationSystemV1::OnNavigationBoundsAdded(ANavMeshBoundsVolume* NavVolum
 	AddNavigationBoundsUpdateRequest(UpdateRequest);
 }
 
+// NavMeshBoundsVolume 销毁时回调：构造 Removed UpdateRequest 入队。
 void UNavigationSystemV1::OnNavigationBoundsRemoved(ANavMeshBoundsVolume* NavVolume)
 {
 	if (NavVolume == nullptr || IsNavigationSystemStatic())
@@ -4240,6 +4510,8 @@ void UNavigationSystemV1::OnNavigationBoundsRemoved(ANavMeshBoundsVolume* NavVol
 	AddNavigationBoundsUpdateRequest(UpdateRequest);
 }
 
+// World Partition + 编辑器场景：把 NavBounds 裁剪到当前用户加载的 Editor 区域内，
+// 避免给未加载区域生成空导航瓦片。仅在存在 World-Partitioned NavMesh 且 EditorWorld 时生效。
 void UNavigationSystemV1::CheckToLimitNavigationBoundsToLoadedRegions(FNavigationBounds& OutBounds) const
 {
 #if WITH_EDITOR && WITH_RECAST
@@ -4300,6 +4572,9 @@ void UNavigationSystemV1::CheckToLimitNavigationBoundsToLoadedRegions(FNavigatio
 #endif // WITH_EDITOR && WITH_RECAST
 }
 
+// 把 NavBounds 更新请求加入 PendingNavBoundsUpdates。规则：
+//   - 同 ID 已有请求：覆盖；特殊地，Removed 紧跟 Added 且 bounds 未变 → 取消（一次都不更新）
+//   - 否则追加到队列尾部
 void UNavigationSystemV1::AddNavigationBoundsUpdateRequest(const FNavigationBoundsUpdateRequest& UpdateRequest)
 {
 	const int32 ExistingIdx = PendingNavBoundsUpdates.IndexOfByPredicate([&](const FNavigationBoundsUpdateRequest& Element) {
@@ -4338,6 +4613,11 @@ void UNavigationSystemV1::AddNavigationBoundsUpdateRequest(const FNavigationBoun
 	}
 }
 
+// 处理 NavBounds 更新请求队列：增 / 删 / 改尺寸。
+// 每个请求会：
+//   1) 同步 RegisteredNavBounds
+//   2) 通知所有 NavData（如 ARecastNavMesh 会据此决定生成范围）
+//   3) 触发 DirtyAll（全量重建）当有 Add/Remove 时
 void UNavigationSystemV1::PerformNavigationBoundsUpdate(const TArray<FNavigationBoundsUpdateRequest>& UpdateRequests)
 {
 	// NOTE: we used to create missing nav data first, before updating nav bounds, 
@@ -4434,6 +4714,8 @@ void UNavigationSystemV1::AddNavigationBounds(const FNavigationBounds& NewBounds
 	RegisteredNavBounds.Add(NewBounds);
 }
 
+// 全量扫描 World 里的 ANavMeshBoundsVolume，重建 RegisteredNavBounds 集合。
+// 通常在 NavSystem 初始化阶段使用；运行时增删走 OnNavigationBoundsAdded/Removed 增量路径。
 void UNavigationSystemV1::GatherNavigationBounds()
 {
 	// Gather all available navigation bounds
@@ -4456,6 +4738,8 @@ void UNavigationSystemV1::GatherNavigationBounds()
 	}
 }
 
+// 收集所有 PlayerController 的 Pawn/Camera 位置作为"Invoker 种子点"。
+// NavigationInvoker 模式下用于初始化时圈出哪些瓦片需要立即烘焙。
 void UNavigationSystemV1::GetInvokerSeedLocations(const UWorld& InWorld, TArray<FVector, TInlineAllocator<32>>& OutSeedLocations)
 {
 	for (FConstPlayerControllerIterator PlayerIt = InWorld.GetPlayerControllerIterator(); PlayerIt; ++PlayerIt)
@@ -4475,6 +4759,9 @@ void UNavigationSystemV1::GetInvokerSeedLocations(const UWorld& InWorld, TArray<
 	}
 }
 
+// 一次性全量构建：丢弃缓存的 NavigationDataChunks → SpawnMissingNavigationData →
+// ProcessRegistrationCandidates → UpdateInvokers/DirtyTilesInBuildBounds → RebuildAll →
+// 阻塞等待每个 NavData->EnsureBuildCompletion 完成。常用于编辑器 "Build Paths"、烘焙 commandlet。
 void UNavigationSystemV1::Build()
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(UNavigationSystemV1::Build);
@@ -4545,6 +4832,8 @@ void UNavigationSystemV1::Build()
 	UE_LOG(LogNavigation, Display, TEXT("UNavigationSystemV1::Build total execution time: %.5fs"), float(FPlatformTime::Seconds() - BuildStartTime));
 }
 
+// 取消所有 NavData 的当前构建任务（调用各自 Generator->CancelBuild）。
+// 用于 World shift / NavSystem 重置 / 用户主动取消。
 void UNavigationSystemV1::CancelBuild()
 {
 	for (ANavigationData* NavData : NavDataSet)
@@ -4559,6 +4848,8 @@ void UNavigationSystemV1::CancelBuild()
 	}
 }
 
+// 为每个 SupportedAgent 检查是否已有 NavData；没有则 CreateNavigationDataInstanceInLevel。
+// bAutoCreateNavigationData + bSpawnNavDataInNavBoundsLevel 共同决定行为。
 void UNavigationSystemV1::SpawnMissingNavigationData()
 {
 	const int32 AllSupportedAgentsCount = SupportedAgents.Num();
@@ -4644,6 +4935,9 @@ uint8 UNavigationSystemV1::FillInstantiatedDataMask(TBitArray<>& OutInstantiated
 	return NumberFound;
 }
 
+// 在指定 Level 中为缺失的 SupportedAgent 生成 NavData。
+// 跳过：CDO 不允许 spawn / 非 Editor 但 NavData 是 Static 模式 / Agent 不在 SupportedAgentsMask。
+// 创建后调用 RequestRegistrationDeferred 入注册队列。
 void UNavigationSystemV1::SpawnMissingNavigationDataInLevel(const TBitArray<>& InInstantiatedMask, ULevel* InLevel/*=nullptr*/)
 {
 	UWorld* NavWorld = GetWorld();
@@ -4686,6 +4980,10 @@ void UNavigationSystemV1::SpawnMissingNavigationDataInLevel(const TBitArray<>& I
 	}
 }
 
+// 在指定关卡里 Spawn 一份 NavData（默认通常是 ARecastNavMesh）。
+// SpawnLevel==null 且 bSpawnNavDataInNavBoundsLevel==true 时：
+//   从 RegisteredNavBounds 里挑第一个 Volume 所在的 Level 作为生成层级。
+// 用途：bAutoCreateNavigationData=true 且没有任何匹配 NavData 时自动补一份。
 ANavigationData* UNavigationSystemV1::CreateNavigationDataInstanceInLevel(const FNavDataConfig& NavConfig, ULevel* SpawnLevel)
 {
 	UWorld* World = GetWorld();
@@ -4770,6 +5068,8 @@ ANavigationData* UNavigationSystemV1::CreateNavigationDataInstanceInLevel(const 
 	return Instance;
 }
 
+// PIE 启动钩子（编辑器实例）：把 EditorWorld 标脏积累暂停 + 加 NoUpdateInPIE 锁，
+// 避免 PIE 期间编辑器 World 持续重建浪费算力。
 void UNavigationSystemV1::OnPIEStart()
 {
 	bIsPIEActive = true;
@@ -4782,6 +5082,8 @@ void UNavigationSystemV1::OnPIEStart()
 	}
 }
 
+// PIE 结束钩子：解 NoUpdateInPIE 锁；为避免编辑器 World 触发不必要的重建，
+// 用 ELockRemovalRebuildAction::NoRebuild 跳过解锁后的 RebuildAll。
 void UNavigationSystemV1::OnPIEEnd()
 {
 	bIsPIEActive = false;
@@ -4795,6 +5097,8 @@ void UNavigationSystemV1::OnPIEEnd()
 	}
 }
 
+// 给 NavBuildingLockFlags 上对应位（按 ENavigationBuildLock 标志）。
+// 从 unlocked → locked 的边沿会通知 DirtyAreasController 进入累积模式。
 void UNavigationSystemV1::AddNavigationBuildLock(uint8 Flags)
 {
 	const bool bWasLocked = IsNavigationBuildingLocked();
@@ -4809,6 +5113,8 @@ void UNavigationSystemV1::AddNavigationBuildLock(uint8 Flags)
 	}
 }
 
+// 解某些构建锁；从 locked → unlocked 边沿时按 RebuildAction 决定是否立即 RebuildAll。
+// 默认 Rebuild；NoRebuild 用于 OnPIEEnd 这种不需重建的场景。
 void UNavigationSystemV1::RemoveNavigationBuildLock(uint8 Flags, const ELockRemovalRebuildAction RebuildAction /*= ELockRemovalRebuildAction::Rebuild*/)
 {
 	const bool bWasLocked = IsNavigationBuildingLocked();
@@ -4832,6 +5138,8 @@ void UNavigationSystemV1::RemoveNavigationBuildLock(uint8 Flags, const ELockRemo
 	}
 }
 
+// Octree 锁：bLock=true 时拒绝任何 Add/Update/Remove 请求（用于关键阶段防并发改动）。
+// 由 DefaultOctreeController 内部维护标志位。
 void UNavigationSystemV1::SetNavigationOctreeLock(bool bLock)
 {
 	UE_LOG(LogNavigation, Verbose, TEXT("UNavigationSystemV1::SetNavigationOctreeLock IsLocked=%s"), *LexToString(bLock));
@@ -4840,6 +5148,9 @@ void UNavigationSystemV1::SetNavigationOctreeLock(bool bLock)
 }
 
 
+// 全量重建所有 NavData。
+// 典型调用：OnWorldInitDone 后第一次初始化、编辑器 Build 按钮、NavBounds 大规模变动。
+// 内部：对每份 NavData 调 RebuildAll（真正走 FNavDataGenerator::RebuildAll）。
 void UNavigationSystemV1::RebuildAll(bool bIsLoadTime)
 {
 	UE_LOG(LogNavigation, Verbose, TEXT("UNavigationSystemV1::RebuildAll"));
@@ -4874,6 +5185,9 @@ void UNavigationSystemV1::RebuildAll(bool bIsLoadTime)
 	}
 }
 
+// 每帧把 DefaultDirtyAreasController 里的脏区域推给各 NavData 做增量重建。
+// 频率由 DirtyAreasUpdateFreq 决定（通常每帧跑）。
+// NavData::RebuildDirtyAreas 会把 Dirty 区域转为 Tile 坐标 → 加入 PendingDirtyTiles。
 void UNavigationSystemV1::RebuildDirtyAreas(float DeltaSeconds)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_TickMarkDirty);
@@ -4906,6 +5220,8 @@ bool UNavigationSystemV1::IsNavigationBuildInProgress()
 	return bRet;
 }
 
+// 单个 NavData 烘焙完成的回调。广播 OnNavigationGenerationFinishedDelegate；
+// 编辑器下重置 bIsBuildingOnLoad 标记。供调试 / UI 显示进度用。
 void UNavigationSystemV1::OnNavigationGenerationFinished(ANavigationData& NavData)
 {
 	OnNavigationGenerationFinishedDelegate.Broadcast(&NavData);
@@ -4921,6 +5237,7 @@ void UNavigationSystemV1::OnNavigationGenerationFinished(ANavigationData& NavDat
 #endif //WITH_EDITOR
 }
 
+// 累计所有 NavData 待办瓦片任务数（含尚未派发的）。常用于 HUD/CSV stat。
 int32 UNavigationSystemV1::GetNumRemainingBuildTasks() const
 {
 	int32 NumTasks = 0;
@@ -4936,6 +5253,7 @@ int32 UNavigationSystemV1::GetNumRemainingBuildTasks() const
 	return NumTasks;
 }
 
+// 累计所有 NavData 当前正在跑的瓦片任务数（已派发到线程池）。
 int32 UNavigationSystemV1::GetNumRunningBuildTasks() const 
 {
 	int32 NumTasks = 0;
@@ -4951,6 +5269,10 @@ int32 UNavigationSystemV1::GetNumRunningBuildTasks() const
 	return NumTasks;
 }
 
+// 流式关卡加载完成回调：
+//   1) AddLevelCollisionToOctree —— 把 Level 静态碰撞导入 Octree
+//   2) 通知所有 NavData->OnStreamingLevelAdded（Recast 会按需拉取该 Level 内的 NavDataChunkActor）
+//   3) 编辑器模式下补登记其内的 ANavigationData 实例
 void UNavigationSystemV1::OnLevelAddedToWorld(ULevel* InLevel, UWorld* InWorld)
 {
 	if ((InWorld != GetWorld()) || (InLevel == nullptr))
@@ -5005,6 +5327,9 @@ void UNavigationSystemV1::OnLevelAddedToWorld(ULevel* InLevel, UWorld* InWorld)
 	}
 }
 
+// 流式关卡卸载回调：
+//   1) RemoveLevelCollisionFromOctree —— 从 Octree 移除该 Level 静态碰撞
+//   2) 通知所有 NavData->OnStreamingLevelRemoved；其中 NavData 自己所属的 Level 被卸载时直接 UnregisterNavData
 void UNavigationSystemV1::OnLevelRemovedFromWorld(ULevel* InLevel, UWorld* InWorld)
 {
 	if ((InWorld == GetWorld()) && (InLevel != nullptr))
@@ -5044,6 +5369,7 @@ void UNavigationSystemV1::AddLevelToOctree(ULevel& Level)
 	AddLevelCollisionToOctree(&Level);
 }
 
+// 把 Level 的 Model（BSP）几何登记进 Octree。Actor/Component 的登记由 Repository 路径完成。
 void UNavigationSystemV1::AddLevelCollisionToOctree(ULevel* Level)
 {
 	if (Level)
@@ -5052,6 +5378,7 @@ void UNavigationSystemV1::AddLevelCollisionToOctree(ULevel* Level)
 	}
 }
 
+// 与 AddLevelCollisionToOctree 配对：把 Level 的 Model 几何从 Octree 中移除。
 void UNavigationSystemV1::RemoveLevelCollisionFromOctree(ULevel* Level)
 {
 	if (Level)
@@ -5060,6 +5387,8 @@ void UNavigationSystemV1::RemoveLevelCollisionFromOctree(ULevel* Level)
 	}
 }
 
+// FCoreUObjectDelegates::PostLoadMapWithWorld 回调：地图 Load 完成后做兜底。
+// 若没有可用 NavData 但 bAutoCreateNavigationData 且非 Static 模式，则创建一份默认 NavData。
 void UNavigationSystemV1::OnPostLoadMap(UWorld* LoadedWorld)
 {
 	if (LoadedWorld != GetWorld())
@@ -5085,6 +5414,8 @@ void UNavigationSystemV1::OnPostLoadMap(UWorld* LoadedWorld)
 }
 
 #if WITH_EDITOR
+// 编辑器：Actor 在视口中被拖动后回调。NavMeshBoundsVolume 走 OnNavigationBoundsUpdated；
+// 其他 Actor 在已注册全部组件后整体 Refresh 进 Octree（含挂接子 Actor）。
 void UNavigationSystemV1::OnActorMoved(AActor* Actor)
 {
 	if (Cast<ANavMeshBoundsVolume>(Actor))
@@ -5101,6 +5432,8 @@ void UNavigationSystemV1::OnActorMoved(AActor* Actor)
 }
 #endif // WITH_EDITOR
 
+// NavigationDirtyEvent 全局事件回调：把外部传入的 Bounds 当作"全脏"区域加入累积队列。
+// 触发方：游戏代码通过 UNavigationSystemV1::NavigationDirtyEvent.Broadcast 主动通知重建。
 void UNavigationSystemV1::OnNavigationDirtied(const FBox& Bounds)
 {
 	AddDirtyArea(Bounds, ENavigationDirtyFlag::All, "OnNavigationDirtied");
@@ -5119,6 +5452,12 @@ void UNavigationSystemV1::OnReloadComplete(EReloadCompleteReason Reason)
 	}
 }
 
+// World 关闭/换图时的清理；在 OnBeginTearingDown / WorldDestroy 路径调用。顺序很关键：
+//   1) 解绑所有引擎/编辑器 delegate
+//   2) 反注册并 CleanUp 每个 NavData（让其完成正在跑的异步任务后释放 Octree 引用）
+//   3) DestroyNavOctree 销毁 NavOctree 数据
+//   4) SetCrowdManager(nullptr) 释放 CrowdManager
+//   5) 清空 AgentToNavDataMap / MainNavData，必要时 Reset NavLink Unique Id
 void UNavigationSystemV1::CleanUp(FNavigationSystem::ECleanupMode Mode)
 {
 	if (bCleanUpDone)
@@ -5206,6 +5545,8 @@ void UNavigationSystemV1::CleanUp(FNavigationSystem::ECleanupMode Mode)
 	bCleanUpDone = true;
 }
 
+// 释放 NavOctree（DefaultOctreeController.Reset）。
+// 注意必须在所有 NavData CleanUp 完成后调用，避免后台瓦片任务访问已释放的 Octree。
 void UNavigationSystemV1::DestroyNavOctree()
 {
 	DefaultOctreeController.Reset();
@@ -5292,6 +5633,9 @@ bool UNavigationSystemV1::IsAllowedToRebuild() const
 	return World && (!World->IsGameWorld() || GetRuntimeGenerationType() == ERuntimeGenerationType::Dynamic);
 }
 
+// 当 bGenerateNavigationOnlyAroundNavigationInvokers 切换时回调：
+//   - 同步 NavOctree 的 DataGatheringMode（懒加载/即时）
+//   - 让所有 NavData 切到/退出 ActiveTiles 模式（仅生成 invoker 周围瓦片）
 void UNavigationSystemV1::OnGenerateNavigationOnlyAroundNavigationInvokersChanged()
 {
 	if (DefaultOctreeController.NavOctree.IsValid())
@@ -5620,6 +5964,8 @@ bool UNavigationSystemV1::DoesPathIntersectBox(const FNavigationPath* Path, cons
 	return Path != nullptr && Path->DoesIntersectBox(Box, AgentLocation, StartingIndex, nullptr, AgentExtent);
 }
 
+// 把所有 Recast NavMesh 的 MaxSimultaneousTileGenerationJobsCount 改为传入值。
+// 用于运行时动态限流（如低端机降配，或大批量加载时降低瞬时压力）。
 void UNavigationSystemV1::SetMaxSimultaneousTileGenerationJobsCount(int32 MaxNumberOfJobs)
 {
 #if WITH_RECAST
@@ -5653,6 +5999,8 @@ void UNavigationSystemV1::ResetMaxSimultaneousTileGenerationJobsCount()
 // Active tiles
 //----------------------------------------------------------------------//
 
+// 静态版：找到 Actor 所在 World 的 NavigationSystem，转调成员版 RegisterInvoker。
+// UNavigationInvokerComponent::Activate 就是走到这里。
 void UNavigationSystemV1::RegisterNavigationInvoker(AActor& Invoker, float TileGenerationRadius, float TileRemovalRadius, const FNavAgentSelector& Agents, ENavigationInvokerPriority Priority)
 {
 	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(Invoker.GetWorld());
@@ -5662,6 +6010,7 @@ void UNavigationSystemV1::RegisterNavigationInvoker(AActor& Invoker, float TileG
 	}
 }
 
+// 反注册 Actor 形式的 Invoker（静态入口，按 World 找到 NavSystem 后转发到成员 UnregisterInvoker）。
 void UNavigationSystemV1::UnregisterNavigationInvoker(AActor& Invoker)
 {
 	UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(Invoker.GetWorld());
@@ -5671,6 +6020,7 @@ void UNavigationSystemV1::UnregisterNavigationInvoker(AActor& Invoker)
 	}
 }
 
+// 切换 NavOctree 几何采集模式（即时 / 懒加载）。运行时改动会同步到当前已存在的 Octree。
 void UNavigationSystemV1::SetGeometryGatheringMode(ENavDataGatheringModeConfig NewMode)
 {
 	DataGatheringMode = NewMode;
@@ -5712,6 +6062,8 @@ namespace UE::Navigation::Private
 	}
 }
 
+// 把 Actor 记入 Invokers Map（key=UObject，value=半径/Agents/Priority）。
+// 触发条件未真正建 Tile —— 真正驱动在 UpdateInvokers + UpdateNavDataActiveTiles。
 void UNavigationSystemV1::RegisterInvoker(AActor& Invoker, float TileGenerationRadius, float TileRemovalRadius, const FNavAgentSelector& Agents, ENavigationInvokerPriority InPriority)
 {
 	UE_CVLOG(bGenerateNavigationOnlyAroundNavigationInvokers == false, this, LogNavInvokers, Warning
@@ -5732,6 +6084,8 @@ void UNavigationSystemV1::RegisterInvoker(AActor& Invoker, float TileGenerationR
 	UE::Navigation::Private::LogNavInvokerRegistration(*this, Data);
 }
 
+// Interface 形式的 Invoker 注册：和 Actor 版相比，UObject 自身不必是 Actor，
+// 通过 INavigationInvokerInterface::GetNavigationInvokerLocation 取位置（如 Component / GameMode 自定义对象）。
 void UNavigationSystemV1::RegisterInvoker(const TWeakInterfacePtr<INavigationInvokerInterface>& Invoker, float TileGenerationRadius, float TileRemovalRadius, const FNavAgentSelector& Agents, ENavigationInvokerPriority InPriority)
 {
 	UE_CVLOG(bGenerateNavigationOnlyAroundNavigationInvokers == false, this, LogNavInvokers, Warning
@@ -5753,11 +6107,13 @@ void UNavigationSystemV1::RegisterInvoker(const TWeakInterfacePtr<INavigationInv
 	}
 }
 
+// Actor 版反注册：转 UnregisterInvoker_Internal。
 void UNavigationSystemV1::UnregisterInvoker(AActor& Invoker)
 {
 	UnregisterInvoker_Internal(Invoker);
 }
 
+// Interface 版反注册：拿到 UObject* 后转 UnregisterInvoker_Internal。
 void UNavigationSystemV1::UnregisterInvoker(const TWeakInterfacePtr<INavigationInvokerInterface>& Invoker)
 {
 	if (const UObject* InvokerObject = Invoker.GetObject())
@@ -5766,6 +6122,7 @@ void UNavigationSystemV1::UnregisterInvoker(const TWeakInterfacePtr<INavigationI
 	}
 }
 
+// 真正从 Invokers Map 中移除条目。下一次 UpdateInvokers 时该位置不再贡献 Active Tiles。
 void UNavigationSystemV1::UnregisterInvoker_Internal(const UObject& Invoker)
 {
 	UE_VLOG(this, LogNavInvokers, Log, TEXT("Removing %s from invokers list"), *Invoker.GetName());
@@ -5813,6 +6170,13 @@ void UNavigationSystemV1::UnregisterFromRepositoryDelegates() const
 	Repository->OnNavigationElementRemovedDelegate = nullptr;
 }
 
+// 扫描 Invokers Map 构造 InvokerLocations 快照。
+// 过程：
+//   1) 剔除失效 Actor/Interface（弱引用已空）
+//   2) 取 Owner 位置（Actor 用 ActorLocation；Interface 用 GetNavigationInvokerLocation）
+//   3) 若配置了 InvokersMaximumDistanceFromSeed + GetInvokerSeedLocations，裁掉离 Seed 太远的 Invoker
+//   4) 按 Agent 位集展开，写入 InvokerLocations
+// 产出结果供 UpdateNavDataActiveTiles 使用。
 void UNavigationSystemV1::UpdateInvokers()
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_Navigation_UpdateInvokers);
@@ -5963,6 +6327,7 @@ void UNavigationSystemV1::DebugLogInvokers(FOutputDevice& OutputDevice) const
 }
 #endif // !UE_BUILD_SHIPPING
 
+// 把 InvokerLocations 推给每份 NavData —— ARecastNavMesh 用它算活跃 Tile 集并触发重建/丢弃。
 void UNavigationSystemV1::UpdateNavDataActiveTiles()
 {
 #if WITH_RECAST
@@ -5976,6 +6341,8 @@ void UNavigationSystemV1::UpdateNavDataActiveTiles()
 #endif
 }
 
+// 当 BuildBounds 变动时：把所有在 BuildBounds 内的 Tile 标脏，强制重建。
+// 配合 SetBuildBounds / Invoker 漂移 使用。
 void UNavigationSystemV1::DirtyTilesInBuildBounds()
 {
 #if WITH_RECAST
@@ -5987,6 +6354,7 @@ void UNavigationSystemV1::DirtyTilesInBuildBounds()
 #endif // WITH_RECAST
 }
 
+// Actor 版蓝图入口（默认 Agents/优先级），转 RegisterInvoker。
 void UNavigationSystemV1::RegisterNavigationInvoker(AActor* Invoker, float TileGenerationRadius, float TileRemovalRadius)
 {
 	if (Invoker != nullptr)
@@ -5996,6 +6364,7 @@ void UNavigationSystemV1::RegisterNavigationInvoker(AActor* Invoker, float TileG
 	}
 }
 
+// Actor 版蓝图入口反注册：转 UnregisterInvoker。
 void UNavigationSystemV1::UnregisterNavigationInvoker(AActor* Invoker)
 {
 	if (Invoker != nullptr)
@@ -6010,6 +6379,8 @@ bool UNavigationSystemV1::K2_GetRandomPointInNavigableRadius(UObject* WorldConte
 	return K2_GetRandomLocationInNavigableRadius(WorldContextObject, Origin, RandomLocation, Radius, NavData, FilterClass);
 }
 
+// 编辑器调试：确保 MainNavData 上挂着导航渲染组件，并按 bShow 控制可见性。
+// "show navigation" 控制台命令会用到。
 void UNavigationSystemV1::VerifyNavigationRenderingComponents(const bool bShow)
 {
 	// make sure nav mesh has a rendering component
@@ -6071,6 +6442,8 @@ INavigationDataInterface* UNavigationSystemV1::GetNavDataForActor(const AActor& 
 	return NavData;
 }
 
+// 收集所有匹配 NavData Agent 且 Level 命中的 NavBounds 的 AreaBox 到 OutBounds。
+// InLevel=null 时不限制 Level。返回新增的 Bounds 数量。
 int UNavigationSystemV1::GetNavigationBoundsForNavData(const ANavigationData& NavData, TArray<FBox>& OutBounds, ULevel* InLevel) const
 {
 	const int InitialBoundsCount = OutBounds.Num();
@@ -6136,6 +6509,8 @@ const FNavDataConfig& UNavigationSystemV1::GetBiggestSupportedAgent(const UWorld
 }
 
 #if WITH_EDITOR
+// World Partition 烘焙：返回所有 NavData 中"导航数据 Builder 需要的最大 Cell 重叠距离"。
+// 用于 World Partition Builder 决定数据需要在邻接 Cell 之间冗余多少范围。
 double UNavigationSystemV1::GetWorldPartitionNavigationDataBuilderOverlap(const UWorld& World) 
 {
 	const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(&World);
@@ -6180,6 +6555,9 @@ const FNavDataConfig& UNavigationSystemV1::GetDefaultSupportedAgentConfig() cons
 	return FirstValidIndex != INDEX_NONE ? SupportedAgents[FirstValidIndex] : DefaultAgent;;
 }
 
+// 运行时替换 SupportedAgents。
+// 典型使用者：ANavSystemConfigOverride.AppendConfig → NavigationSystemConfig 覆盖 Agent 列表。
+// 会 UnregisterUnusedNavData + 触发必要的重建。
 void UNavigationSystemV1::OverrideSupportedAgents(const TArray<FNavDataConfig>& NewSupportedAgents)
 {
 	UE_CLOG(bWorldInitDone, LogNavigation, Warning, TEXT("Trying to override NavigationSystem\'s SupportedAgents past the World\'s initialization"));
@@ -6207,6 +6585,8 @@ void UNavigationSystemV1::OverrideSupportedAgents(const TArray<FNavDataConfig>& 
 	ApplySupportedAgentsFilter();
 }
 
+// 用 SupportedAgentsMask 过滤 SupportedAgents：被 mask 排除掉的 Agent 调用 Invalidate 清空 NavDataClass。
+// 不会真正删除条目，仅让其后续匹配/创建时被 GetSupportedAgentIndex 跳过。
 void UNavigationSystemV1::ApplySupportedAgentsFilter()
 {
 	// reset the SupportedAgents 
@@ -6229,6 +6609,8 @@ void UNavigationSystemV1::ApplySupportedAgentsFilter()
 	}
 }
 
+// 把 SupportedAgentsMask 中已被禁用的 Agent 对应的 NavData 反注册掉。
+// 通常紧跟 SetSupportedAgentsMask 调用，保证不留下"无人使用"的 NavData。
 void UNavigationSystemV1::UnregisterUnusedNavData()
 {
 	for (int32 AgentIndex = 0; AgentIndex < SupportedAgents.Num(); AgentIndex++)
@@ -6245,12 +6627,16 @@ void UNavigationSystemV1::UnregisterUnusedNavData()
 	}
 }
 
+// 设置 Agent 选择掩码并立即 ApplySupportedAgentsFilter。
+// 由 NavigationSystemConfig::Configure / NavSystemConfigOverride 调用。
 void UNavigationSystemV1::SetSupportedAgentsMask(const FNavAgentSelector& InSupportedAgentsMask)
 {
 	SupportedAgentsMask = InSupportedAgentsMask;
 	ApplySupportedAgentsFilter();
 }
 
+// 把 UNavigationSystemConfig 的 DefaultAgentName + SupportedAgentsMask 应用到本实例。
+// DefaultAgentName 为空时挑第一个 valid Agent 作为缺省。World 初始化阶段调用。
 void UNavigationSystemV1::Configure(const UNavigationSystemConfig& Config)
 {
 	if (Config.DefaultAgentName != NAME_None)
@@ -6279,6 +6665,8 @@ void UNavigationSystemV1::Configure(const UNavigationSystemConfig& Config)
 	}
 }
 
+// 与 Configure 不同：仅"追加"NewConfig 中尚未启用的 Agent 位（不会移除已启用的）。
+// ANavSystemConfigOverride 用此来在子关卡里增加额外 Agent 支持。
 void UNavigationSystemV1::AppendConfig(const UNavigationSystemConfig& NewConfig)
 {
 	if (NewConfig.SupportedAgentsMask.IsSame(SupportedAgentsMask) == false)
@@ -6340,6 +6728,9 @@ void UNavigationSystemModuleConfig::UpdateWithNavSysCDO(const UNavigationSystemV
 	}
 }
 
+// 模块 Config 的主入口：World 创建时调用此函数构造 UNavigationSystemV1 实例。
+// - 若 bStrictlyStatic=true：走 ConfigureAsStatic 关掉运行时重建逻辑
+// - 按 SupportedAgents / bCreateOnClient / bAutoSpawnMissingNavData / bSpawnNavDataInNavBoundsLevel 配置新实例
 UNavigationSystemBase* UNavigationSystemModuleConfig::CreateAndConfigureNavigationSystem(UWorld& World) const
 {
 	// This should be handled by ShouldCreateNavigationSystemInstance

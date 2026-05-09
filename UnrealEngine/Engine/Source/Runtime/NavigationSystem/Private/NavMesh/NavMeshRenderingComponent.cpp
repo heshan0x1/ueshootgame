@@ -4,6 +4,32 @@
 	NavMeshRenderingComponent.cpp: A component that renders a navmesh.
  =============================================================================*/
 
+// =====================================================================================
+// NavMeshRenderingComponent.cpp —— 中文总览
+// ---------------------------------------------------------------------------
+// 本文件负责把 ARecastNavMesh 的数据翻译成屏幕上可见的调试几何，主要包括：
+//  1) 大量 Helper（FNavMeshRenderingHelpers 命名空间内）：画盒、画圆柱、三维弧线、
+//     箭头、计算 Cluster 颜色、视锥剔除等。
+//  2) FNavMeshSceneProxyData —— 线程无关的数据容器：
+//     - Serialize：支持 GameplayDebugger 网络传输
+//     - GatherData：核心入口，利用 ARecastNavMesh::BeginBatchQuery+GetDebugGeometry
+//       收集 FRecastDebugGeometry 中的面/顶点，再按 ENavMeshDetailFlags 配置把
+//       它们转成 MeshBuilders / 线条 / Box / 文本。
+//  3) FNavMeshSceneProxy —— 进入渲染线程的代理；构造时把 ProxyData 写入 VB/IB，
+//     GetDynamicMeshElements 每帧提交 MeshBatch 供 GPU 绘制。
+//  4) UNavMeshRenderingComponent —— 挂在 ARecastNavMesh Actor 上的组件生命周期管理；
+//     OnRegister/OnUnregister 和 DrawDelegate 的挂钩；TimerFunction 节流刷新。
+//
+// 关键流程（对应架构文档 4.3 节末端"渲染"部分）：
+//   NavMesh 变脏 → MarkRenderStateDirty → CreateDebugSceneProxy
+//     → GatherData（遍历所有关心的 Tile 调 Recast 查询接口）
+//     → new FNavMeshSceneProxy（游戏线程拷贝入 VB/IB）
+//     → RenderThread GetDynamicMeshElements 组织 MeshBatch
+//
+// 渲染线程安全：ProxyData 在游戏线程构造后成为 Proxy 私有成员，不再被修改；
+// Proxy 不会回读 UObject（除了少量 bDebug* 快照）。
+// =====================================================================================
+
 #include "NavMesh/NavMeshRenderingComponent.h"
 #include "Materials/Material.h"
 #include "NavigationSystem.h"
@@ -31,26 +57,35 @@
 #include "EditorViewportClient.h"
 #endif
 
-static constexpr FColor NavMeshRenderColor_Recast_TriangleEdges(255, 255, 255);
-static constexpr FColor NavMeshRenderColor_Recast_TileEdges(16, 16, 16, 32);
-static constexpr FColor NavMeshRenderColor_RecastMesh(140, 255, 0, 164);
-static constexpr FColor NavMeshRenderColor_TileBounds(255, 255, 64, 255);
-static constexpr FColor NavMeshRenderColor_PathCollidingGeom(255, 255, 255, 40);
-static constexpr FColor NavMeshRenderColor_RecastTileBeingRebuilt(255, 0, 0, 64);
-static constexpr FColor NavMeshRenderColor_OffMeshConnectionInvalid(64, 64, 64);
-static const FColor NavMeshRenderColor_PolyForbidden(FColorList::Black);
+// ===== Debug 绘制调色板 =====
+// 以下常量与 ARecastNavMesh 的可视化风格绑定，可在此统一调整
+static constexpr FColor NavMeshRenderColor_Recast_TriangleEdges(255, 255, 255); // DetailMesh 三角形边（白）
+static constexpr FColor NavMeshRenderColor_Recast_TileEdges(16, 16, 16, 32);    // Tile 之间接缝（深灰，半透明）
+static constexpr FColor NavMeshRenderColor_RecastMesh(140, 255, 0, 164);        // 可走区域默认填充色（嫩绿）
+static constexpr FColor NavMeshRenderColor_TileBounds(255, 255, 64, 255);       // Tile AABB 线框（黄）
+static constexpr FColor NavMeshRenderColor_PathCollidingGeom(255, 255, 255, 40);// 参与体素化的原始几何（半透白）
+static constexpr FColor NavMeshRenderColor_RecastTileBeingRebuilt(255, 0, 0, 64);// 正在重建的 Tile（红）
+static constexpr FColor NavMeshRenderColor_OffMeshConnectionInvalid(64, 64, 64); // 生成失败的 NavLink（灰）
+static const FColor NavMeshRenderColor_PolyForbidden(FColorList::Black);        // 标记禁行的多边形
 
-static constexpr float DefaultEdges_LineThickness = 0.0f;
-static constexpr float TileResolution_LineThickness = 5.f;
-static constexpr float PolyEdges_LineThickness = 1.1f;
-static constexpr float NavMeshEdges_LineThickness = 4.f;
-static constexpr float LinkLines_LineThickness = 2.0f;
-static constexpr float GeneratedLinkLines_LineThickness = 4.0f;
+// ===== Debug 线宽预设 =====
+static constexpr float DefaultEdges_LineThickness = 0.0f;  // 普通边线宽（0=GPU 最小一像素）
+static constexpr float TileResolution_LineThickness = 5.f; // TileResolution 高亮用粗线
+static constexpr float PolyEdges_LineThickness = 1.1f;     // 多边形边
+static constexpr float NavMeshEdges_LineThickness = 4.f;   // NavMesh 外边界
+static constexpr float LinkLines_LineThickness = 2.0f;     // OffMesh 连接普通线
+static constexpr float GeneratedLinkLines_LineThickness = 4.0f; // 自动生成的 Link 更粗
 static constexpr float ClusterLinkLines_LineThickness = 2.0f;
-static constexpr float LinkLines_UnidirectionalArcVerticalSeparationDistance = 3.0f;
+static constexpr float LinkLines_UnidirectionalArcVerticalSeparationDistance = 3.0f; // 单向弧与反向弧的垂直间距
 
+// -------------------------------------------------------------------------------------
+// FNavMeshRenderingHelpers 命名空间：全是无状态的画图/视锥/颜色工具函数
+// 大部分被 GatherData / GetDynamicMeshElements 反复调用。
+// 放在同一文件便于内联，不单独导出。
+// -------------------------------------------------------------------------------------
 namespace FNavMeshRenderingHelpers
 {
+	// 用 12 条线画一个 OBB/AABB 的线框（Dedicated Server 下跳过）
 	void DrawDebugBox(FPrimitiveDrawInterface* PDI, FVector const& Center, FVector const& Box, FColor const& Color)
 	{
 		// no debug line drawing on dedicated server
@@ -73,6 +108,8 @@ namespace FNavMeshRenderingHelpers
 		}
 	}
 
+	// 判断线段是否在视锥内：任一端点太远 → 剔除；两端都落在某一平面外侧 → 剔除
+	// 用于大量 NavLink / 边线的一次性剔除
 	bool LineInView(const FVector& Start, const FVector& End, const FSceneView* View)
 	{
 		if (FVector::DistSquaredXY(Start, View->ViewMatrices.GetViewOrigin()) > ARecastNavMesh::GetDrawDistanceSq() ||
@@ -93,6 +130,7 @@ namespace FNavMeshRenderingHelpers
 		return true;
 	}
 
+	// 点的视锥剔除（用于路径点、DebugLabels 等）
 	bool PointInView(const FVector& Position, const FSceneView* View)
 	{
 		if (FVector::DistSquaredXY(Position, View->ViewMatrices.GetViewOrigin()) > ARecastNavMesh::GetDrawDistanceSq())
@@ -112,6 +150,8 @@ namespace FNavMeshRenderingHelpers
 		return true;
 	}
 
+	// 距离判定：相机到线段两端都在距离阈值内才参与后续绘制
+	// CorrectDistance<=0 时退化为 ARecastNavMesh::GetDrawDistanceSq()
 	bool LineInCorrectDistance(const FVector& Start, const FVector& End, const FSceneView* View, FVector::FReal CorrectDistance = -1.)
 	{
 		const FVector::FReal MaxDistanceSq = (CorrectDistance > 0.) ? FMath::Square(CorrectDistance) : ARecastNavMesh::GetDrawDistanceSq();
@@ -119,6 +159,8 @@ namespace FNavMeshRenderingHelpers
 				FVector::DistSquaredXY(End, View->ViewMatrices.GetViewOrigin()) < MaxDistanceSq;
 	}
 
+	// 参数曲线：抛物线采样点（u∈[0,1]），用于 NavLink 弧线
+	//   高度公式 h*(1 - (2u-1)^2)：在中段最高、两端=0
 	FVector EvalArc(const FVector& Org, const FVector& Dir, const FVector::FReal h, const FVector::FReal u)
 	{
 		FVector Pt = Org + Dir * u;
@@ -127,6 +169,8 @@ namespace FNavMeshRenderingHelpers
 		return Pt;
 	}
 
+	// 把一条弧（从 Start 到 End，抛物线高度比例 Height）离散成 Segments 段线段
+	// 双向链接会在调用端加 VerticalOffset 把上下方向的弧分开
 	void CacheArc(TArray<FDebugRenderSceneProxy::FDebugLine>& DebugLines, const FVector& Start, const FVector& End, const FVector::FReal Height, const uint32 Segments, const FLinearColor& Color, float LineThickness = 0, float VerticalOffset = 0)
 	{
 		if (Segments == 0)
@@ -151,6 +195,7 @@ namespace FNavMeshRenderingHelpers
 		}
 	}
 
+	// 在 Tip 点画一个朝向 Tip→Origin 的箭头（两条分叉线）
 	void CacheArrowHead(TArray<FDebugRenderSceneProxy::FDebugLine>& DebugLines, const FVector& Tip, const FVector& Origin, const FVector::FReal Size, const FLinearColor& Color, float LineThickness = 0)
 	{
 		const FVector Az(0.0, 1.0, 0.0);
@@ -161,6 +206,8 @@ namespace FNavMeshRenderingHelpers
 		DebugLines.Add(FDebugRenderSceneProxy::FDebugLine(Tip, FVector(Tip.X + Ay.X*Size - Ax.X*Size / 3, Tip.Y + Ay.Y*Size - Ax.Y*Size / 3, Tip.Z + Ay.Z*Size - Ax.Z*Size / 3), Color.ToFColor(true), LineThickness));
 	}
 
+	// 绘制一条 OffMesh 链接（跳跃/梯子）的可视化弧：弧 + 箭头
+	// LinkDirection=双向 时在端点 V0 也画一个反向箭头；生成的 link 会更粗更显眼
 	void CacheLink(TArray<FDebugRenderSceneProxy::FDebugLine>& DebugLines, const FVector V0, const FVector V1, const FColor LinkColor, const uint8 LinkDirection, const bool bIsGenerated)
 	{
 		const float LineThickness = bIsGenerated ? GeneratedLinkLines_LineThickness : LinkLines_LineThickness;
@@ -176,6 +223,7 @@ namespace FNavMeshRenderingHelpers
 		}
 	}
 
+	// 用线段构造一个带高度的圆柱（用于 Invoker 半径、Query 范围等可视化）
 	void DrawWireCylinder(TArray<FDebugRenderSceneProxy::FDebugLine>& DebugLines, const FVector& Base, const FVector& X, const FVector& Y, const FVector& Z, FColor Color, FVector::FReal Radius, FVector::FReal HalfHeight, int32 NumSides, uint8 DepthPriority, float LineThickness = 0)
 	{
 		const FVector::FReal AngleDelta = 2.0 * PI / static_cast<FVector::FReal>(NumSides);
@@ -199,6 +247,8 @@ namespace FNavMeshRenderingHelpers
 		return static_cast<uint8>((v & (1 << bit)) >> bit);
 	}
 
+	// 按 Cluster 索引位交叉得到一个稳定且彼此差异明显的伪随机颜色
+	// 用于区分层级寻路中的 Cluster 颜色（alpha=164）
 	FColor GetClusterColor(int32 Idx)
 	{
 		const uint8 r = 1 + GetBit(Idx, 1) + GetBit(Idx, 3) * 2;
@@ -207,12 +257,14 @@ namespace FNavMeshRenderingHelpers
 		return FColor(r * 63, g * 63, b * 63, 164);
 	}
 
+	// 颜色变暗到 50%（用于 Cluster Link 的端点色）
 	FColor DarkenColor(const FColor& Base)
 	{
 		const uint32 Col = Base.DWColor();
 		return FColor(((Col >> 1) & 0x007f7f7f) | (Col & 0xff000000));
 	}
 
+	// 颜色变暗到 75%（DarkenColor 太深，这里折中）
 	FColor SemiDarkenColor(const FColor& Base)
 	{
 		const uint32 Col = Base.DWColor();
@@ -223,6 +275,8 @@ namespace FNavMeshRenderingHelpers
 		return FColor(ThreeQuarterCol | (Col & 0xff000000));
 	}
 
+	// 往 FDebugMeshData 追加一个顶点：默认法线朝上、UV=0、切线(1,0,0)
+	// 颜色直接编码 ClusterColor，后续由 DebugMeshMaterial 按顶点色上色
 	void AddVertex(FNavMeshSceneProxyData::FDebugMeshData& MeshData, const FVector& Pos, const FColor Color)
 	{
 		FDynamicMeshVertex* Vertex = new(MeshData.Vertices) FDynamicMeshVertex;
@@ -242,6 +296,8 @@ namespace FNavMeshRenderingHelpers
 		MeshData.Indices.Add(V2);
 	}
 
+	// 把一个 Cluster（Recast Debug 的 triangle soup）整体加进 MeshBuilders
+	// MeshIndices/MeshVerts 由 Recast 端已经三角化好；这里只做坐标偏移和颜色染色
 	void AddCluster(TArray<FNavMeshSceneProxyData::FDebugMeshData>& MeshBuilders, const TArray<int32>& MeshIndices, const TArray<FVector>& MeshVerts, const FColor Color, const FVector DrawOffset)
 	{
 		if (MeshIndices.Num() == 0)
@@ -263,6 +319,8 @@ namespace FNavMeshRenderingHelpers
 		MeshBuilders.Add(DebugMeshData);
 	}
 
+	// 把 Recast 空间里的原始几何（PathCollidingGeometry）变换到 Unreal 空间
+	// 注意 Recast 坐标系 (-x,z,-y) 与 Unreal 不同，需要 Recast2UnrealPoint 转换
 	void AddRecastGeometry(TArray<FVector>& OutVertexBuffer, TArray<uint32>& OutIndexBuffer, const FVector::FReal* Coords, int32 NumVerts, const int32* Faces, int32 NumFaces, const FTransform& Transform = FTransform::Identity)
 	{
 		const int32 VertIndexBase = OutVertexBuffer.Num();
@@ -280,12 +338,15 @@ namespace FNavMeshRenderingHelpers
 		}
 	}
 
+	// 查询 bit 标志：是否绘制 TestFlag 类别
 	inline bool HasFlag(int32 Flags, ENavMeshDetailFlags TestFlag)
 	{
 		return (Flags & (1 << static_cast<int32>(TestFlag))) != 0;
 	}
 
 #if WITH_RECAST
+	// 把 ARecastNavMesh 上各种 bDraw* 开关编码成一张位图（ENavMeshDetailFlags 顺序）
+	// 它是 FNavMeshSceneProxyData::GatherData 的主要"开关"输入
 	int32 GetDetailFlags(const ARecastNavMesh* NavMesh)
 	{
 		return (NavMesh == nullptr) ? 0 : 0 |
@@ -317,7 +378,10 @@ namespace FNavMeshRenderingHelpers
 
 //////////////////////////////////////////////////////////////////////////
 // FNavMeshSceneProxyData
+// 数据容器实现：Reset / Serialize / GetAllocatedSize / GatherData
+//////////////////////////////////////////////////////////////////////////
 
+// 清空所有几何缓冲，准备下一次 GatherData；bNeedsNewData 置位表示需要重建 Proxy
 void FNavMeshSceneProxyData::Reset()
 {
 	MeshBuilders.Reset();
@@ -338,6 +402,8 @@ void FNavMeshSceneProxyData::Reset()
 	NavDetailFlags = 0;
 }
 
+// 为 GameplayDebugger 序列化：把所有几何/文字数据打包成字节流，网络同步到客户端
+// 不包含 UObject 引用，可跨进程安全传输
 void FNavMeshSceneProxyData::Serialize(FArchive& Ar)
 {
 	int32 NumMeshBuilders = MeshBuilders.Num();
@@ -498,10 +564,20 @@ uint32 FNavMeshSceneProxyData::GetAllocatedSize() const
 #if WITH_RECAST
 
 // Deprecated
+// 旧签名（int32 TileSet），5.5 起请使用 FNavTileRef 版本
 void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InNavDetailFlags, const TArray<int32>& TileSet)
 {
 }
 
+// 主入口：从 ARecastNavMesh 采集全部可视化数据
+// 典型调用栈：UNavMeshRenderingComponent::CreateDebugSceneProxy
+//   → GatherData(NavMesh, FNavMeshRenderingHelpers::GetDetailFlags(NavMesh), TileSet)
+// 内部处理：
+//   1) Reset + 读取基本偏移
+//   2) 借 FRecastDebugGeometry 让 NavMesh 自行把所有需要的"面/边/Link"摆进来
+//   3) 可选收集：BuildTime 热力图、InternalDebugData（Heightfield/Contour/PolyMesh）
+//   4) 组装 MeshBuilders / 线数组 / DebugLabels
+// 本函数为游戏线程调用，允许访问 UObject
 void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InNavDetailFlags, const TArray<FNavTileRef>& TileSet)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_NavMesh_GatherDebugDrawingGeometry);
@@ -587,6 +663,8 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 
 		{
 			// On screen information
+			// 在屏幕左上角显示 NavMesh 基本信息：生成模式、Cell 参数、Region/Layer 分区策略等
+			// 这些 DebugLabel 会在 DrawDebugLabels 中以 Canvas 文本绘制
 			QUICK_SCOPE_CYCLE_COUNTER(STAT_NavMesh_GatherDebugDrawing_2DLabels);
 
 			auto GetPartitioningString = [](const ERecastPartitioning::Type Type) -> FString
@@ -673,6 +751,8 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 #endif // RECAST_INTERNAL_DEBUG_DATA		
 		}
 		
+		// 准备 Area 颜色表：RECAST_MAX_AREAS 项，每项对应一个 Area 索引
+		// RECAST_DEFAULT_AREA=0 的颜色取 NavConfig.Color；若未设置则用默认嫩绿
 		const FNavDataConfig& NavConfig = NavMesh->GetConfig();
 		TArray<FColor> NavMeshColors;
 		NavMeshColors.AddDefaulted(RECAST_MAX_AREAS);
@@ -690,6 +770,10 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 			NavMeshDrawOffset.Z += NavMesh->GetConfig().AgentRadius / 10.f;
 		}
 
+		// BeginBatchQuery/FinishBatchQuery 成对出现：让 ARecastNavMesh 在遍历
+		// 期间持有 RWLock 的读锁，避免 Recast Tile 被同时清掉
+		// GetDebugGeometryForTile 会把指定 Tile 的所有几何（顶点/多边形/边/Link等）
+		// 填充进 FRecastDebugGeometry。TileSet 为空时传 FNavTileRef() 代表全部
 		NavMesh->BeginBatchQuery();
 		if (TileSet.Num() > 0)
 		{
@@ -707,6 +791,7 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		const TArray<FVector>& MeshVerts = NavMeshGeometry.MeshVerts;
 
 		// @fixme, this is going to double up on lots of interior lines
+		// TriangleEdges：DetailMesh 每个三角形都画三条边（会重复，FIXME）
 		const bool bGatherTriEdges = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::TriangleEdges);
 		if (bGatherTriEdges)
 		{
@@ -725,6 +810,7 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		}
 
 		// make lines for tile edges
+		// PolyEdges：多边形边（由 Recast PolyMesh 合并后的内部边）
 		const bool bGatherPolyEdges = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::PolyEdges);
 		if (bGatherPolyEdges)
 		{
@@ -738,6 +824,7 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		}
 
 		// make lines for navmesh edges
+		// BoundaryEdges：NavMesh 外边界（与 NullArea / 墙体相邻的边）
 		const bool bGatherBoundaryEdges = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::BoundaryEdges);
 		if (bGatherBoundaryEdges)
 		{
@@ -752,6 +839,8 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		}
 
 		// offset all navigation-link positions
+		// OffMesh 连接（跳跃/梯子/门）画成抛物线+箭头
+		// 当 Cluster 调试开启时交给 Cluster 分支处理；失败的链接若启用 bGatherFailedNavLinks 也一并画
 		const bool bGatherNavLinks = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::NavLinks);
 		const bool bGatherFailedNavLinks = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::FailedNavLinks);
 
@@ -816,6 +905,9 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		const bool bGatherPolygonFlags = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::PolygonFlags);
 		const bool bGatherPolyAreaIDs = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::PolygonAreaIDs);
 
+		// 以下一大段循环：对 TileSet 中每个 Tile 聚合文本/边框/分辨率色/多边形标签
+		// 每个 Tile 只生成一个文字标签位置（投影到其 AABB 内的 NavMesh 表面）
+		// 生成的标签会在 DrawDebugLabels 阶段 Project 到屏幕
 		if (bGatherTileLabels || bGatherTileBounds || bGatherTileResolutions || bGatherPolygonLabels || bGatherPolygonCost || bGatherPolygonFlags || bGatherPolyAreaIDs || bGatherTileBuildTimes)
 		{
 			QUICK_SCOPE_CYCLE_COUNTER(STAT_NavMesh_GatherDebugDrawing_TileIterations);
@@ -1065,6 +1157,9 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		NavMesh->FinishBatchQuery();
 
 		// Draw Mesh
+		// FilledPolys：把可走多边形按 Area 分组着色填充
+		// 启用 Clusters 时按簇上色（每个簇一个随机色）；否则按 AreaID 上色
+		// ForbiddenIndices 用黑色标记"禁行但仍存在"的多边形
 		const bool bGatherFilledPolys = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::FilledPolys);
 		if (bGatherFilledPolys)
 		{
@@ -1118,6 +1213,11 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 		}
 #endif // RECAST_INTERNAL_DEBUG_DATA
 
+		// NavOctree 调试：遍历整个 FNavigationOctree 的节点 / 元素
+		// - bGatherOctree：画每个 Node 的包围盒
+		// - bGatherOctreeDetails：额外在每个 Element Bounds 上贴 "N elements" 文本
+		// - bGatherPathCollidingGeometry：把参与构建的原始碰撞三角形（NavCollision/Recast 几何缓存）
+		//   转换到 Unreal 空间并合入 MeshBuilders；会自动应用 InstanceTransforms（ISM 实例化）
 		const bool bGatherOctree = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::NavOctree);
 		const bool bGatherOctreeDetails = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::NavOctreeDetails);
 		const bool bGatherPathCollidingGeometry = FNavMeshRenderingHelpers::HasFlag(NavDetailFlags, ENavMeshDetailFlags::PathCollidingGeometry);
@@ -1203,6 +1303,8 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 			}
 		}
 
+		// BuiltMeshIndices：高亮"当前正在生成"的 Tile，红色半透明
+		// 由 FRecastTileGenerator 生成过程中临时写入，用于视觉化观察 Tile Build 的进度
 		if (NavMeshGeometry.BuiltMeshIndices.Num() > 0)
 		{
 			QUICK_SCOPE_CYCLE_COUNTER(STAT_NavMesh_GatherDebugDrawing_BuiltMeshIndices);
@@ -1307,6 +1409,7 @@ void FNavMeshSceneProxyData::GatherData(const ARecastNavMesh* NavMesh, int32 InN
 
 namespace FNavMeshRenderingHelpers
 {
+	// 辅助用：把一批三角形按颜色分组统计，AddMeshForInternalData 内部用
 	struct FUniqueColor
 	{
 		FUniqueColor() : Color(0), Count(0) {}
@@ -1325,6 +1428,9 @@ namespace FNavMeshRenderingHelpers
 	}
 }
 
+// 把 FRecastTileGenerator 在生成中间保留下的"SolidHeightfield / CompactHeightfield /
+// ContourSet / PolyMesh" 等中间产物可视化进 MeshBuilders / AuxLines / AuxPoints / DebugLabels
+// 按颜色分组合并三角形以避免 MeshBatch 里混色（DebugMeshMaterial 不支持顶点色）
 void FNavMeshSceneProxyData::AddMeshForInternalData(const FRecastInternalDebugData& InInternalData)
 {
 	if (InInternalData.TriangleIndices.Num() > 0)
@@ -1422,6 +1528,8 @@ void FNavMeshSceneProxyData::AddMeshForInternalData(const FRecastInternalDebugDa
 
 //////////////////////////////////////////////////////////////////////////
 // FNavMeshSceneProxy
+// 渲染线程代理实现：构造时把 ProxyData 烘进 GPU 缓冲；析构时释放 RHI 资源
+//////////////////////////////////////////////////////////////////////////
 
 SIZE_T FNavMeshSceneProxy::GetTypeHash() const
 {
@@ -1429,6 +1537,10 @@ SIZE_T FNavMeshSceneProxy::GetTypeHash() const
 	return reinterpret_cast<size_t>(&UniquePointer);
 }
 
+// 构造函数（游戏线程）：
+//  1) 拷贝 ProxyData，继承 AuxBoxes 给父类 FDebugRenderSceneProxy 使用
+//  2) 为每个 MeshBuilder 合并顶点到一个大 VB/IB，分配一个 FColoredMaterialRenderProxy
+//  3) BeginInitResource 把 VB/IB 推给 RHI 线程初始化
 FNavMeshSceneProxy::FNavMeshSceneProxy(const UPrimitiveComponent* InComponent, FNavMeshSceneProxyData* InProxyData, bool ForceToRender)
 	: FDebugRenderSceneProxy(InComponent)
 	, VertexFactory(GetScene().GetFeatureLevel(), "FNavMeshSceneProxy")
@@ -1500,6 +1612,7 @@ FNavMeshSceneProxy::FNavMeshSceneProxy(const UPrimitiveComponent* InComponent, F
 	}
 }
 
+// 析构（渲染线程）：按 UE 规范释放 VB/IB/VertexFactory
 FNavMeshSceneProxy::~FNavMeshSceneProxy()
 {
 	VertexBuffers.PositionVertexBuffer.ReleaseResource();
@@ -1509,6 +1622,14 @@ FNavMeshSceneProxy::~FNavMeshSceneProxy()
 	VertexFactory.ReleaseResource();
 }
 
+// 每帧渲染线程调用：向 Collector 提交本 Proxy 的所有几何
+// 结构：
+//  1) 先画 Octree 包围盒（OctreeBounds）
+//  2) 对每个 MeshBuilder 构造 FMeshBatch（三角形填充，禁用 view mode overrides）
+//  3) 依次画线：NavMeshEdgeLines / ClusterLinkLines / TileEdgeLines / NavLinkLines
+//     / AuxLines / ThickLineItems（其中远距离的线会自动降级到 Foreground 细线）
+//  4) 画点 AuxPoints
+// 对每条线都做视锥 + 距离剔除（LineInView / LineInCorrectDistance）
 void FNavMeshSceneProxy::GetDynamicMeshElements(const TArray<const FSceneView*>& Views, const FSceneViewFamily& ViewFamily, uint32 VisibilityMap, FMeshElementCollector& Collector) const
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastRenderingSceneProxy_GetDynamicMeshElements);
@@ -1682,6 +1803,9 @@ void FNavMeshSceneProxy::GetDynamicMeshElements(const TArray<const FSceneView*>&
 }
 
 #if WITH_RECAST && UE_ENABLE_DEBUG_DRAWING
+// 把 DebugLabels 投影到 Canvas 上：
+//   - 若 Location == InvalidLocation，则视为"左上角堆叠文字"（一般是概要信息）
+//   - 否则 Project 到屏幕坐标再绘制
 void FNavMeshDebugDrawDelegateHelper::DrawDebugLabels(UCanvas* Canvas, APlayerController*)
 {
 	if (!Canvas)
@@ -1732,6 +1856,7 @@ void FNavMeshDebugDrawDelegateHelper::DrawDebugLabels(UCanvas* Canvas, APlayerCo
 }
 #endif
 
+// 只在 Navigation ShowFlag 开 / bForceRendering 时参与绘制通道
 FPrimitiveViewRelevance FNavMeshSceneProxy::GetViewRelevance(const FSceneView* View) const
 {
 	const bool bVisible = !!View->Family->EngineShowFlags.Navigation || bForceRendering;
@@ -1758,10 +1883,14 @@ uint32 FNavMeshSceneProxy::GetAllocatedSizeInternal() const
 
 //////////////////////////////////////////////////////////////////////////
 // NavMeshRenderingComponent
+// 生命周期与 Timer 刷新机制
+//////////////////////////////////////////////////////////////////////////
 
 #if WITH_EDITOR
 namespace
 {
+	// 判断当前 World 是否至少有一个激活视口（Game/编辑器窗口）
+	// 没有视口时 ShowFlag 对用户不可见，省掉刷新
 	bool AreAnyViewportsRelevant(const UWorld* World)
 	{
 		FWorldContext* WorldContext = GEngine->GetWorldContextFromWorld(World);
@@ -1783,6 +1912,7 @@ namespace
 }
 #endif
 
+// 构造：EditorOnly、无碰撞、不可选；默认不收集数据
 UNavMeshRenderingComponent::UNavMeshRenderingComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -1793,6 +1923,9 @@ UNavMeshRenderingComponent::UNavMeshRenderingComponent(const FObjectInitializer&
 	bForceUpdate = false;
 }
 
+// 判断 Navigation ShowFlag 是否至少在一个视口打开
+// - 游戏模式：看 GameViewport
+// - 编辑器：遍历所有编辑器视口（因为不能从 World 精确区分 PIE/SIE）
 bool UNavMeshRenderingComponent::IsNavigationShowFlagSet(const UWorld* World)
 {
 	bool bShowNavigation = false;
@@ -1825,6 +1958,8 @@ bool UNavMeshRenderingComponent::IsNavigationShowFlagSet(const UWorld* World)
 	return bShowNavigation;
 }
 
+// 每秒 1 次的 Timer 回调：轮询 ShowFlag（UE 没提供 ShowFlag 变更事件）
+// 当 ShowFlag 从关→开且 bCollectNavigationData 尚未跟上时 → MarkRenderStateDirty
 void UNavMeshRenderingComponent::TimerFunction()
 {
 	const UWorld* World = GetWorld();
@@ -1846,6 +1981,7 @@ void UNavMeshRenderingComponent::TimerFunction()
 	}
 }
 
+// 注册：启动轮询 Timer（编辑器用 GEditor 的 TimerManager，运行时用 World 的）
 void UNavMeshRenderingComponent::OnRegister()
 {
 	Super::OnRegister();
@@ -1865,6 +2001,7 @@ void UNavMeshRenderingComponent::OnRegister()
 #endif //WITH_RECAST && UE_ENABLE_DEBUG_DRAWING
 }
 
+// 反注册：清理 Timer
 void UNavMeshRenderingComponent::OnUnregister()
 {
 #if WITH_RECAST && UE_ENABLE_DEBUG_DRAWING
@@ -1883,6 +2020,8 @@ void UNavMeshRenderingComponent::OnUnregister()
 	Super::OnUnregister();
 }
 
+// 默认 GatherData 实现：取 NavMesh 上所有 bDraw* → DetailFlags → 收集全部 Tile
+// 子类可重写以追加自定义调试元素（例如 AIModule 在此追加额外可视化）
 void UNavMeshRenderingComponent::GatherData(const ARecastNavMesh& NavMesh, FNavMeshSceneProxyData& OutProxyData) const
 {
 #if WITH_RECAST
@@ -1893,6 +2032,8 @@ void UNavMeshRenderingComponent::GatherData(const ARecastNavMesh& NavMesh, FNavM
 }
 
 #if UE_ENABLE_DEBUG_DRAWING
+// 主入口：游戏线程构造 SceneProxy
+// 只在 Navigation ShowFlag 打开、组件可见、Owner NavMesh 开启绘制时才实际构造
 FDebugRenderSceneProxy* UNavMeshRenderingComponent::CreateDebugSceneProxy()
 {
 #if WITH_RECAST
@@ -1926,6 +2067,8 @@ FDebugRenderSceneProxy* UNavMeshRenderingComponent::CreateDebugSceneProxy()
 }
 #endif
 
+// 包围盒 = NavMesh 总 Bounds；若启用 Octree 绘制还要并入 Octree 根节点 Bounds
+// 用于视锥裁剪，避免 SceneProxy 被意外剔除
 FBoxSphereBounds UNavMeshRenderingComponent::CalcBounds(const FTransform& LocalToWorld) const
 {
 	FBox BoundingBox(ForceInit);

@@ -1,5 +1,61 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// ReplicationReader.cpp —— 接收端核心实现（每连接一份）
+// -----------------------------------------------------------------------------
+// 本文件是 Iris 接收侧最复杂的实现之一，约 3400 行。整体职责见 ReplicationReader.h
+// 的文件头注释。本 .cpp 关注实现细节，按主流程划分如下：
+//
+// 1. Read（主入口）
+//    a) ReadStreamDebugFeatures        读取调试 feature 位图（BatchSize/Sentinels）
+//    b) ReadObjectsPendingDestroy      解析需销毁对象列表（按 cvar 选择 Root-only 或含 SubObject）
+//    c) ReadObjects                    解析对象 batch（核心）
+//
+// 2. ReadObjectBatch（per-batch）
+//    • ReadNetRefHandleId 取远端 handle；通过 ObjectReferenceCache 翻译到本地 InternalIndex；
+//    • 若是首次出现 → 调用 Bridge::CreateNetRefHandleFromRemote → UNetObjectFactory::
+//      InstantiateReplicatedObjectFromHeader → 在本地实例化 UObject；
+//    • 收集 batch 携带的"must-be-mapped 引用"，若全部本地存在 → 走 ReadObjectsInBatch；
+//      否则 UpdateUnresolvedMustBeMappedReferences 把整段 bytes 暂存到 PendingBatchData；
+//    • ReadObjectsInBatchWith[out]Sizes 处理对象+SubObject 串行解码。
+//
+// 3. 状态/附件解码
+//    • 普通对象：DeserializeObjectStateDelta（含基线匹配）→ 收集引用到 Collector → 量化 buffer；
+//    • Attachment：通过 NetBlobHandlerManager::Read*Blob 反序列化 + 入队到 dispatch；
+//    • HugeObject：分片走 NetBlobAssembler，齐了再 ProcessHugeObject 进入"内嵌 batch"路径。
+//
+// 4. DispatchStateData（帧末统一派发）
+//    • 对每个对象：BuildUnresolvedChangeMaskAndUpdateObjectReferenceTracking 生成
+//      unresolvedMask / newlyResolved 列表；
+//    • DequantizeAndApplyHelper.Apply 把内部量化 buffer → ExternalState → UObject 属性 + RepNotify；
+//    • 维护 UnresolvedHandleToDependents / ResolvedDynamicHandleToDependents 反向表。
+//
+// 5. ResolveAndDispatchUnresolvedReferences（每帧）
+//    • Hot/Cold 缓存策略：HotResolvingLifetimeMS 内的视为 hot，每帧重试；
+//      cold 则按 ColdResolvingRetryTimeMS 节流；
+//    • 解析成功 → 把对应对象加入 InternalObjectsToResolve → DispatchStateData 重做。
+//
+// 6. PendingBatchData / Async loading
+//    • 当 batch 含 must-be-mapped 引用尚未加载完成（如 Level streaming），
+//      整段 batch payload 进入 FPendingBatchHolder，调用方按 EIrisAsyncLoadingPriority 排序；
+//    • ProcessQueuedBatches 每帧/事件触发，重试解析这些 pending batch。
+//
+// 7. 错误处理
+//    • Sentinel 不匹配 → bitstream 错位，Context.SetError 终止；
+//    • Protocol mismatch → BrokenObjects + 上报 ReplicationSystem::ReportProtocolMismatch；
+//    • async load 长时间未完成 → 用 BlockedMustBeMappedLastWarningTime 节流警告。
+//
+// CVar 总览（关键）：
+//    net.Iris.UseResolvingHandleCache             开关 Hot/Cold 引用缓存
+//    net.Iris.HotResolvingLifetimeMS              hot 引用判定窗口
+//    net.Iris.ColdResolvingRetryTimeMS            cold 引用重试间隔
+//    net.Iris.UseOptObjectRefTracking             启用优化版 UpdateObjectReferenceTracking
+//    net.Iris.ExecuteReliableRPCsBeforeApplyState 兼容模式：先执行 Reliable RPC 再 Apply 状态
+//    net.Iris.DeferEndReplication                 EndReplication 推迟到 Apply 之后（默认 true）
+//    net.Iris.ImmediateDispatchEndReplicationForSubObjects  SubObject EndReplication 立即派发
+//    net.Iris.RemapDynamicObjects                 允许 dynamic 对象重映射（销毁后重建）
+// =============================================================================
+
 #include "Iris/ReplicationSystem/ReplicationReader.h"
 
 #include "Algo/RemoveIf.h"
@@ -705,6 +761,11 @@ void FReplicationReader::EndReplication(FInternalNetRefIndex InternalIndex, bool
 	}
 }
 
+// 接收侧 baseline+delta 解码：
+//   - 取 ReplicationInfo 中两份 StoredBaselines 的对应槽位；
+//   - 应用 delta，得到当前帧完整 InternalState；
+//   - OutNewBaselineIndex 是对端要求本端创建的新 baseline 槽（接收端镜像存储以便后续 delta 校验）。
+// 注意：DeltaCompression 的 baseline 由发送端管理，接收端只负责镜像存储 + 应用 delta。
 void FReplicationReader::DeserializeObjectStateDelta(FNetSerializationContext& Context, uint32 InternalIndex, FDispatchObjectInfo& Info, FReplicatedObjectInfo& ObjectInfo, const FNetRefHandleManager::FReplicatedObjectData& ObjectData, uint32& OutNewBaselineIndex)
 {
 	FNetBitStreamReader& Reader = *Context.GetBitStreamReader();
@@ -752,6 +813,20 @@ void FReplicationReader::DeserializeObjectStateDelta(FNetSerializationContext& C
 	}
 }
 
+// =============================================================================
+// UpdateUnresolvedMustBeMappedReferences —— 把尚未解析的 batch 转入 PendingBatchData
+// -----------------------------------------------------------------------------
+// 当一个对象 batch 中含有 must-be-mapped（必须在解码前先解析的）引用，且本地有任一个
+// 未解析（如所属 Level 尚未 streaming 完成 / 软引用 async loading 中），整段 batch payload
+// 必须延迟处理。流程：
+//   1) 触发 ObjectReferenceCache 异步加载（按 EIrisAsyncLoadingPriority 优先级）；
+//   2) 在 PendingBatchHolder 中创建/更新一条 FPendingBatchData，把 OwnerHandle、引用列表、
+//      待回放 chunk（bitstream 区域）保存下来；
+//   3) 上报警告（同一资产做节流，避免日志洪水）；
+// 后续 ProcessQueuedBatches 会反复尝试解析。一旦所有 must-be-mapped 都可解析，便按原始
+// bitstream 顺序"重放"该 batch（包括其中的 EndReplication）。
+// 返回非空 → 表示 batch 已暂存；调用方应跳过当帧 dispatch。
+// =============================================================================
 FPendingBatchData* FReplicationReader::UpdateUnresolvedMustBeMappedReferences(FNetRefHandle OwnerHandle, TArray<FNetRefHandle>& MustBeMappedReferences, EIrisAsyncLoadingPriority InIrisAsyncLoadingPriority)
 {
 	FPendingBatchData* PendingBatch = PendingBatchHolder.Find(OwnerHandle);
@@ -981,6 +1056,12 @@ uint32 FReplicationReader::ReadObjectsInBatch(FNetSerializationContext& Context,
 	}
 }
 
+// 单个对象 batch 的解码入口。一个 batch = 一个 owner 对象 + 0..N 个 sub-object。
+// 若 batch 中含尚未本地存在/可解析的 must-be-mapped 引用 → 整段 bytes 会被复制到
+// FPendingBatchData 排队（见 UpdateUnresolvedMustBeMappedReferences）；
+// 否则解码 owner（可选 CreationHeader → Bridge::CreateNetRefHandleFromRemote 实例化）+
+// 状态/附件/SubObject。
+// 返回值：本 batch 内"对象数"（用于上层统计）。
 uint32 FReplicationReader::ReadObjectBatch(FNetSerializationContext& Context, uint32 ReadObjectFlags)
 {
 	FNetBitStreamReader& Reader = *Context.GetBitStreamReader();
@@ -2166,6 +2247,17 @@ void FReplicationReader::ResolveAndDispatchUnresolvedReferencesForObject(FNetSer
 }
 
 // Dispatch all data received for the frame, this includes trying to resolve object references
+// =============================================================================
+// DispatchStateData —— 帧末统一派发（Read 完成后调用）
+// -----------------------------------------------------------------------------
+// 把本帧收到并通过 BuildUnresolvedChangeMaskAndUpdateObjectReferenceTracking
+// 处理过的对象走以下步骤：
+//   1) 更新 UnresolvedHandleToDependents / ResolvedDynamicHandleToDependents 反向表；
+//   2) 如果 bExecuteReliableRPCsBeforeApplyState → 先派发 Reliable 附件（兼容旧路径）；
+//   3) DequantizeAndApplyHelper：内部量化 buffer → ExternalState（UObject 属性）→ RepNotify；
+//   4) 派发剩余附件（Unreliable / 仍待解析的标记为 unresolvable）；
+//   5) DispatchEndReplication（销毁/TearOff）—— 默认 bDeferEndReplication=true 推迟到此处。
+// =============================================================================
 void FReplicationReader::DispatchStateData(FNetSerializationContext& Context)
 {
 	IRIS_PROFILER_SCOPE(FReplicationReader::DispatchStateData);
@@ -2398,6 +2490,11 @@ void FReplicationReader::DispatchStateData(FNetSerializationContext& Context)
 	FlushPostDispatchForBatch();
 }
 
+// 每帧扫描 Hot/Cold unresolved 缓存：
+//   - Hot：HotResolvingLifetimeMS 内的 unresolved，每帧重试；
+//   - Cold：超期，按 ColdResolvingRetryTimeMS 节流重试。
+// 一旦某 Handle 解析成功 → 反查 UnresolvedHandleToDependents → 把所有 owner 加入
+// InternalObjectsToResolve，再走 DispatchStateData 一遍即把变更应用到 UObject。
 void FReplicationReader::ResolveAndDispatchUnresolvedReferences()
 {
 	IRIS_PROFILER_SCOPE(FReplicationReader_ResolveAndDispatchUnresolvedReferences);
@@ -2641,6 +2738,8 @@ void FReplicationReader::ReadObjects(FNetSerializationContext& Context, uint32 O
 	}
 }
 
+// HugeObject 通道：单个分片 NetBlob 到达时调用，把分片 push 给 NetBlobAssembler。
+// 当所有分片都到齐 → ProcessHugeObject 走"内嵌 batch"路径解码。
 void FReplicationReader::ProcessHugeObjectAttachment(FNetSerializationContext& Context, const TRefCountPtr<FNetBlob>& Attachment)
 {
 	if (Attachment->GetCreationInfo().Type != NetObjectBlobType)
@@ -2761,6 +2860,11 @@ void FReplicationReader::RemoveFromUnresolvedCache(const FNetRefHandle Handle)
 	}
 }
 
+// 重放 PendingBatchHolder 中的 batch。每帧（或事件触发）调用：
+//   • 扫描 holder 中每条 FPendingBatchData，检查 MustBeMappedReferences 是否全部可解析；
+//   • 若是 → 用 SubBitStreamReader 在保存的 chunk 上重新解码（包括 EndReplication 等 chunk）；
+//   • 期间若 batch 又遇到新 unresolved → 仍保留在 holder 中（更新 LastWarning）；
+//   • 解析超时（async loading 卡住）→ 周期性 Warning。
 void FReplicationReader::ProcessQueuedBatches()
 {
 	UE_NET_TRACE_FRAME_STATSCOUNTER(Parameters.ReplicationSystem->GetId(), ReplicationReader.PendingQueuedBatches, PendingBatchHolder.Num(), ENetTraceVerbosity::Trace);
@@ -3087,6 +3191,9 @@ void FReplicationReader::ProcessQueuedBatches()
 	}
 }
 
+// 当 NetBlobAssembler 报告所有 HugeObject 分片到齐时调用：把组装好的 raw bytes 包装成
+// 一个 SubBitStreamReader，递归调用 ReadObjects/ReadObjectBatch 路径完成解码。
+// 走内嵌 batch 时使用 ReadObjectFlag_IsReadingHugeObjectBatch 区分（影响 batch size 校验）。
 void FReplicationReader::ProcessHugeObject(FNetSerializationContext& Context)
 {
 	if (!Attachments.HasUnprocessedAttachments(ENetObjectAttachmentType::HugeObject, ObjectIndexForOOBAttachment))
@@ -3115,6 +3222,17 @@ void FReplicationReader::ProcessHugeObject(FNetSerializationContext& Context)
 	}
 }
 
+// =============================================================================
+// FReplicationReader::Read —— 接收侧主入口
+// -----------------------------------------------------------------------------
+// 由 UReplicationDataStream::ReadData 调用，按下列顺序解码本连接收到的 ReplicationDataStream
+// payload：
+//   1) ReadStreamDebugFeatures        读取写入端启用了哪些调试 features（决定后续是否读 sentinel/size）
+//   2) ReadObjectsPendingDestroy      解析销毁列表（按 cvar 选择 Root-only 或含 SubObject 路径）
+//   3) ReadObjects                    解析对象 batch 数组（含 attachments / huge object 分片）
+// 期间任何 bitstream 错误都会通过 Context.SetError(...) 终止，调用方根据 NetErrorContext 决定
+// 是否断开连接或上报 ReplicationSystem。
+// =============================================================================
 void FReplicationReader::Read(FNetSerializationContext& Context)
 {
 	FNetBitStreamReader& Reader = *Context.GetBitStreamReader();

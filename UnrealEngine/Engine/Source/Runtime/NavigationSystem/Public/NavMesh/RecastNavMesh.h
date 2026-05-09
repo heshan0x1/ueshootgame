@@ -2,6 +2,57 @@
 
 #pragma once
 
+// ============================================================================
+// 文件概览：RecastNavMesh.h
+// ----------------------------------------------------------------------------
+// 本文件定义 ARecastNavMesh（ANavigationData 的 Recast 实现 Actor）及其配套
+// 数据结构。体量大，可按以下角色划分阅读：
+//
+//   [顶部宏 & 枚举]
+//     - RECAST_MAX_AREAS / RECAST_DEFAULT_AREA / RECAST_NULL_AREA：
+//       Recast 最多支持 64 种 Area 类型（Area ID 0 为 Null/不可走，
+//       DEFAULT/LOW 位置见宏）；uint8 AreaID 在寻路过程贯穿始终。
+//     - RECAST_ASYNC_REBUILDING：是否异步生成；决定 BatchQueryCounter 等锁结构
+//     - ERecastPartitioning：Tile 分区算法（Watershed/Monotone/ChunkyMonotone）
+//     - ENavigationLedgeSlopeFilterMode：Ledge 过滤策略
+//
+//   [辅助结构]
+//     - FDetourTileSizeInfo / FDetourTileLayout：Tile 字节布局元数据，
+//       用于计算 Tile 二进制大小、序列化跳过等
+//     - FRecastDebugPathfindingNode / FRecastDebugGeometry：调试视图容器
+//     - FNavTileRef：64 位 Tile 引用（5.5 起替代裸 dtTileRef）
+//     - FNavPoly：简要 Poly 描述（PolyRef + 中心）
+//     - ERecastNamedFilter：预构建命名过滤器（去掉 NavLink / 非默认 Area 等）
+//     - FNavMeshResolutionParam：Low/Default/High 分辨率下的 CellSize/Height/StepHeight
+//     - FRecastNamedFiltersCreator / FNavMeshConfig：过滤器工厂
+//     - FNavMeshTileData / FNavMeshTileData::FNavData：Tile 数据装箱 +
+//       引用计数（MakeUnique 产生深拷贝；Release 取出裸指针移交所有权）
+//     - FNavMeshDirtyTileElement：待重建 Tile + 优先级
+//     - FRecastNavMeshTileGenerationDebug：编辑器里选"单个/矩形 Tile"做内部数据可视化
+//
+//   [核心 Actor：ARecastNavMesh]
+//     - 大量 UPROPERTY：Debug 绘制开关 / 生成参数（TileSize、CellSize、CellHeight、
+//       AgentRadius、AgentHeight、AgentMaxStepHeight、区域划分、采样容差、是否生成
+//       NavLink 等） / 动态模式参数
+//     - Tile/Poly API：GetNavMeshTilesAt / GetDebugGeometryForTile /
+//       GetPolyCenter / GetPolyVerts / GetPolyFlags / GetPolyWallSegments ...
+//     - 查询入口：FindPath / TestPath / NavMeshRaycast (多个重载) /
+//       ProjectPoint / BatchRaycast / GetRandomPoint / FindMoveAlongSurface /
+//       FindDistanceToWall / HasCompleteDataInRadius / IsSegmentOnNavmesh
+//     - Link：UpdateCustomLink / UpdateNavigationLinkArea / UpdateSegmentLinkArea
+//     - 生成器桥接：ConditionalConstructGenerator、OnNavMeshTilesUpdated、
+//       InvalidateAffectedPaths、RebuildTile、DirtyTilesInBounds
+//     - 序列化：Serialize / SerializeRecastNavMesh（按 NavMeshVersion 分支）
+//
+//   [末尾]
+//     - FRecastNavMeshCachedData：快照 Area→Flags 映射，供后台线程生成 Tile
+//       时无锁查阅，避免在多线程环境里直接问 ARecastNavMesh。
+//
+// 实际 Detour 调用都委托给 FPImplRecastNavMesh（见同目录 PImplRecastNavMesh.h）。
+// ARecastNavMesh 主要负责：UObject 生命周期、Filter/Area 管理、调试可视化参数、
+// 序列化、以及"静态 FindPath 回调"（被挂到基类 FindPathImplementation 函数指针）。
+// ============================================================================
+
 #if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_4
 #include "CoreMinimal.h"
 #endif
@@ -16,25 +67,34 @@
 #include "NavMesh/NavMeshPath.h"
 #include "RecastNavMesh.generated.h"
 
+// A* Open/Closed List 的默认节点上限；FNavigationQueryFilter 可覆盖
 #define RECAST_MAX_SEARCH_NODES		2048
 
+// Tile 边长最小值（UE 单位 cm）。过小会导致 Tile 数量爆炸
 #define RECAST_MIN_TILE_SIZE		300.f
 
+// Recast Area 最大数量（含 Null/Default/LowHeight）
 #define RECAST_MAX_AREAS			64
+// 默认可走 Area ID（常对应 UNavArea_Default）
 #define RECAST_DEFAULT_AREA			(RECAST_MAX_AREAS - 1)
+// 低高度 Area ID（常对应 UNavArea_LowHeight —— 代理半蹲能过）
 #define RECAST_LOW_AREA				(RECAST_MAX_AREAS - 2)
+// 不可走 Area ID（对应 UNavArea_Null；0 固定为"空"）
 #define RECAST_NULL_AREA			0
 // Note poly costs are still floats in UE so we are using FLT_MAX as unwalkable still. 
 // Path CostLimit and Distance are based on FVector::FReal.
+// 某个 Area/Poly 被视作"不可通行"时使用的极大代价（浮点表示）
 #define RECAST_UNWALKABLE_POLY_COST	FLT_MAX 
 
 // If set, recast will use async workers for rebuilding tiles in runtime
 // All access to tile data must be guarded with critical sections
+// 开启后 Tile 在工作线程生成；访问 Tile 数据必须走 BeginBatchQuery/FinishBatchQuery 锁保护
 #ifndef RECAST_ASYNC_REBUILDING
 #define RECAST_ASYNC_REBUILDING	1
 #endif
 
 //If set we will time slice the nav regen if RECAST_ASYNC_REBUILDING is 0
+// 与异步互斥：未启异步时可用时间切片，把 Tile 生成分摊到多帧
 #ifndef ALLOW_TIME_SLICE_NAV_REGEN
 #define ALLOW_TIME_SLICE_NAV_REGEN 0
 #endif
@@ -63,6 +123,7 @@ struct dtMeshTile;
 class UNavigationSystemV1;
 class UNavigationSystemBase;
 
+// Recast Tile 分区算法：必须与 rcRegionPartitioning 枚举保持一致
 UENUM()
 namespace ERecastPartitioning
 {
@@ -70,12 +131,13 @@ namespace ERecastPartitioning
 
 	enum Type : int
 	{
-		Monotone,
-		Watershed,
-		ChunkyMonotone,
+		Monotone,       // 单调分区：快，但生成的区域形状可能较差
+		Watershed,      // 分水岭：质量最好（默认），最慢
+		ChunkyMonotone, // 块状单调：速度/质量折中
 	};
 }
 
+// Ledge（"悬崖"，可走面旁边的陡降）过滤策略
 UENUM()
 enum class ENavigationLedgeSlopeFilterMode : uint8
 {
@@ -84,6 +146,7 @@ enum class ENavigationLedgeSlopeFilterMode : uint8
 	UseStepHeightFromAgentMaxSlope	// Use maximum step height computed from AgentMaxSlope
 };
 
+// Tile 内部分区大小统计；用于预估/校验 Tile 二进制大小
 struct FDetourTileSizeInfo
 {
 	unsigned short VertCount = 0;
@@ -99,6 +162,7 @@ struct FDetourTileSizeInfo
 	unsigned short OffMeshBase = 0;
 };
 
+// Tile 在字节流中的各段偏移；Recast 用它来做 dtCreateNavMeshData / 序列化跳转
 struct FDetourTileLayout
 {
 	NAVIGATIONSYSTEM_API FDetourTileLayout(const dtMeshTile& tile);
@@ -123,12 +187,15 @@ public:
 	int32 TileSize = 0;
 };
 
+// 路径生成标志位，在 FNavMeshPath::ApplyFlags 中被解读
 namespace ERecastPathFlags
 {
 	/** If set, path won't be post processed. */
+	// 跳过 String Pulling（只保留 PathCorridor）
 	inline const int32 SkipStringPulling = (1 << 0);
 
 	/** If set, path will contain navigation corridor. */
+	// 强制保留 PathCorridor（即便 bWantsPathCorridor 默认 false）
 	inline const int32 GenerateCorridor = (1 << 1);
 
 	/** Make your game-specific flags start at this index */
@@ -136,13 +203,14 @@ namespace ERecastPathFlags
 }
 
 #if WITH_RECAST
+// 调试寻路时记录 A* 图中每个被访问节点的信息（代价、父节点、是否在 Open 等）
 struct FRecastDebugPathfindingNode
 {
-	NavNodeRef PolyRef;
-	NavNodeRef ParentRef;
-	FVector::FReal Cost = 0.;
-	FVector::FReal TotalCost = 0.;
-	FVector::FReal Length = 0.;
+	NavNodeRef PolyRef;         // 本节点对应的 Poly
+	NavNodeRef ParentRef;       // A* 中的父节点（回溯路径用）
+	FVector::FReal Cost = 0.;   // g(n) —— 从起点到此的累计代价
+	FVector::FReal TotalCost = 0.; // f(n) = g + h
+	FVector::FReal Length = 0.; // 从起点到此的走廊长度
 
 	FVector NodePos;
 	TArray<FVector3f, TInlineAllocator<6> > Verts; // LWC_TODO: Precision loss. Issue here is regarding debug rendering needing to work with FVector3f.
@@ -183,8 +251,10 @@ struct FRecastDebugPathfindingData
 	FRecastDebugPathfindingData(ERecastDebugPathfindingFlags::Type InFlags) : Flags(InFlags) {}
 };
 
+// 调试绘制用的几何容器：按 AreaID 分组的多边形索引、OffMeshLink、边界边、构建时间热图等
 struct FRecastDebugGeometry
 {
+	// OffMeshLink 的端点"可通行状态"掩码
 	enum EOffMeshLinkEnd
 	{
 		OMLE_None = 0x0,
@@ -273,6 +343,7 @@ struct FRecastDebugGeometry
 	uint32 NAVIGATIONSYSTEM_API GetAllocatedSize() const;
 };
 
+// 64 位 Tile 引用封装（5.5 起替代裸 dtTileRef，以便未来扩容与强类型化）
 struct FNavTileRef
 {
 	FNavTileRef() {}
@@ -306,12 +377,14 @@ private:
 	uint64 TileRef = 0;
 };
 
+// 简要 Poly 描述（被 GetPolysInTile / GetPolysInBox 批量返回）
 struct FNavPoly
 {
-	NavNodeRef Ref;
-	FVector Center;
+	NavNodeRef Ref;    // 64bit Detour PolyRef
+	FVector Center;    // Poly 中心（UE 坐标）
 };
 
+// 预构建的命名过滤器；以静态 FRecastQueryFilter 形式缓存，避免每次查询都重建
 namespace ERecastNamedFilter
 {
 	enum Type 
@@ -549,6 +622,8 @@ namespace FNavMeshConfig
 	};
 }
 
+// 多分辨率 Tile 支持：每个分辨率（Low/Default/High）有自己的 CellSize/Height/StepHeight。
+// 用法：对远景使用低分辨率节省构建时间，近景使用高分辨率保证精度。
 USTRUCT()
 struct FNavMeshResolutionParam
 {
@@ -557,25 +632,40 @@ struct FNavMeshResolutionParam
 	bool IsValid() const { return CellSize > 0.f && CellHeight > 0.f && AgentMaxStepHeight > 0.f; }
 	
 	/** Horizontal size of voxelization cell */
+	// 体素水平尺寸（越小越精细）
 	UPROPERTY(EditAnywhere, Category = Generation, config, meta = (ClampMin = "1.0", ClampMax = "1024.0"))
 	float CellSize = 25.f;
 
 	/** Vertical size of voxelization cell */
+	// 体素垂直尺寸
 	UPROPERTY(EditAnywhere, Category = Generation, config, meta = (ClampMin = "1.0", ClampMax = "1024.0"))
 	float CellHeight = 10.f;
 
 	/** Largest vertical step the agent can perform */
+	// 代理可跨越的最大垂直落差（地面到地面的"台阶"高度）
 	UPROPERTY(EditAnywhere, Category = Generation, config, meta = (ClampMin = "0.0"))
 	float AgentMaxStepHeight = 35.f;
 };
 
+// ============================================================================
+// ARecastNavMesh —— Recast 实现的 ANavigationData。
+// 职责清单（对应 NavigationSystem_Architecture_CN.md §4.4 寻路流程）：
+//   1) 持有 FPImplRecastNavMesh (Pimpl) 与生成器 FRecastNavMeshGenerator。
+//   2) 挂接静态 FindPath 给基类的 FindPathImplementation 函数指针：
+//      ARecastNavMesh::FindPath 为入口，内部调用 FPImplRecastNavMesh::FindPath。
+//   3) 维护 FRecastNavMeshCachedData：异步生成线程无锁查询 Area→Flags 的缓存。
+//   4) 序列化 NavMesh：Serialize / SerializeRecastNavMesh + NAVMESHVER_* 版本兼容。
+//   5) 暴露大量可编辑属性：Tile 尺寸 / Agent 参数 / Debug 开关 / Link 生成等。
+// ============================================================================
 UCLASS(config=Engine, defaultconfig, hidecategories=(Input,Rendering,Tags,Transformation,Actor,Layers,Replication), notplaceable, MinimalAPI)
 class ARecastNavMesh : public ANavigationData
 {
 	GENERATED_UCLASS_BODY()
 
+	// Poly flags 位宽（16 bit）。Detour 最多支持 16 个自定义标志（如 NavLink、特殊可走标记）
 	typedef uint16 FNavPolyFlags;
 
+	// 自定义 UObject 序列化；含 SerializeRecastNavMesh 所需的版本控制与 dtNavMesh 打包
 	NAVIGATIONSYSTEM_API virtual void Serialize( FArchive& Ar ) override;
 
 #if WITH_EDITOR
@@ -677,14 +767,17 @@ class ARecastNavMesh : public ANavigationData
 	//----------------------------------------------------------------------//
 
 	/** if true, the NavMesh will allocate fixed size pool for tiles, should be enabled to support streaming */
+	// 关卡流式加载必须开启：预分配固定 Tile 池，让新 Tile 进入时不扩容
 	UPROPERTY(EditAnywhere, Category=Generation, config)
 	uint32 bFixedTilePoolSize:1;
 
 	/** maximum number of tiles NavMesh can hold */
+	// Tile 池容量上限（上面开启时生效）
 	UPROPERTY(EditAnywhere, Category=Generation, config, meta=(editcondition = "bFixedTilePoolSize"))
 	int32 TilePoolSize;
 
 	/** size of single tile, expressed in uu */
+	// 单个 Tile 边长（UE 单位）；Tile 越大，A* 跨 Tile 越少但并行生成越差
 	UPROPERTY(EditAnywhere, Category=Generation, config, meta=(ClampMin = "300.0"))
 	float TileSizeUU;
 
@@ -713,14 +806,17 @@ class ARecastNavMesh : public ANavigationData
 	FNavMeshResolutionParam NavMeshResolutionParams[(uint8)ENavigationDataResolution::MAX];
 
 	/** Radius of smallest agent to traverse this navmesh */
+	// 最小代理半径：决定体素化时缩进（inset）多少
 	UPROPERTY(EditAnywhere, Category = Generation, config, meta = (ClampMin = "0.0", ClampMax = "100000.0", UIMin = "0.0", UIMax = "100000.0"))
 	float AgentRadius;
 
 	/** Size of the tallest agent that will path with this navmesh. */
+	// 最大代理高度：决定体素化时"头顶空间"的筛选阈值
 	UPROPERTY(EditAnywhere, Category = Generation, config, meta = (ClampMin = "0.0", ClampMax = "100000.0", UIMin = "0.0", UIMax = "100000.0"))
 	float AgentHeight;
 
 	/* The maximum slope (angle) that the agent can move on. */ 
+	// 最大可走斜率（度），超过视为墙
 	UPROPERTY(EditAnywhere, Category=Generation, config, meta=(ClampMin = "0.0", ClampMax = "89.0", UIMin = "0.0", UIMax = "89.0" ))
 	float AgentMaxSlope;
 
@@ -934,19 +1030,22 @@ private:
 
 public:
 
+	// Detour Raycast 结果：被 ARecastNavMesh::NavMeshRaycast / FPImplRecastNavMesh::Raycast 填充。
+	// 与 dtNavMeshQuery::raycast 的区别：UE 版可跨 Tile，沿线逐 Poly 推进，
+	// 记录走廊 PolyRef 序列与命中时间（HitTime = 从 Start 到命中处的归一化比例）。
 	struct FRaycastResult
 	{
 		enum 
 		{
-			MAX_PATH_CORRIDOR_POLYS = 128
+			MAX_PATH_CORRIDOR_POLYS = 128   // 单次 Raycast 最多记录 128 个 Poly
 		};
 
-		NavNodeRef CorridorPolys[MAX_PATH_CORRIDOR_POLYS];
-		float CorridorCost[MAX_PATH_CORRIDOR_POLYS];
-		int32 CorridorPolysCount;
-		FVector::FReal HitTime;
-		FVector HitNormal;
-		uint32 bIsRaycastEndInCorridor : 1;
+		NavNodeRef CorridorPolys[MAX_PATH_CORRIDOR_POLYS]; // 沿线 Poly 序列
+		float CorridorCost[MAX_PATH_CORRIDOR_POLYS];       // 每段代价（参考）
+		int32 CorridorPolysCount;                          // 实际填了几个
+		FVector::FReal HitTime;                            // 命中时间 [0,1]；== FLT_MAX 表示未命中
+		FVector HitNormal;                                 // 命中墙的法线
+		uint32 bIsRaycastEndInCorridor : 1;                // 终点是否落在走廊末端 Poly 内
 
 		FRaycastResult()
 			: CorridorPolysCount(0)
@@ -1414,10 +1513,18 @@ public:
 	NAVIGATIONSYSTEM_API bool ProjectPointMulti(const FVector& Point, TArray<FNavLocation>& OutLocations, const FVector& Extent,
 		FVector::FReal MinZ, FVector::FReal MaxZ, FSharedConstNavQueryFilter Filter = NULL, const UObject* Querier = NULL) const;
 	
-	// @todo document
+	// @todo docuement
+	// ---------- 静态寻路回调（基类 FindPathImplementation / TestPathImplementation 使用）----------
+	// ARecastNavMesh::FindPath 由 ANavigationData 的函数指针调用，内部会：
+	//   1) 校验 NavData 仍有效
+	//   2) 解包 FPathFindingQuery 中的 Start/End/Filter/CostLimit
+	//   3) 调用 FPImplRecastNavMesh::FindPath
+	// 这是架构文档 §4.4 "寻路同步流程" 第 3 步的具体入口。
 	static NAVIGATIONSYSTEM_API FPathFindingResult FindPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query);
 	static NAVIGATIONSYSTEM_API bool TestPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query, int32* NumVisitedNodes);
+	// 层级可达性测试（基于 Cluster Links；WITH_NAVMESH_CLUSTER_LINKS 启用时有效）
 	static NAVIGATIONSYSTEM_API bool TestHierarchicalPath(const FNavAgentProperties& AgentProperties, const FPathFindingQuery& Query, int32* NumVisitedNodes);
+	// NavMesh 上的 Raycast 多重载；最终都落到 FPImplRecastNavMesh::Raycast
 	static NAVIGATIONSYSTEM_API bool NavMeshRaycast(const ANavigationData* Self, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FSharedConstNavQueryFilter QueryFilter, const UObject* Querier, FRaycastResult& Result);
 	static bool NavMeshRaycast(const ANavigationData* Self, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FSharedConstNavQueryFilter QueryFilter, const UObject* Querier = NULL);
 	static bool NavMeshRaycast(const ANavigationData* Self, const FVector& RayStart, const FVector& RayEnd, FVector& HitLocation, FNavigationRaycastAdditionalResults* AdditionalResults, FSharedConstNavQueryFilter QueryFilter, const UObject* Querier = NULL);
@@ -1561,6 +1668,7 @@ private:
 	NAVIGATIONSYSTEM_API URecastNavMeshDataChunk* GetNavigationDataChunk(const TArray<UNavigationDataChunk*>& InChunks) const;
 
 	/** NavMesh versioning. */
+	// 加载时记下的 NAVMESHVER_*，用于 SerializeRecastNavMesh 的字段迁移判断
 	uint32 NavMeshVersion;
 	
 	/** 
@@ -1569,15 +1677,18 @@ private:
 	 *	@NOTE: if we switch over to C++11 this should be unique_ptr
 	 *	@TODO since it's no secret we're using recast there's no point in having separate implementation class. FPImplRecastNavMesh should be merged into ARecastNavMesh
 	 */
+	// Pimpl 核心；所有 dtNavMesh 的实际访问都经它完成
 	FPImplRecastNavMesh* RecastNavMeshImpl;
 	
 #if RECAST_ASYNC_REBUILDING
 	/** batch query counter */
+	// BeginBatchQuery/FinishBatchQuery 嵌套计数；保护 Async Tile 生成时的读访问
 	mutable int32 BatchQueryCounter;
 
 #endif // RECAST_ASYNC_REBUILDING
 
 private:
+	// 进程级共享的命名过滤器静态数组；见 ERecastNamedFilter
 	static NAVIGATIONSYSTEM_API const FRecastQueryFilter* NamedFilters[ERecastNamedFilter::NamedFiltersCount];
 #else
 	virtual bool IsNodeRefValid(NavNodeRef NodeRef) const override { return true; }
@@ -1630,13 +1741,17 @@ bool ARecastNavMesh::NavMeshRaycast(const ANavigationData* Self, const FVector& 
 
 /** structure to cache owning RecastNavMesh data so that it doesn't have to be polled
  *	directly from RecastNavMesh while asyncronously generating navmesh */
+// 生成器侧缓存：在后台 Tile 生成线程运行时，避免直接回问 ARecastNavMesh
+// （可能 UObject 被 GC / 属性被改），快照一份 Area→Flags / Area→ID 的表即可无锁查询。
+// 构建：Construct(RecastNavMeshActor) 在主线程填好后发给生成器
+// 同步：OnAreaAdded/Removed 在 Area 变动时由主线程维护
 struct FRecastNavMeshCachedData
 {
-	ARecastNavMesh::FNavPolyFlags FlagsPerArea[RECAST_MAX_AREAS];
-	ARecastNavMesh::FNavPolyFlags FlagsPerOffMeshLinkArea[RECAST_MAX_AREAS];
-	TMap<const UClass*, int32> AreaClassToIdMap;
-	TWeakObjectPtr<const ARecastNavMesh> ActorOwner;
-	uint32 bUseSortFunction : 1;
+	ARecastNavMesh::FNavPolyFlags FlagsPerArea[RECAST_MAX_AREAS];            // 每个 Area 的 Poly Flags
+	ARecastNavMesh::FNavPolyFlags FlagsPerOffMeshLinkArea[RECAST_MAX_AREAS]; // OffMeshLink 专用 Flags
+	TMap<const UClass*, int32> AreaClassToIdMap;                             // UNavArea 子类 → AreaID
+	TWeakObjectPtr<const ARecastNavMesh> ActorOwner;                         // 反向指针（弱引，防 GC 悬挂）
+	uint32 bUseSortFunction : 1;                                             // 是否启用 Area 代价排序
 
 	static FRecastNavMeshCachedData Construct(const ARecastNavMesh* RecastNavMeshActor);
 	void OnAreaAdded(const UClass* AreaClass, int32 AreaID);

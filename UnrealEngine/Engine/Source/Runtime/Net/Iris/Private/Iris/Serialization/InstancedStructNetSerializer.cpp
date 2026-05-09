@@ -1,5 +1,22 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// InstancedStructNetSerializer.cpp —— FInstancedStruct 序列化实现
+// -----------------------------------------------------------------------------
+// 关键流程（见每个函数注释）：
+//   * Quantize：保存 (StructType=UObject 量化引用, StructData=嵌套 struct 量化态);
+//   * Serialize：先写 1 bit 是否有效，无效则提前结束。否则写 type + data。
+//   * Deserialize：读 type → ObjectNetSerializer.Dequantize 拿 UScriptStruct → 烘焙 Descriptor → 读 data。
+//   * Apply：应用到客户端真实对象时若类型不变则保留非复制成员；否则 InitializeAs 重置。
+//
+// 重要细节：
+//   * 类型 UScriptStruct 通过 FObjectNetSerializer 序列化 —— 走 NetGUID/PathExport，
+//     因此跨进程也能正确解析；
+//   * Descriptor 烘焙开销大，所以用 FInstancedStructDescriptorCache 缓存（默认 8 项 LRU）；
+//   * SupportedTypes 当前作为"硬白名单"未启用（看 InitInstancedStructNetSerializerConfig 中
+//     bIsAllowingArbitraryStruct == true，注释引用 UE-180981 待办）。
+// =============================================================================
+
 #include "Iris/Serialization/InstancedStructNetSerializer.h"
 #include UE_INLINE_GENERATED_CPP_BY_NAME(InstancedStructNetSerializer)
 
@@ -18,6 +35,7 @@
 #include "Iris/Serialization/QuantizedObjectReference.h"
 #include "Templates/IsPODType.h"
 
+// 标记 NeedDestruction，使 RefCountPtr<Descriptor> + DescriptorCache 在销毁时释放。
 FInstancedStructNetSerializerConfig::FInstancedStructNetSerializerConfig()
 : FNetSerializerConfig()
 {
@@ -29,45 +47,63 @@ FInstancedStructNetSerializerConfig::~FInstancedStructNetSerializerConfig() = de
 namespace UE::Net
 {
 
+// LRU 容量（CVar 可调）。<=0 视为无限缓存（用 Map）。
 static int32 MaxCachedInstancedStructDescriptorCount = 8;
 static FAutoConsoleVariableRef CVarMaxCachedInstancedStructDescriptors(TEXT("InstancedStruct.MaxCachedReplicationStateDescriptors"), MaxCachedInstancedStructDescriptorCount, TEXT("How many ReplicationStateDescriptors the InstancedStructNetSerializer is allowed to cache for InstancedStructs without a type allow list. Warning: A value <= 0 means an unlimited amount of descriptors."));
 
+// 错误码：当反序列化端遇到未知/非法 struct 类型时上报。
 const FName NetError_InstancedStructNetSerializer_InvalidStructType("Invalid struct type");
 
+// 量化态的核心数据结构。
+// 注意 StructName / StructDescriptorTraits 不被序列化（不参与比特流），仅作运行时优化。
 struct FFInstancedStructNetSerializerQuantizedData
 {
+	// 嵌套 struct 的对齐量化 buffer（按 Descriptor->InternalSize/Alignment 动态分配）。
 	FNetSerializerAlignedStorage StructData;
+	// UScriptStruct 类型自身的量化对象引用（NetGUID/PathExport）。
 	FQuantizedObjectReference StructType;
 
 	// Not serialized. Fully qualified path. For ReplicationStateDescriptor lookup, validation etc. 
+	// 完整 path FName，用于 DescriptorCache 查表（避免每次都 GetPathName）。
 	FName StructName;
 	// Not serialized. To optimize away some calls like dynamic memory management and object references.
+	// 缓存元素 Descriptor 的 trait 子集；用于跳过 CloneDynamicState / CollectRefs 等无谓调用。
 	EReplicationStateTraits StructDescriptorTraits;
 };
 
+// FInstancedStructPropertyNetSerializerInfo ——
+// 把 "FInstancedStruct" 这个 named struct 注册到 PropertyNetSerializerInfoRegistry，
+// 让 ReplicationStateDescriptorBuilder 在烘焙时给 FInstancedStruct 字段绑定本 serializer。
 struct FInstancedStructPropertyNetSerializerInfo : public FNamedStructPropertyNetSerializerInfo
 {
 public:
 	FInstancedStructPropertyNetSerializerInfo();
 
 protected:
+	// 强制每个 FInstancedStruct 属性使用属性专属 Config（用于属性级白名单/调试名）。
 	virtual bool CanUseDefaultConfig(const FProperty* Property) const;
 	virtual FNetSerializerConfig* BuildNetSerializerConfig(void* NetSerializerConfigBuffer, const FProperty* Property) const override;
 };
 
 }
 
+// QuantizedData 标记为 POD：FNetSerializerAlignedStorage / FQuantizedObjectReference 都不持有 vtable，
+// 可以直接 memcpy 进/出 ReplicationProtocol 缓冲。
 template<> struct TIsPODType<UE::Net::FFInstancedStructNetSerializerQuantizedData> { enum { Value = true }; };
 
 namespace UE::Net
 {
 
+// 主 Serializer 定义。所有 12 个契约函数都显式声明 + 实现，因为 bIsForwardingSerializer=true。
 struct FInstancedStructNetSerializer
 {
 	// Version
 	static const uint32 Version = 0;
 
 	// Traits
+	// QuantizedType 内含动态分配（StructData）；
+	// 类型可能引用对象（StructType），需要参与 CollectNetReferences；
+	// 自身只是 dispatch，需 Apply 等所有契约 → forwarding。
 	static constexpr bool bHasDynamicState = true;
 	static constexpr bool bIsForwardingSerializer = true;
 	static constexpr bool bHasCustomNetReference = true;
@@ -93,16 +129,23 @@ struct FInstancedStructNetSerializer
 
 	static void CollectNetReferences(FNetSerializationContext&, const FNetCollectReferencesArgs&);
 
+	// 应用到客户端真实对象。Apply 是 Iris 特有的高层 API（不在 12 项契约中），
+	// 用于把"反量化的临时态"合并/拷贝到真实游戏对象上，区别于 RepNotify。
 	static void Apply(FNetSerializationContext&, const FNetApplyArgs&);
 
 private:
 	// Frees dynamic memory allocated by the struct instance. Zeros the struct storage. Does not free the struct storage. After the call the Value is ready to be re-purposed for a different type of struct.
+	// 释放 struct 实例的 dynamic state（不 free StructData 本体），并 memzero —— 让 storage 可以重复利用给另一种类型。
 	static void FreeStructInstance(FNetSerializationContext&, FInstancedStructNetSerializerConfig*, QuantizedType& Value);
 	// Frees dynamic memory allocated by the struct instance, frees the storage for the struct instance and reset the entire quantized state to default.
+	// 完全 Reset：含 StructData free、整个 QuantizedType 清零。
 	static void Reset(FNetSerializationContext&, FInstancedStructNetSerializerConfig*, QuantizedType&);
 
+	// 内部 helper，仅释放 struct 实例 dynamic state（递归调 StructNetSerializer.FreeDynamicState）。
 	static void InternalFreeStructInstance(FNetSerializationContext&, FInstancedStructNetSerializerConfig*, QuantizedType&);
 
+	// 注册委托：在 PreFreezeNetSerializerRegistry 阶段把 FInstancedStructPropertyNetSerializerInfo
+	// 注册到全局 PropertyNetSerializerInfoRegistry。
 	class FNetSerializerRegistryDelegates final : private UE::Net::FNetSerializerRegistryDelegates
 	{
 	public:
@@ -120,6 +163,7 @@ private:
 		UE_NET_IMPLEMENT_NETSERIALIZER_INFO(FInstancedStructPropertyNetSerializerInfo);
 	};
 
+	// 缓存指向其他通用 serializer 的指针，避免每次调用都 UE_NET_GET_SERIALIZER。
 	inline static const FNetSerializer* StructNetSerializer = &UE_NET_GET_SERIALIZER(FStructNetSerializer);
 	inline static const FNetSerializer* ObjectNetSerializer = &UE_NET_GET_SERIALIZER(FObjectNetSerializer);
 	inline static FNetSerializerRegistryDelegates NetSerializerRegistryDelegates;
@@ -127,6 +171,10 @@ private:
 
 UE_NET_IMPLEMENT_SERIALIZER(FInstancedStructNetSerializer);
 
+// -----------------------------------------------------------------------------
+// Serialize —— 写"是否有效 + (类型 + 数据)"
+// -----------------------------------------------------------------------------
+// 报文：[1 bit valid] ([type 引用][struct 数据])?
 void FInstancedStructNetSerializer::Serialize(FNetSerializationContext& Context, const FNetSerializeArgs& Args)
 {
 	const QuantizedType& Value = *reinterpret_cast<QuantizedType*>(Args.Source);
@@ -162,6 +210,9 @@ void FInstancedStructNetSerializer::Serialize(FNetSerializationContext& Context,
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Deserialize —— 读"是否有效 + (类型 → 烘焙 Descriptor → 数据)"
+// -----------------------------------------------------------------------------
 void FInstancedStructNetSerializer::Deserialize(FNetSerializationContext& Context, const FNetDeserializeArgs& Args)
 {
 	QuantizedType& Value = *reinterpret_cast<QuantizedType*>(Args.Target);
@@ -250,6 +301,12 @@ void FInstancedStructNetSerializer::Deserialize(FNetSerializationContext& Contex
 	}
 }
 
+// -----------------------------------------------------------------------------
+// SerializeDelta / DeserializeDelta —— 暂未实现 Delta 压缩
+// -----------------------------------------------------------------------------
+// 接收端可能拿不到对应 UScriptStruct（被 cook out / 模块未加载）；此时 Delta
+// 流难以优雅降级。当前 fallback 走完整 Serialize/Deserialize。
+// $IRIS TODO 注释见函数内。
 void FInstancedStructNetSerializer::SerializeDelta(FNetSerializationContext& Context, const FNetSerializeDeltaArgs& Args)
 {
 	// Skip DC support for now. Need to figure out how to gracefully handle missing UScriptStruct on the receiving end.
@@ -262,6 +319,13 @@ void FInstancedStructNetSerializer::DeserializeDelta(FNetSerializationContext& C
 	Deserialize(Context, Args);
 }
 
+// -----------------------------------------------------------------------------
+// Quantize —— 真实 FInstancedStruct → 量化态
+// -----------------------------------------------------------------------------
+// 1. 取真实 ScriptStruct，FindOrAddDescriptor 拿 ReplicationStateDescriptor；
+// 2. 类型变更才需要重新分配 StructData，并重新量化 StructType（UObject 引用）；
+// 3. 调 StructNetSerializer.Quantize 把真实 struct 量化进 StructData。
+// 类型不变时复用旧 StructData allocation —— 减少抖动。
 void FInstancedStructNetSerializer::Quantize(FNetSerializationContext& Context, const FNetQuantizeArgs& Args)
 {
 	const SourceType& Source = *reinterpret_cast<SourceType*>(Args.Source);
@@ -322,7 +386,12 @@ void FInstancedStructNetSerializer::Quantize(FNetSerializationContext& Context, 
 	Reset(Context, Config, Target);
 }
 
+// -----------------------------------------------------------------------------
+// Dequantize —— 量化态 → 真实 FInstancedStruct（按需 InitializeAs 切类型）
+// -----------------------------------------------------------------------------
 // $IRIS TODO : Consider implementing Apply to avoid unnecessary memory operations.
+// 注意：Dequantize 永远把"完整 struct 内容"覆盖到 Target；如果只想要"按字段 Apply"
+// 应单独走 Apply 路径（见下方）。
 void FInstancedStructNetSerializer::Dequantize(FNetSerializationContext& Context, const FNetDequantizeArgs& Args)
 {
 	const QuantizedType& Source = *reinterpret_cast<QuantizedType*>(Args.Source);
@@ -375,6 +444,9 @@ void FInstancedStructNetSerializer::Dequantize(FNetSerializationContext& Context
 	}
 }
 
+// -----------------------------------------------------------------------------
+// IsEqual —— 量化态：长度 + StructType + 字节比对；真实态：FInstancedStruct::operator==
+// -----------------------------------------------------------------------------
 bool FInstancedStructNetSerializer::IsEqual(FNetSerializationContext& Context, const FNetIsEqualArgs& Args)
 {
 	if (Args.bStateIsQuantized)
@@ -414,6 +486,9 @@ bool FInstancedStructNetSerializer::Validate(FNetSerializationContext& Context, 
 	return true;
 }
 
+// -----------------------------------------------------------------------------
+// CloneDynamicState —— 深克隆量化态（StructData allocation + 子 struct 内 dynamic）
+// -----------------------------------------------------------------------------
 void FInstancedStructNetSerializer::CloneDynamicState(FNetSerializationContext& Context, const FNetCloneDynamicStateArgs& Args)
 {
 	const QuantizedType& Source = *reinterpret_cast<const QuantizedType*>(Args.Source);
@@ -438,6 +513,9 @@ void FInstancedStructNetSerializer::CloneDynamicState(FNetSerializationContext& 
 	}
 }
 
+// -----------------------------------------------------------------------------
+// FreeDynamicState —— 释放整段量化态
+// -----------------------------------------------------------------------------
 void FInstancedStructNetSerializer::FreeDynamicState(FNetSerializationContext& Context, const FNetFreeDynamicStateArgs& Args)
 {
 	QuantizedType& Value = *reinterpret_cast<QuantizedType*>(Args.Source);
@@ -447,6 +525,11 @@ void FInstancedStructNetSerializer::FreeDynamicState(FNetSerializationContext& C
 	Value.StructData.Free(Context);
 }
 
+// -----------------------------------------------------------------------------
+// CollectNetReferences —— 收集 StructType 的对象引用 + 嵌套 struct 内引用
+// -----------------------------------------------------------------------------
+// 1) StructType 自身就是一个 UScriptStruct 引用 → ResolveOnClient；
+// 2) 若元素 Descriptor 标记 HasObjectReference，递归调 StructNetSerializer.CollectNetReferences。
 void FInstancedStructNetSerializer::CollectNetReferences(FNetSerializationContext& Context, const FNetCollectReferencesArgs& Args)
 {
 	const QuantizedType& Value = *reinterpret_cast<QuantizedType*>(Args.Source);
@@ -476,6 +559,12 @@ void FInstancedStructNetSerializer::CollectNetReferences(FNetSerializationContex
 	}
 }
 
+// -----------------------------------------------------------------------------
+// Apply —— 把 Source（来自反量化）合并到 Target（真实游戏对象）
+// -----------------------------------------------------------------------------
+// 类型不变 → 复用 Target storage 调 ApplyStruct（仅覆盖 replicated 字段，
+// 保留非 replicated 字段，比 Dequantize 整体覆盖更友好）。
+// 类型变化 → InitializeAs 重置 Target，再 ApplyStruct。
 void FInstancedStructNetSerializer::Apply(FNetSerializationContext& Context, const FNetApplyArgs& Args)
 {
 	const SourceType& Source = *reinterpret_cast<const SourceType*>(Args.Source);
@@ -496,6 +585,14 @@ void FInstancedStructNetSerializer::Apply(FNetSerializationContext& Context, con
 	}
 }
 
+// -----------------------------------------------------------------------------
+// 内部释放/重置三件套
+// -----------------------------------------------------------------------------
+// FreeStructInstance：先 InternalFreeStructInstance 释放 dynamic state，再
+//                     memzero StructData（复用 storage 给下一种类型）。
+// Reset：彻底释放（包含 storage 本体）+ memzero 整个 QuantizedType。
+// InternalFreeStructInstance：仅当元素 Descriptor 含 HasDynamicState 时才递归
+//                             调 StructNetSerializer.FreeDynamicState。
 void FInstancedStructNetSerializer::FreeStructInstance(FNetSerializationContext& Context, FInstancedStructNetSerializerConfig* Config, QuantizedType& Value)
 {
 	InternalFreeStructInstance(Context, Config, Value);
@@ -533,6 +630,10 @@ void FInstancedStructNetSerializer::InternalFreeStructInstance(FNetSerialization
 namespace UE::Net
 {
 
+// 配置初始化（注册时调用） ——
+// 1) 暂时不启用 SupportedTypes 白名单（见 UE-180981）；
+// 2) 给 DescriptorCache 设置调试名 "OuterClassName.PropertyName"；
+// 3) 限制 LRU 容量（CVar MaxCachedInstancedStructDescriptorCount）。
 void InitInstancedStructNetSerializerConfig(FInstancedStructNetSerializerConfig* Config, const FProperty* Property)
 {
 	// We want to be explicit about which structs are supported in the config. That requires UE-180981. For now let's allow any UScriptStruct.
@@ -566,6 +667,9 @@ void InitInstancedStructNetSerializerConfig(FInstancedStructNetSerializerConfig*
 	}
 }
 
+// FInstancedStructPropertyNetSerializerInfo 实现 ——
+// 与 PropertyNetSerializerInfoRegistry 对接：声明绑定到 named struct
+// "InstancedStruct"，并强制每个属性独立 Config（属性级白名单 + 调试信息）。
 FInstancedStructPropertyNetSerializerInfo::FInstancedStructPropertyNetSerializerInfo()
 : FNamedStructPropertyNetSerializerInfo(FName("InstancedStruct"), UE_NET_GET_SERIALIZER(FInstancedStructNetSerializer))
 {
@@ -574,11 +678,13 @@ FInstancedStructPropertyNetSerializerInfo::FInstancedStructPropertyNetSerializer
 bool FInstancedStructPropertyNetSerializerInfo::CanUseDefaultConfig(const FProperty* Property) const
 {
 	// Creating property specific configs so that we can validate and allow only property specific types. This allows us property specific tracking of used types too.
+	// 强制 false：每个 InstancedStruct 属性都拿独立 Config，便于做属性级白名单与缓存隔离。
 	return false;
 }
 
 FNetSerializerConfig* FInstancedStructPropertyNetSerializerInfo::BuildNetSerializerConfig(void* NetSerializerConfigBuffer, const FProperty* Property) const
 {
+	// Placement-new 在调用者提供的 buffer 里构造 Config，再做属性级初始化。
 	FInstancedStructNetSerializerConfig* Config = new (NetSerializerConfigBuffer) FInstancedStructNetSerializerConfig();
 	InitInstancedStructNetSerializerConfig(Config, Property);
 	return Config;
@@ -588,6 +694,10 @@ FNetSerializerConfig* FInstancedStructPropertyNetSerializerInfo::BuildNetSeriali
 
 namespace UE::Net::Private
 {
+
+// =============================================================================
+// FInstancedStructDescriptorCache 实现 —— LRU/Map 双模式 Descriptor 缓存
+// =============================================================================
 
 FInstancedStructDescriptorCache::FInstancedStructDescriptorCache()
 {
@@ -605,6 +715,9 @@ void FInstancedStructDescriptorCache::SetDebugName(const FString& InDebugName)
 	DebugName = InDebugName;
 }
 
+// 切换 LRU/无限缓存模式：
+//   * MaxCount <= 0  → 用 DescriptorMap（无限），LRU 清空；
+//   * MaxCount  > 0  → 用 DescriptorLruCache（限大小），Map 清空。
 void FInstancedStructDescriptorCache::SetMaxCachedDescriptorCount(int32 MaxCount)
 {
 	if (MaxCount <= 0)
@@ -615,6 +728,7 @@ void FInstancedStructDescriptorCache::SetMaxCachedDescriptorCount(int32 MaxCount
 	else
 	{
 		// Clear DescriptorMap which is only used for unlimited MaxCount
+		// 切换模式时把另一存储清空，避免重复缓存导致内存浪费。
 		UE_CLOG(!DescriptorMap.IsEmpty(), LogIris, Warning, TEXT("Clearing DescriptorMap from FIstancedStructDescriptorCache %s"), ToCStr(DebugName));
 		DescriptorMap.Empty();
 		DescriptorLruCache.Empty(MaxCount);
@@ -631,6 +745,8 @@ void FInstancedStructDescriptorCache::AddSupportedTypes(const TConstArrayView<TS
 }
 
 
+// 白名单检查：空 SupportedTypes 表示放行任意 UScriptStruct。
+// 否则要求 Struct IsChildOf 列表中任意一项（继承基类语义）。
 bool FInstancedStructDescriptorCache::IsSupportedType(const UScriptStruct* Struct) const
 {
 	if (ensure(Struct != nullptr))
@@ -680,6 +796,9 @@ TRefCountPtr<const FReplicationStateDescriptor> FInstancedStructDescriptorCache:
 	return FindDescriptor(PathName);
 }
 
+// FindOrAddDescriptor(FName) ——
+// 命中即返回；未命中则用 StaticLoadObject 加载 UScriptStruct（按 PathName 字符串），
+// 再调 CreateAndCacheDescriptor 烘焙 + 入缓存。
 TRefCountPtr<const FReplicationStateDescriptor> FInstancedStructDescriptorCache::FindOrAddDescriptor(FName StructPath)
 {
 	TRefCountPtr<const FReplicationStateDescriptor> Descriptor;
@@ -704,6 +823,8 @@ TRefCountPtr<const FReplicationStateDescriptor> FInstancedStructDescriptorCache:
 	return Descriptor;
 }
 
+// FindOrAddDescriptor(UScriptStruct) ——
+// 类型已就绪不需要 Load。先 IsSupportedType 通过白名单校验，再烘焙缓存。
 TRefCountPtr<const FReplicationStateDescriptor> FInstancedStructDescriptorCache::FindOrAddDescriptor(const UScriptStruct* Struct)
 {
 	TRefCountPtr<const FReplicationStateDescriptor> Descriptor;
@@ -730,6 +851,9 @@ TRefCountPtr<const FReplicationStateDescriptor> FInstancedStructDescriptorCache:
 	return Descriptor;
 }
 
+// CreateAndCacheDescriptor —— 真正烘焙 + 加锁入缓存
+// 调用 FReplicationStateDescriptorBuilder::CreateDescriptorForStruct（昂贵），
+// 因此一定要缓存复用。
 TRefCountPtr<const FReplicationStateDescriptor> FInstancedStructDescriptorCache::CreateAndCacheDescriptor(const UScriptStruct* Struct, FName StructPath)
 {
 	TRefCountPtr<const FReplicationStateDescriptor> Descriptor;

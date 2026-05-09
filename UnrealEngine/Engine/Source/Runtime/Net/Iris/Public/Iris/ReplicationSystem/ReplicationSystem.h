@@ -1,5 +1,55 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ReplicationSystem.h —— **Iris 的总门面**
+// 角色：UReplicationSystem 是 Iris 模块对游戏代码 / NetDriver 的"唯一入口"。
+//       所有上层操作（连接管理、过滤、优先级、分组、条件、RPC、调试、帧循环）
+//       都由这个类的方法暴露。
+//
+// 设计模式：
+//   * **PImpl**       : 实现细节由 FReplicationSystemImpl 持有（TPimplPtr<Impl> Impl;），
+//                       本头文件保持稳定 ABI，编译期解耦。
+//   * **聚合根**      : FReplicationSystemInternal 是真正的"私有数据中心"，
+//                       Impl 通过它访问所有子系统。
+//   * **工厂**        : FReplicationSystemFactory 全局管理 RS 实例数组（PIE 多实例支持）。
+//
+// 帧循环主入口（与 §4 帧循环一一对应）：
+//
+//   服务器端发送：
+//     1) NetUpdate(DeltaSeconds)         -- 整个 PreSend 流水线
+//     2) SendUpdate(SendFn)              -- 由 NetDriver 触发实际写包（DataStreamChannel）
+//     3) PostSendUpdate()                -- 收尾 / 重置脏标志 / 推进 PendingEnd 等
+//     4) TickPostReceive()               -- Dispatch 后的小型 send（仅 OOB RPC）
+//
+//   客户端接收：
+//     1) PreReceiveUpdate()              -- 进入收包阶段
+//     2) （NetDriver 内部 ReadData -> ReplicationReader）
+//     3) PostReceiveUpdate()             -- 结束收包，处理延迟 detach / Stop 等
+//
+// 重要 API 分类（见 ReplicationSystem.md §2.1）：
+//   * 连接：AddConnection / RemoveConnection / IsValidConnection / SetReplicationView /
+//           SetConnectionGracefullyClosing / SetReplicationEnabledForConnection / ...
+//   * 过滤：SetFilter / GetFilterHandle / GetFilter / GetFilterName /
+//           AddExclusion/Inclusion FilterGroup / SetGroupFilterStatus / SubObject Filter
+//   * 优先级：SetStaticPriority / SetPrioritizer / GetPrioritizerHandle / GetPrioritizer
+//   * 分组：CreateGroup / DestroyGroup / FindGroup / IsValid* / AddToGroup / RemoveFromGroup
+//   * 条件：SetReplicationCondition / SetReplicationConditionConnectionFilter
+//   * Owner：SetOwningNetConnection / GetOwningNetConnection
+//   * 特殊：SetDeltaCompressionStatus / SetIsNetTemporary / TearOffNextUpdate /
+//           ForceNetUpdate / MarkDirty / SetCullDistanceOverride / GetCullDistance
+//   * NetBlob / RPC：RegisterNetBlobHandler / QueueNetObjectAttachment / SendRPC /
+//                    SetRPCSendPolicyFlags / ResetRPCSendPolicyFlags
+//   * Meta / 调试：GetReplicationBridge[As<T>] / GetNetTokenStore / IsNetRefHandleAssigned /
+//                  GetReplicationProtocol / GetDebugName / GetWorldLocations /
+//                  CollectNetMetrics / ResetNetMetrics / ReportProtocolMismatch / ...
+//
+// 工厂入口：
+//   * FReplicationSystemFactory::CreateReplicationSystem(Params)   -- 在 NetDriver 启用 Iris 时调用
+//   * FReplicationSystemFactory::DestroyReplicationSystem(Sys)
+//   * FReplicationSystemFactory::GetAllReplicationSystems()        -- 遍历所有 RS（PIE）
+//   * GetReplicationSystem(Id)                                     -- 按 ReplicationSystemId 反查
+// =====================================================================================
+
 #pragma once
 
 #include "CoreTypes.h"
@@ -17,6 +67,7 @@
 
 // The number of inline elements the TInlineAllocator for ReplicationSystems can store.
 // Projects may define this to a value best suited for their needs.
+// 工程可在 Target.cs 重定义此值，以避免常规情况下 RS 数组的堆分配（PIE 多实例需要适当增大）。
 #ifndef UE_NUM_INLINE_REPLICATIONSYSTEMS
 	#define UE_NUM_INLINE_REPLICATIONSYSTEMS 8
 #endif
@@ -76,6 +127,36 @@ class UReplicationSystem : public UObject
 
 public:
 
+	/**
+	 * RS 创建参数。所有字段都有合理默认值；NetDriver 会按服务器/客户端、引擎配置覆写。
+	 *
+	 * 容量 / 内存：
+	 *   * MaxReplicatedObjectCount         : 该 RS 最多能注册多少 NetObject（位图位数硬上限）。
+	 *                                        会自动向上对齐到 32 的倍数（NetBitArray 一字 = 32 bit）。
+	 *   * InitialNetObjectListCount        : 初始分配的 BitArray / TArray 容量。0 = 与 Max 相同（不再增长）。
+	 *                                        小于 Max 时节省内存，但首次扩容会有一次 reallocation。
+	 *   * NetObjectListGrowCount           : 每次扩容增长多少（同样自动对齐 32）。小值省内存但更易碎片化。
+	 *   * PreAllocatedMemoryBuffersObjectCount : NetChunkedArray（per-object 大块缓冲）的预分配对象数。
+	 *                                        大值利于 cache friendly，但占用更多 RAM。
+	 *   * MaxReplicationWriterObjectCount  : 一台机器同时可以"向远端 写入" 的对象数上限。
+	 *                                        客户端通常很小（仅自己控制的对象 / RPC）。0 = 跟随 Max。
+	 *   * MaxDeltaCompressedObjectCount    : 同时启用 DeltaCompression 的对象数上限（基线池容量）。
+	 *   * MaxNetObjectGroupCount           : 同时存在的 NetObjectGroup 数（CreateGroup 不能超此值）。
+	 *
+	 * 行为开关：
+	 *   * bIsServer                        : 当前 RS 是服务器侧（决定 Filter/Prio 等是否运行）。
+	 *   * bAllowObjectReplication          : 启用属性复制 / Filter / Prio / DC / DirtyTracker 等。
+	 *                                        客户端或纯 RPC 用 RS 通常 false。
+	 *   * bUseRemoteObjectReferences       : UE_WITH_REMOTE_OBJECT_HANDLE 启用时是否把 TObjectPtr/TWeakObjectPtr
+	 *                                        序列化为 FRemoteObjectReferences。
+	 *   * bAllowParallelTasks              : Poll/Quantize/Write 是否并行 LowLevelTasks（仅 server + ObjRep 两者都启用）。
+	 *   * bAllowMinimalUpdateIfNoConnections : 没有连接时是否做最小化更新（节省 server CPU）。
+	 *
+	 * 委托 / 外部对象：
+	 *   * ForwardNetRPCCallDelegate        : 本地 RPC 转交给上层（NetDriver）执行。
+	 *   * NetTokenStore                    : NetToken 存储（FNameTokenStore / FStringTokenStore 等）。
+	 *                                        通常每条 NetDriver 共享一份，跨 RS 复用。
+	 */
 	struct FReplicationSystemParams
 	{
 		/** The replication bridge that allows communication between the replication system and the game engine  */
@@ -171,18 +252,31 @@ public:
 	 * Update all internal systems, such as filtering, dirty tracking, prioritization, etc.
 	 * Also copies all replicated data into the internal Iris protocols so they are ready to be sent to clients
 	 */
+	/**
+	 * 帧循环主入口（服务器侧）。展开为 §4 帧循环：
+	 *   StartPreSendUpdate -> UpdateWorldLocations -> UpdateFiltering ->
+	 *   UpdateConnectionSpecifics(Poll+Copy) -> QuantizeDirtyStateData ->
+	 *   UpdateObjectScopes -> PropagateDirtyChanges -> UpdatePrioritization ->
+	 *   DeltaCompression.PreSend -> （NetDriver 后续触发 Write）。
+	 */
 	IRISCORE_API void NetUpdate(float DeltaSeconds);
 
 	/**
 	 * Tick replication system after parsing all received data.
 	 * Used to check if immediate RPCs need to be sent before the rest of the engine is ticked
 	 */
+	/**
+	 * Dispatch 之后的"小型 Send"——将带 SendImmediate 标志的 RPC/Attachment 立即推送，
+	 * 不重新计算 Scope/Filtering，仅 NetBlob 通道写入。
+	 */
 	IRISCORE_API void TickPostReceive();
 
 	/** Callback triggered before connections start processing their received data */
+	/** 接收阶段起点；置 Bridge::bInReceiveUpdate=true 并清空临时表。 */
 	IRISCORE_API void PreReceiveUpdate();
 
 	/** Callback triggered after the connections processed all received data */
+	/** 接收阶段终点；处理 HandlesToStopReplicating / 延迟 detach。 */
 	IRISCORE_API void PostReceiveUpdate();
 
 	/**
@@ -191,11 +285,13 @@ public:
 	 * @see UDataStreamChannel.
 	 * @param SendFunction, Function taking an array of ConnectionId`s that has data to send
 	 */
+	/** 当前由 NetDriver 驱动；未来可能由 RS 自己发包。SendFunction 接收"有数据要发"的 ConnectionId 列表。 */
 	IRISCORE_API void SendUpdate(TFunctionRef<void(TArrayView<uint32>)> SendFunction);
 
 	/**
 	 * Cleanup temporaries and prepare for the next send update.
 	 */
+	/** 收尾：ResetObjectStateDirtiness / EndPostSendUpdate / DC 基线后处理 / WorldLocations 解锁等。 */
 	IRISCORE_API void PostSendUpdate();
 
 	/**
@@ -763,6 +859,7 @@ private:
 	void PostGarbageCollection();
 	void CollectGarbage();
 
+	// PImpl：把 FReplicationSystemImpl 的细节藏在 cpp，门面头文件 ABI 稳定。
 	TPimplPtr<UE::Net::Private::FReplicationSystemImpl> Impl;
 
 	FDelegateHandle PostGarbageCollectHandle;
@@ -771,8 +868,8 @@ private:
 	TObjectPtr<UObjectReplicationBridge> ReplicationBridge;
 
 	double ElapsedTime = 0;
-	uint32 Id;
-	int32 PIEInstanceID;
+	uint32 Id;                              // 0-based RS Id（与 FNetRefHandle.ReplicationSystemId 一致）
+	int32 PIEInstanceID;                    // PIE 实例 Id（独立服务/客户端会有不同值）
 	uint32 bIsServer : 1;
 	uint32 bAllowObjectReplication : 1;
 	uint32 bDoCollectGarbage : 1;
@@ -786,6 +883,11 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FReplicationSystemLifeTime, UReplicationSyst
 using FReplicationSystemCreatedDelegate = FReplicationSystemLifeTime;
 using FReplicationSystemDestroyedDelegate = FReplicationSystemLifeTime;
 
+/**
+ * RS 生命周期工厂——全局静态。
+ * 维护一个 inline-allocator 数组（默认 8 个内联，多 PIE 实例时按需扩展）。
+ * 通过 GetReplicationSystem(Id) 可在任意位置反查。
+ */
 class FReplicationSystemFactory
 {
 public:
@@ -803,6 +905,7 @@ public:
 	IRISCORE_API static void DestroyReplicationSystem(UReplicationSystem* System);
 
 	/** Returns all replication systems. Entries may be null. */
+	/** 返回所有 RS（含 null 槽位 —— 销毁后位置不收缩，保持 Id 稳定）。 */
 	IRISCORE_API static TArrayView<UReplicationSystem*> GetAllReplicationSystems();
 
 	/** Static delegate that is triggered just after creating and initializing a new replication system. */
@@ -819,6 +922,7 @@ private:
 	IRISCORE_API static FReplicationSystemArray ReplicationSystems;
 };
 
+/** 通过 Id 反查 RS（越界返回 nullptr）。Id 与 FNetRefHandle.ReplicationSystemId 一致。 */
 inline UReplicationSystem* GetReplicationSystem(uint32 Id)
 {
 	return Id >= static_cast<uint32>(FReplicationSystemFactory::ReplicationSystems.Num()) ? nullptr : FReplicationSystemFactory::ReplicationSystems[Id];

@@ -1,5 +1,33 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================================================
+// 【MassDebugger.cpp —— FMassDebugger 静态接口的实现 + 控制台命令注册中心】
+//
+// 本文件是 Mass 调试系统最大的实现文件（约 1600 行），承担三大职责：
+//
+//   职责一：注册"mass.debug.*"和"mass.*"控制台命令族（约前 500 行）
+//     - mass.debug.SetDebugEntityRange / DebugEntity / ResetDebugEntity：选定调试实体
+//     - mass.debug.DestroyEntity：通过控制台销毁实体
+//     - mass.debug.SetFragmentBreakpoint / ClearFragmentBreakpoint：动态布置/清除断点
+//     - mass.PrintEntityFragments / LogArchetypes / LogFragmentSizes / LogMemoryUsage / LogKnownFragments
+//     - mass.RecacheQueries
+//   这些命令是程序员日常调试 Mass 内部状态的"瑞士军刀"。
+//
+//   职责二：FMassDebugger 静态成员定义与方法实现（中段）
+//     - 委托/容器的静态实例
+//     - 所有内省 API（GetXxx / EnumerateXxx）通过 friend 关系直接读取 Mass 内部字段
+//     - 实体选择/高亮、Environment 注册、Provider 注册
+//
+//   职责三：断点管理（后段）
+//     - Should*Break / Has*Breakpoint：热路径查询
+//     - Set/Clear*Breakpoint：增删断点 + 维护 ProcessorsWithBreakpoints/FragmentsWithBreakpoints 加速集合
+//     - RefreshBreakpoints：从 Breakpoints 数组重建加速集合（在外部修改后调用）
+//     - GetFragmentTypeFromName：fragment 名→类型反查（通过扫描 archetype 收集类型缓存）
+//
+// 整个文件被 #if WITH_MASSENTITY_DEBUG / #endif 包裹——Shipping 构建中除了空 USTRUCT 注册
+// 几乎不会编译任何代码，且无可执行符号。
+// =====================================================================================================================
+
 #include "MassDebugger.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(MassDebugger)
@@ -27,10 +55,18 @@
 
 namespace UE::Mass::Debug
 {
+	// ===== 三个核心调试开关（CVar）的真实存储 =======================================
+	// 它们在 MassDebugger.h 中通过 extern 声明，定义在这里。
+	// 通过 FAutoConsoleVariableRef 注册到控制台后，可在 ~ 控制台动态切换。
+	// =================================================================================
 	bool bAllowProceduralDebuggedEntitySelection = false;
 	bool bAllowBreakOnDebuggedEntity = false;
 	bool bTestSelectedEntityAgainstProcessorQueries = true;
 
+	/**
+	 * 把上面三个 CVar 注册到控制台。ECVF_Cheat 标记表明这些是开发用变量，
+	 * Shipping 构建里默认不可在 GUI 控制台中显示（除非 Cheat 系统启用）。
+	 */
 	FAutoConsoleVariableRef CVars[] =
 	{
 		{ TEXT("mass.debug.AllowProceduralDebuggedEntitySelection"), bAllowProceduralDebuggedEntitySelection
@@ -43,6 +79,19 @@ namespace UE::Mass::Debug
 			, ECVF_Cheat }
 	};
 
+	/**
+	 * 【FNoDebuggerNotification —— "断点已设但 IDE 未挂载"提醒器】
+	 *
+	 * 用户用 mass.debug.SetFragmentBreakpoint 命令设了断点，结果触发时却没有 IDE attach——
+	 * UE_DEBUG_BREAK() 实际上会 abort（或被 SEH 吞掉）。本结构通过对比"上次和现在"的
+	 * IsDebuggerPresent() 状态，在检测到 attach→detach 边沿时弹一个对话框告知用户。
+	 *
+	 * 状态机：
+	 *   - bDebuggerPresent：上次轮询的 IDE 状态
+	 *   - bUserNotified：本次 detach 状态下是否已经弹过框（避免重复打扰）
+	 *   - 当 detach 边沿出现且未通知 → 弹框 + 标记 notified
+	 *   - 当 attach 重新出现 → 重置 notified（下次 detach 还会弹）
+	 */
 	struct FNoDebuggerNotification
 	{
 		static void ConditionallyNotifyUser()
@@ -72,6 +121,7 @@ namespace UE::Mass::Debug
 	bool FNoDebuggerNotification::bUserNotified = false;
 	
 
+	/** EMassFragmentAccess → 短串："--"/"RO"/"RW"。日志里以紧凑形式展示 fragment 访问权限。 */
 	FString DebugGetFragmentAccessString(EMassFragmentAccess Access)
 	{
 		switch (Access)
@@ -106,6 +156,10 @@ namespace UE::Mass::Debug
 	}
 
 	// First Id of a range of lightweight entity for which we want to activate debug information
+	// 【全局调试实体范围】这两个 int 是"被调试关注"的 entity index 范围；
+	// 由控制台命令 mass.debug.SetDebugEntityRange / DebugEntity / ResetDebugEntity 修改。
+	// 注意它们是 *namespace 全局变量*，不属于任何 EntityManager——
+	// 也就是说所有 EntityManager 共享同一组范围（这与 FEnvironment::SelectedEntity 不同）。
 	int32 DebugEntityBegin = INDEX_NONE;
 
 	// Last Id of a range of lightweight entity for which we want to activate debug information
@@ -117,6 +171,10 @@ namespace UE::Mass::Debug
 		DebugEntityEnd = InDebugEntityEnd;
 	}
 
+	/**
+	 * 控制台命令：mass.debug.SetDebugEntityRange <First> <Last>
+	 * 设定调试实体的索引范围。GameplayDebugger 等系统会用此范围过滤可视化。
+	 */
 	static FAutoConsoleCommand SetDebugEntityRangeCommand(
 		TEXT("mass.debug.SetDebugEntityRange"),
 		TEXT("Range of lightweight entity IDs that we want to debug.")
@@ -160,6 +218,7 @@ namespace UE::Mass::Debug
 		return DebugEntityBegin != INDEX_NONE && DebugEntityEnd != INDEX_NONE;
 	}
 
+	/** 是否调试范围只覆盖单个实体（Begin == End）。GameplayDebugger 用作"显示哪一只"。 */
 	bool IsDebuggingSingleEntity()
 	{
 		return DebugEntityBegin != INDEX_NONE && DebugEntityBegin == DebugEntityEnd;
@@ -172,6 +231,7 @@ namespace UE::Mass::Debug
 		return DebugEntityBegin != INDEX_NONE && DebugEntityEnd != INDEX_NONE && DebugEntityBegin <= DebugEntityEnd;
 	}
 	
+	/** 判断指定实体是否落入调试范围；可同时返回该实体的稳定调色板色（按 Index 取色）。 */
 	bool IsDebuggingEntity(FMassEntityHandle Entity, FColor* OutEntityColor)
 	{
 		const int32 EntityIdx = Entity.Index;
@@ -185,12 +245,20 @@ namespace UE::Mass::Debug
 		return bIsDebuggingEntity;
 	}
 
+	/** 按 Entity.Index 在 GColorList（全局可读色板）中取色——同 Index 永远同色，
+	 *  方便在轨迹图、画面叠加上跨帧追踪同一实体。 */
 	FColor GetEntityDebugColor(FMassEntityHandle Entity)
 	{
 		const int32 EntityIdx = Entity.Index;
 		return EntityIdx != INDEX_NONE ? GColorList.GetFColorByIndex(EntityIdx % GColorList.GetColorsNum()) : FColor::Black;
 	}
 
+	// ===== 控制台命令注册区块 =========================================================
+	// 下面这一大批 FAutoConsoleCommand* 静态对象在模块加载时把命令登记到全局命令系统。
+	// 模块卸载时静态对象析构会自动注销。
+	// =================================================================================
+
+	/** mass.PrintEntityFragments <Index> ：打印指定 entity 的所有 fragment 值。 */
 	FAutoConsoleCommandWithWorldArgsAndOutputDevice PrintEntityFragmentsCmd(
 		TEXT("mass.PrintEntityFragments"),
 		TEXT("Prints all fragment types and values (uproperties) for the specified Entity index"),
@@ -217,6 +285,8 @@ namespace UE::Mass::Debug
 			})
 	);
 
+	/** mass.LogArchetypes [bIncludeEmpty]：把所有 World 下的 archetype 描述打印出来。
+	 *  默认包含空 archetype；适合排查"为什么有这么多 archetype"。 */
 	FAutoConsoleCommandWithWorldArgsAndOutputDevice LogArchetypesCmd(
 		TEXT("mass.LogArchetypes"),
 		TEXT("Dumps description of archetypes to log. Optional parameter controls whether to include or exclude non-occupied archetypes. Defaults to 'include'."),
@@ -258,6 +328,9 @@ namespace UE::Mass::Debug
 	);
 
 	// @todo these console commands will be reparented to "massentities" domain once we rename and shuffle the modules around 
+	/** mass.RecacheQueries：强制让所有 EntityQuery 重新缓存自己关联的 archetype 列表。
+	 *  内部通过递增 ArchetypeDataVersion 让 query 下次执行时检测到变更并 recache。
+	 *  常用于诊断"我新加了 archetype 但 query 没识别"的问题。 */
 	FAutoConsoleCommandWithWorld RecacheQueries(
 		TEXT("mass.RecacheQueries"),
 		TEXT("Forces EntityQueries to recache their valid archetypes"),
@@ -271,6 +344,8 @@ namespace UE::Mass::Debug
 			}
 	));
 
+	/** mass.LogFragmentSizes：列出全局已注册的所有 FMass*Fragment 类型及其字节尺寸。
+	 *  用于排查"哪个 fragment 太大导致 chunk 容量过小"。 */
 	FAutoConsoleCommandWithWorldArgsAndOutputDevice LogFragmentSizes(
 		TEXT("mass.LogFragmentSizes"),
 		TEXT("Logs all the fragment types being used along with their sizes."),
@@ -286,6 +361,7 @@ namespace UE::Mass::Debug
 			})
 	);
 
+	/** mass.LogMemoryUsage：打印 MassEntitySubsystem 的总内存占用（含 archetype、chunk、命令缓冲等）。 */
 	FAutoConsoleCommandWithWorldArgsAndOutputDevice LogMemoryUsage(
 		TEXT("mass.LogMemoryUsage"),
 		TEXT("Logs how much memory the mass entity system uses"),
@@ -300,6 +376,8 @@ namespace UE::Mass::Debug
 				}
 			}));
 
+	/** mass.LogKnownFragments：打印全部已知 tag / fragment / shared fragment / chunk fragment
+	 *  及其在 BitSet 中的下标。下标对调试 BitSet 比较意义重大。 */
 	FAutoConsoleCommandWithOutputDevice LogFragments(
 		TEXT("mass.LogKnownFragments"),
 		TEXT("Logs all the known tags and fragments along with their \"index\" as stored via bitsets."),
@@ -329,6 +407,8 @@ namespace UE::Mass::Debug
 				PrintKnownTypes(FMassChunkFragmentBitSet::DebugGetAllStructTypes());
 			}));
 
+	/** mass.debug.DestroyEntity <ID>：通过 deferred 命令缓冲销毁指定实体——
+	 *  不立即销毁是因为 destroy 在很多代码路径上有约束，必须排队到安全点。 */
 	static FAutoConsoleCommandWithWorldAndArgs DestroyEntity(
 		TEXT("mass.debug.DestroyEntity"),
 		TEXT("ID of a Mass entity that we want to destroy.")
@@ -365,6 +445,8 @@ namespace UE::Mass::Debug
 		EntityManager.Defer().DestroyEntity(EntityToDestroy);
 	}));
 
+	/** mass.debug.DebugEntity <ID>：选定调试实体——等价于 GameplayDebugger 拾取。
+	 *  会同时设置 DebugEntityRange=[ID,ID] 并调 SelectEntity 走完整选定流程（广播委托）。 */
 	static FAutoConsoleCommandWithWorldAndArgs SetDebugEntity(
 		TEXT("mass.debug.DebugEntity"),
 		TEXT("ID of a Mass entity that we want to debug.")
@@ -398,6 +480,12 @@ namespace UE::Mass::Debug
 		}
 	));
 
+	/**
+	 * 按部分名查 fragment / shared fragment / const shared fragment 的 UScriptStruct。
+	 * 仅在 WITH_STRUCTUTILS_DEBUG 启用时工作（此宏依赖 StructUtils 模块的调试支持）。
+	 *
+	 * 注意：此函数 *不* 查 chunk fragment 和 tag。
+	 */
 	const UScriptStruct* FindElementTypeByName(const FString& PartialFragmentName)
 	{
 		const UScriptStruct* Result = nullptr;
@@ -415,6 +503,8 @@ namespace UE::Mass::Debug
 		return Result;
 	}
 
+	/** mass.debug.SetFragmentBreakpoint <Type1> [Type2 ...]：在 selected entity 上对
+	 *  指定的若干 fragment 类型设置写入断点。前提：先用 mass.debug.DebugEntity 选中实体。 */
 	static FAutoConsoleCommandWithWorldAndArgs SetFragmentBreakpoint(
 		TEXT("mass.debug.SetFragmentBreakpoint"),
 		TEXT("Enables fragment write break-point on an arbitrary number of fragment types, on the selected entity (see `mass.debug.DebugEntity`).")
@@ -457,6 +547,8 @@ namespace UE::Mass::Debug
 		}
 	));
 
+	/** mass.debug.ClearFragmentBreakpoint <Type1> [Type2 ...]：清除断点。
+	 *  特别注意：若当前没有 selected entity，则会清除所有实体上对该类型的断点。 */
 	static FAutoConsoleCommandWithWorldAndArgs ClearFragmentBreakpoint(
 		TEXT("mass.debug.ClearFragmentBreakpoint"),
 		TEXT("Clears fragment write break-point on an arbitrary number of fragment types, on the selected entity (see `mass.debug.DebugEntity`).")
@@ -502,6 +594,7 @@ namespace UE::Mass::Debug
 //----------------------------------------------------------------------//
 // FMassDebugger
 //----------------------------------------------------------------------//
+// 静态成员定义。委托/容器/锁全部为模块级 globals，由 ShutdownDebugger 显式清理。
 FMassDebugger::FOnBreakpointsChanged FMassDebugger::OnBreakpointsChangedDelegate;
 FMassDebugger::FOnEntitySelected FMassDebugger::OnEntitySelectedDelegate;
 
@@ -513,11 +606,16 @@ TArray<FMassDebugger::FEnvironment> FMassDebugger::ActiveEnvironments;
 UE::FTransactionallySafeMutex FMassDebugger::EntityManagerRegistrationLock;
 TMap<FName, const UScriptStruct*> FMassDebugger::FragmentsByName;
 
+// ===== Processor / Query 内省（friend 直接访问私有字段）==============================
+
+/** 直接读 Processor::OwnedQueries（private）——这是 friend 关系存在的核心理由。 */
 TConstArrayView<FMassEntityQuery*> FMassDebugger::GetProcessorQueries(const UMassProcessor& Processor)
 {
 	return Processor.OwnedQueries;
 }
 
+/** "上一秒新鲜版"的 query：返回前先调每个 query 的 CacheArchetypes 强制刷新缓存。
+ *  代价是 O(query 数 * archetype 数) 的匹配重算——只在 Debugger UI 主动拉取时才用。 */
 TConstArrayView<FMassEntityQuery*> FMassDebugger::GetUpToDateProcessorQueries(const FMassEntityManager& EntityManager, UMassProcessor& Processor)
 {
 	for (FMassEntityQuery* Query : Processor.OwnedQueries)
@@ -531,6 +629,7 @@ TConstArrayView<FMassEntityQuery*> FMassDebugger::GetUpToDateProcessorQueries(co
 	return Processor.OwnedQueries;
 }
 
+/** 把 Query 的私有需求字段一次性打包成只读视图（零拷贝）。 */
 UE::Mass::Debug::FQueryRequirementsView FMassDebugger::GetQueryRequirements(const FMassEntityQuery& Query)
 {
 	UE::Mass::Debug::FQueryRequirementsView View = { Query.FragmentRequirements, Query.ChunkFragmentRequirements, Query.ConstSharedFragmentRequirements, Query.SharedFragmentRequirements
@@ -545,6 +644,8 @@ void FMassDebugger::GetQueryExecutionRequirements(const FMassEntityQuery& Query,
 	Query.ExportRequirements(OutExecutionRequirements);
 }
 
+/** 列举能匹配 Query 的所有实体——通过 EntityManager.GetMatchingArchetypes 拿到 archetype 列表，
+ *  再把每个 archetype 内的实体收集起来。注意快照时刻的语义。 */
 TArray<FMassEntityHandle> FMassDebugger::GetEntitiesMatchingQuery(const FMassEntityManager& EntityManager, const FMassEntityQuery& Query)
 {
 	TArray<FMassEntityHandle> Entities;
@@ -557,6 +658,10 @@ TArray<FMassEntityHandle> FMassDebugger::GetEntitiesMatchingQuery(const FMassEnt
 	return Entities;
 }
 
+// ===== Archetype 内省 =================================================================
+
+/** 遍历 EntityManager 的 FragmentHashToArchetypeMap（同 fragment 集合可能产生多个 archetype），
+ *  对每个 archetype 调用回调。是大多数 archetype 全量遍历操作的基础。 */
 void FMassDebugger::ForEachArchetype(const FMassEntityManager& EntityManager, const UE::Mass::Debug::FArchetypeFunction& Function)
 {
 	for (auto& KVP : EntityManager.FragmentHashToArchetypeMap)
@@ -589,6 +694,8 @@ const FMassArchetypeCompositionDescriptor& FMassDebugger::GetArchetypeCompositio
 	return ArchetypeData.CompositionDescriptor;
 }
 
+/** 把 archetype 数据指针的整数地址作为 Trace ID。
+ *  注意：archetype 一旦创建就不会重新分配位置（SharedPtr 持有），所以这是稳定 ID。 */
 uint64 FMassDebugger::GetArchetypeTraceID(const FMassArchetypeData& ArchetypeData)
 {
 	return reinterpret_cast<uint64>(&ArchetypeData);
@@ -621,6 +728,14 @@ void FMassDebugger::EnumerateChunks(const FMassArchetypeData& Archetype, TFuncti
 	}
 }
 
+/**
+ * 【GetArchetypeEntityStats —— archetype 统计采集（核心算法）】
+ *
+ * 把 FArchetypeStats 各字段一次性填好。其中 WastedEntityMemory 的算法分两步：
+ *   1) DebugGetEntityMemoryNumbers 同时返回"已分配 chunk 总内存"和"被实体真正占用的内存"
+ *   2) 二者之差就是 chunk 尾部空槽的浪费量
+ * 这指标是判断 archetype 利用率（chunk 是否过度碎片化）的关键。
+ */
 void FMassDebugger::GetArchetypeEntityStats(const FMassArchetypeHandle& ArchetypeHandle, UE::Mass::Debug::FArchetypeStats& OutStats)
 {
 	const FMassArchetypeData& ArchetypeData = FMassArchetypeHelper::ArchetypeDataFromHandleChecked(ArchetypeHandle);
@@ -642,6 +757,7 @@ const TConstArrayView<FName> FMassDebugger::GetArchetypeDebugNames(const FMassAr
 	return ArchetypeData.GetDebugNames();
 }
 
+/** 收集某 archetype 内的所有实体（按 chunk 拼接）。供 Mass Debugger UI"显示该 archetype 内的实体列表"用。 */
 TArray<FMassEntityHandle> FMassDebugger::GetEntitiesOfArchetype(const FMassArchetypeHandle& ArchetypeHandle)
 {
 	TArray<FMassEntityHandle> EntitiesOfArchetype;
@@ -655,15 +771,21 @@ TArray<FMassEntityHandle> FMassDebugger::GetEntitiesOfArchetype(const FMassArche
 	return EntitiesOfArchetype;
 }
 
+// ===== Composite Processor 依赖图内省 ===============================================
+
+/** 拿到 composite processor 内已扁平化的依赖图（拓扑排序后的节点列表）。 */
 TConstArrayView<UMassCompositeProcessor::FDependencyNode> FMassDebugger::GetProcessingGraph(const UMassCompositeProcessor& GraphOwner)
 {
 	return GraphOwner.FlatProcessingGraph;
 }
 
+/** 拿到 composite processor 实际持有的子 processor 数组。 */
 TConstArrayView<TObjectPtr<UMassProcessor>> FMassDebugger::GetHostedProcessors(const UMassCompositeProcessor& GraphOwner)
 {
 	return GraphOwner.ChildPipeline.GetProcessors();
 }
+
+// ===== Requirement 字符串化 ==========================================================
 
 FString FMassDebugger::GetRequirementsDescription(const FMassFragmentRequirements& Requirements)
 {
@@ -696,6 +818,21 @@ FString FMassDebugger::GetArchetypeRequirementCompatibilityDescription(const FMa
 	return FMassDebugger::GetArchetypeRequirementCompatibilityDescription(Requirements, ArchetypeData.GetCompositionDescriptor());
 }
 	
+/**
+ * 【GetArchetypeRequirementCompatibilityDescription —— 失败原因诊断】
+ *
+ * 这是"为什么我的实体没被处理"问题的核心 API。
+ * 把 archetype 不满足 requirement 的具体原因生成多行字符串：
+ *   - 若有 negative requirement (None) 不满足：列出意外存在的 fragment/tag/...
+ *   - 若有 positive requirement (All/Any) 不满足：列出缺失的 fragment/tag/...
+ *   - 若只有 optional 但都没匹配：报告 none of optionals satisfied
+ * 全部条件均满足时返回 "Match"。
+ *
+ * 算法分两段：
+ *   段1 (negative)：始终检查（只要 HasNegativeRequirements）；
+ *   段2 (positive)：若 HasPositiveRequirements 则只检查硬性需求，
+ *        否则若 HasOptionalRequirements 则检查 optional——三段互斥。
+ */
 FString FMassDebugger::GetArchetypeRequirementCompatibilityDescription(const FMassFragmentRequirements& Requirements, const FMassArchetypeCompositionDescriptor& ArchetypeComposition)
 {
 	FStringOutputDevice OutDescription;
@@ -806,11 +943,14 @@ FString FMassDebugger::GetArchetypeRequirementCompatibilityDescription(const FMa
 	return OutDescription.Len() > 0 ? static_cast<FString>(OutDescription) : TEXT("Match");
 }
 
+/** 单条 requirement 的简短字符串（前缀 +/-/?）。 */
 FString FMassDebugger::GetSingleRequirementDescription(const FMassFragmentRequirementDescription& Requirement)
 {
 	return FString::Printf(TEXT("%s%s[%s]"), Requirement.IsOptional() ? TEXT("?") : (Requirement.Presence == EMassFragmentPresence::None ? TEXT("-") : TEXT("+"))
 		, *GetNameSafe(Requirement.StructType), *UE::Mass::Debug::DebugGetFragmentAccessString(Requirement.AccessMode));
 }
+
+// ===== 控制台命令实现：archetype 描述、entity 描述输出 ===============================
 
 void FMassDebugger::OutputArchetypeDescription(FOutputDevice& Ar, const FMassArchetypeHandle& ArchetypeHandle)
 {
@@ -856,6 +996,18 @@ void FMassDebugger::OutputEntityDescription(FOutputDevice& Ar, const FMassEntity
 	}
 }
 
+// ===== 实体选择/高亮 =================================================================
+
+/**
+ * 【SelectEntity】
+ * 1) 校验 EntityHandle 有效；
+ * 2) 设置全局 DebugEntityRange = [Index, Index]（影响 IsDebuggingEntity 等查询）；
+ * 3) 把 Environment 的 SelectedEntity 设为该实体；
+ * 4) 广播 OnEntitySelectedDelegate（Debugger UI、GameplayDebugger 等订阅者更新视图）。
+ *
+ * 注意：本函数对无效实体**静默返回**，不会清空选中状态。这与
+ * `mass.debug.DebugEntity` 命令的行为一致："找不到实体则保留之前的选择"。
+ */
 void FMassDebugger::SelectEntity(const FMassEntityManager& EntityManager, const FMassEntityHandle EntityHandle)
 {
 	if (EntityManager.IsEntityValid(EntityHandle))
@@ -873,6 +1025,13 @@ FMassEntityHandle FMassDebugger::GetSelectedEntity(const FMassEntityManager& Ent
 	return GetActiveEnvironmentChecked(EntityManager).SelectedEntity;
 }
 
+/**
+ * 【HighlightEntity】纯 UI 高亮——*不验证* EntityHandle 有效性，*不广播*事件，
+ * environment 缺失时**静默失败**（与 SelectEntity 用 Checked 版本不同）。
+ *
+ * 这种宽容设计允许调用方传入无效 handle 来"取消高亮"，且让外部 UI 工具
+ * 在 EntityManager 已下线的窗口期内调用不会崩。
+ */
 void FMassDebugger::HighlightEntity(const FMassEntityManager& EntityManager, const FMassEntityHandle EntityHandle)
 {
 	if (FEnvironment* ActiveEnvironment = GetActiveEnvironment(EntityManager))
@@ -890,11 +1049,20 @@ FMassEntityHandle FMassDebugger::GetHighlightedEntity(const FMassEntityManager& 
 	return FMassEntityHandle();
 }
 
+// ===== Environment 注册/反注册 =======================================================
+
 bool FMassDebugger::IsEntityManagerInitialized(const FMassEntityManager& EntityManager)
 {
 	return EntityManager.InitializationState == FMassEntityManager::EInitializationState::Initialized;
 }
 
+/**
+ * 【RegisterEntityManager】
+ * 由 FMassEntityManager 在初始化末尾调用——构造一个新 FEnvironment 并 emplace 进
+ * ActiveEnvironments，然后广播 OnEntityManagerInitialized 让 Debugger UI 增加该 manager。
+ *
+ * 锁的范围：仅保护 ActiveEnvironments.Emplace；广播在锁外做以避免长时间持锁。
+ */
 int32 FMassDebugger::RegisterEntityManager(FMassEntityManager& EntityManager)
 {
 	int32 NewEnvironmentIndex = INDEX_NONE;
@@ -906,6 +1074,14 @@ int32 FMassDebugger::RegisterEntityManager(FMassEntityManager& EntityManager)
 	return NewEnvironmentIndex;
 }
 
+/**
+ * 【UnregisterEntityManager】
+ * 双分支处理：
+ *   - 若 EntityManager 仍然 share-able（DoesSharedInstanceExist=true）：用 weak ptr 比对找到精确条目移除；
+ *   - 否则：weak ptr 已经失效，无法精确比对——只能"清扫所有失效条目"。
+ *
+ * 这种设计应对"EntityManager 被销毁但本函数还没来得及调用"的边界情形。
+ */
 void FMassDebugger::UnregisterEntityManager(FMassEntityManager& EntityManager)
 {
 	if (EntityManager.DoesSharedInstanceExist())
@@ -931,6 +1107,12 @@ void FMassDebugger::UnregisterEntityManager(FMassEntityManager& EntityManager)
 	OnEntityManagerDeinitialized.Broadcast(EntityManager);
 }
 
+/**
+ * 【RegisterProcessorDataProvider】
+ * 关联一个 processor 数据提供器到指定 EntityManager 的 environment。
+ * 若 environment 还不存在，会先调 RegisterEntityManager 创建（lazy initialize 语义）。
+ * 这种"用名字键覆盖式注册"允许同名 provider 反复注册，每次替换上一次。
+ */
 void FMassDebugger::RegisterProcessorDataProvider(FName ProviderName, const TSharedRef<FMassEntityManager>& EntityManager, const UE::Mass::Debug::FProcessorProviderFunction& ProviderFunction)
 {
 	int32 Index;
@@ -972,6 +1154,25 @@ bool FMassDebugger::DoesArchetypeMatchRequirements(const FMassArchetypeHandle& A
 	return false;
 }
 
+// ===== 断点相关 API ===================================================================
+
+/**
+ * 【ShouldProcessorBreak —— processor 执行断点的热路径查询】
+ *
+ * 三段式短路：
+ *   1) 全局快路径：FBreakpoint::HasBreakpoint() 检查整个进程是否有任何断点
+ *   2) Environment 级：ActiveEnvironment.bHasBreakpoint
+ *   3) Processor 级：ProcessorsWithBreakpoints.Contains(Processor)
+ * 三道门都通过后才线性扫描 Breakpoints 数组找具体匹配。
+ *
+ * 注意：返回的是首个**已启用**且通过 filter 的断点 handle；但 HitCount 对所有匹配
+ * 的断点（含禁用的）都会递增。
+ *
+ * 【疑似 bug 2】函数中 FoundHandle 的语义：在 for 循环中可能被多次赋值，最终只
+ * 返回最后一个匹配的 handle。如果调用方期望"任意一个 handle"则没问题，但若期望
+ * "首个匹配"则与代码不符——目前看代码用法 (MASS_BREAKPOINT 仅看 IsValid()) 也只
+ * 关心 truthiness，所以无实际影响。
+ */
 UE::Mass::Debug::FBreakpointHandle FMassDebugger::ShouldProcessorBreak(const FMassEntityManager& EntityManager, const UMassProcessor* Processor, FMassEntityHandle Entity)
 {
 	if (LIKELY(!UE::Mass::Debug::FBreakpoint::HasBreakpoint()))
@@ -1114,6 +1315,17 @@ UE::Mass::Debug::FBreakpoint& FMassDebugger::CreateBreakpoint(const FMassEntityM
 	return ActiveEnvironment.Breakpoints.Emplace_GetRef();
 }
 
+/**
+ * 【SetProcessorBreakpoint —— 注册 processor 执行断点】
+ *
+ * 步骤：
+ *   1) 提醒用户"如果没 IDE attach 这是无效的"（FNoDebuggerNotification）
+ *   2) 设全局/env 级 bHasBreakpoint=true
+ *   3) 创建一个 FBreakpoint，TriggerType=ProcessorExecute、Trigger=Processor
+ *   4) 若指定了 Entity，FilterType=SpecificEntity；否则 None（任意实体）
+ *   5) 把 Processor 加入加速集合 ProcessorsWithBreakpoints
+ *   6) 广播 OnBreakpointsChanged 让 Debugger UI 刷新
+ */
 void FMassDebugger::SetProcessorBreakpoint(const FMassEntityManager& EntityManager, TNotNull<const UMassProcessor*> Processor, FMassEntityHandle Entity)
 {
 	UE::Mass::Debug::FNoDebuggerNotification::ConditionallyNotifyUser();
@@ -1160,6 +1372,19 @@ void FMassDebugger::SetFragmentWriteBreakpoint(const FMassEntityManager& EntityM
 	OnBreakpointsChangedDelegate.Broadcast();
 }
 
+/**
+ * 【SetFragmentWriteBreakForSelectedEntity】
+ * 与 SetFragmentWriteBreakpoint 不同的是 FilterType=SelectedEntity——
+ * 触发时实时查询当前 selected entity，焦点切换则断点目标随之改变。
+ *
+ * 【疑似 bug 3】这里 `UE::Mass::Debug::FBreakpoint NewBreakpoint = ActiveEnvironment.Breakpoints.Emplace_GetRef();`
+ * 缺少了 `&` 引用——它把 emplace 出的元素 *复制* 到了局部变量，对该局部变量的修改
+ * 不会影响 vector 中真正的元素！结果应该是：触发器/filter 全部留在 default 状态，
+ * fragment 写入断点根本不会工作。其他类似函数（SetProcessorBreakpoint、
+ * SetFragmentWriteBreakpoint）都是 `auto& NewBreakpoint`，这里看起来是漏写 &。
+ * 注意：`FragmentsWithBreakpoints.Add(FragmentType)` 和 `bHasBreakpoint=true` 仍生效，
+ * 所以 ShouldBreakOnFragmentWrite 进入慢路径后会找不到匹配的 trigger，最终返回 Invalid。
+ */
 void FMassDebugger::SetFragmentWriteBreakForSelectedEntity(const FMassEntityManager& EntityManager, TNotNull<const UScriptStruct*> FragmentType)
 {
 	UE::Mass::Debug::FNoDebuggerNotification::ConditionallyNotifyUser();
@@ -1255,6 +1480,19 @@ void FMassDebugger::ClearFragmentWriteBreak(const FMassEntityManager& EntityMana
 	OnBreakpointsChangedDelegate.Broadcast();
 }
 
+/**
+ * 【ClearAllFragmentWriteBreak】
+ *
+ * 【疑似 bug 4】`Breakpoint.TriggerType == FBreakpoint::ETriggerType::ProcessorExecute`
+ * 看起来应当是 `FragmentWrite` 才对——本函数语义是"清除某 fragment 类型的所有写入断点"，
+ * 但代码却在比较 ProcessorExecute trigger，与函数名字面意义矛盾。
+ * 这可能导致：
+ *   a) 想清除的 fragment 写入断点没被清除；
+ *   b) 把 ProcessorExecute 类型的（碰巧 trigger 是 fragment 类型？这种组合本不存在）误删除。
+ * 实际由于不同 trigger 类型的 Trigger.Get<TObjectKey<...>>() 类型不同，
+ * 这里 Get<TObjectKey<UScriptStruct>>() 在 ProcessorExecute trigger 上会断言失败/未定义。
+ * 强烈建议核对原意修复。
+ */
 void FMassDebugger::ClearAllFragmentWriteBreak(const FMassEntityManager& EntityManager, const UScriptStruct* FragmentType)
 {
 	FEnvironment& ActiveEnvironment = GetActiveEnvironmentChecked(EntityManager);
@@ -1327,6 +1565,11 @@ void FMassDebugger::RemoveBreakpoint(UE::Mass::Debug::FBreakpointHandle Handle)
 	}
 }
 
+/**
+ * 【ShutdownDebugger】
+ * 模块卸载时调用——区别于 ClearAllBreakpoints：**不广播任何委托**，
+ * 因为销毁过程中订阅者可能已经失效。直接清空所有数据结构。
+ */
 void FMassDebugger::ShutdownDebugger()
 {
 	// Don't call ClearAllBreakpoints here because we don't want to send the BreakpointsChanged delegate
@@ -1339,6 +1582,15 @@ void FMassDebugger::ShutdownDebugger()
 	FragmentsByName.Empty();
 }
 
+/**
+ * 【GetFragmentTypeFromName —— 按名字反查 fragment UScriptStruct】
+ *
+ * 算法：先查缓存（FragmentsByName），未命中则全量扫描所有 environment 的所有 archetype，
+ * 把每个 archetype 的 composition 中所有 fragment / chunk fragment / shared / const shared
+ * 类型加入缓存。然后再查一次缓存。
+ *
+ * 注意：未涉及 tag 类型——故"按名字"无法找到 tag。这与 FindElementTypeByName 行为略有差异。
+ */
 const UScriptStruct* FMassDebugger::GetFragmentTypeFromName(FName FragmentName)
 {
 	const UScriptStruct** FoundType = FragmentsByName.Find(FragmentName);
@@ -1405,6 +1657,10 @@ const UScriptStruct* FMassDebugger::GetFragmentTypeFromName(FName FragmentName)
 	return nullptr;
 }
 
+// ===== Fragment 数据读取 =============================================================
+// 这组 API 给 Debugger UI 用：在外部窥探实体的 fragment 当前值（复制返回，不会污染原数据）。
+
+/** 重载1：内部分配 FStructOnScope 后调重载2。 */
 TSharedPtr<FStructOnScope> FMassDebugger::GetFragmentData(const FMassEntityManager& EntityManager, const UScriptStruct* FragmentType, FMassEntityHandle Entity)
 {
 	TSharedPtr<FStructOnScope> StructOnScope = MakeShared<FStructOnScope>(FragmentType);
@@ -1415,6 +1671,10 @@ TSharedPtr<FStructOnScope> FMassDebugger::GetFragmentData(const FMassEntityManag
 	return nullptr;
 }
 
+/**
+ * 重载2：取实体 archetype，从 chunk 中找到 fragment 内存指针，CopyScriptStruct 到 OutStructData。
+ * 关键点：返回的是**副本**——UI 编辑后需要其它机制写回（不是直接修改实体）。
+ */
 bool FMassDebugger::GetFragmentData(const FMassEntityManager& EntityManager, const UScriptStruct* FragmentType, FMassEntityHandle Entity, TSharedPtr<FStructOnScope>& OutStructData)
 {
 	if (!EntityManager.IsEntityValid(Entity))
@@ -1529,6 +1789,21 @@ bool FMassDebugger::GetConstSharedFragmentData(const FMassEntityManager& EntityM
 	return false;
 }
 
+/**
+ * 【RefreshBreakpoints —— 重建加速集合】
+ *
+ * 当外部代码直接修改了 Environment.Breakpoints 数组（增删/改 trigger）后调用，
+ * 让 ProcessorsWithBreakpoints / FragmentsWithBreakpoints 与 bHasBreakpoint 标志重新对齐。
+ *
+ * 算法：
+ *   1) 重置全局 bHasBreakpoint=false
+ *   2) 遍历每个 environment：
+ *      a) Reset 两个加速集合
+ *      b) 遍历 Breakpoints，按 Trigger 的 TVariant 类型决定加进哪个集合
+ *      c) 根据集合非空性更新 env.bHasBreakpoint
+ *   3) 把所有 env.bHasBreakpoint 或合到全局 bHasBreakpoint
+ *   4) 广播 OnBreakpointsChanged
+ */
 void FMassDebugger::RefreshBreakpoints()
 {
 	UE::Mass::Debug::FBreakpoint::bHasBreakpoint = false;
@@ -1585,6 +1860,14 @@ FMassDebugger::FEnvironment* FMassDebugger::GetActiveEnvironment(const FMassEnti
 	return &ActiveEnvironments[Index];
 }
 
+// ===== FEnvironment 实现 =============================================================
+
+/**
+ * 【FEnvironment 构造函数】
+ * 初始化 weak ptr。若启用了 Mass trace，注册"trace 启动时回调"——
+ * 当 Insights 开始 trace 时自动把现有 archetype 全部 emit 一次"创建事件"，
+ * 让 trace 时间轴拥有完整的初始状态快照（否则只有 trace 启动后新建的 archetype 会出现）。
+ */
 FMassDebugger::FEnvironment::FEnvironment(FMassEntityManager& InEntityManager)
 	: EntityManager(InEntityManager.AsWeak())
 	, MutableEntityManager(InEntityManager.AsWeak())
@@ -1603,6 +1886,7 @@ FMassDebugger::FEnvironment::FEnvironment(FMassEntityManager& InEntityManager)
 #endif
 }
 
+/** 析构：解绑 trace 委托。 */
 FMassDebugger::FEnvironment::~FEnvironment()
 {
 #if UE_MASS_TRACE_ENABLED
@@ -1615,6 +1899,10 @@ void FMassDebugger::FEnvironment::ClearBreakpoints()
 	ProcessorsWithBreakpoints.Reset();
 	FragmentsWithBreakpoints.Reset();
 	Breakpoints.Reset();
+	// 注意：直接把全局 bHasBreakpoint 置 false——但其他 environment 可能仍有断点！
+	// 调用方（FMassDebugger::ClearAllBreakpoints / ShutdownDebugger）需要确保所有 env 都清空才行。
+	// 单独对一个 env 调用此函数会错误地把全局标志关掉，影响其他 env。
+	// 这点设计上有点 fragile：详见 ARCHITECTURE.md 的潜在问题列表。
 	UE::Mass::Debug::FBreakpoint::bHasBreakpoint = false;
 }
 

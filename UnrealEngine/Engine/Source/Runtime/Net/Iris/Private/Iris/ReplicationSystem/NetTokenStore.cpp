@@ -1,5 +1,14 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================
+// NetTokenStore.cpp —— FNetTokenStore + FNetTokenDataStore 实现
+// -------------------------------------------------------------------------------------------------------------
+// 本文件包含三个层次：
+//   1) FNetTokenStoreState（内部实现类）：TokenInfoArray[TypeId][Index] -> KeyIndex 的二级数组；
+//   2) FNetTokenDataStore：基类的 GetTokenKey / CreateAndStoreTokenForKey / Read|WriteNetToken 实现；
+//   3) FNetTokenStore：注册表 + 比特流读写 + 条件性 export + 远端 Token 校验 + 替换为权威 Token。
+// =============================================================================================================
+
 #include "Iris/ReplicationSystem/NetTokenStore.h"
 #include "Iris/ReplicationSystem/ObjectReferenceCacheFwd.h"
 #include "Iris/Serialization/NetBitStreamReader.h"
@@ -24,12 +33,14 @@ public:
 	using FNetTokenStoreKey = FNetTokenDataStore::FNetTokenStoreKey;
 
 	// The size of the array is managed by FNetTokenDataStream
+	// 注：TokenInfoArray 的实际增长由 NetTokenDataStream 接收 export 数据时驱动 ReserveTokenCount。
 	FNetTokenStoreState()
 	{
 		Reset();
 	}
 
 	// Reserve space for tokens
+	// 接收侧：根据收到的 NetToken.GetIndex() 扩张数组到 (Index+1) 大小，并把空槽位填 0（=Invalid Key）。
 	bool ReserveTokenCount(uint32 TypeIndex, uint32 NewCount)
 	{
 		if ((TypeIndex >= FNetToken::MaxTypeIdCount) || (NewCount >= FNetToken::MaxNetTokenCount))
@@ -46,6 +57,7 @@ public:
 	void Reset()
 	{
 		// We reserve the first token for each type as an invalid token
+		// Index=0 始终为非法槽，方便 ReserveTokenCount + SetNumZeroed 用 0 表示"Invalid"。
 		for (TArray<FNetTokenStoreKey>& TokenInfos : TokenInfoArray)
 		{
 			TokenInfos.SetNum(1);
@@ -53,6 +65,7 @@ public:
 	}
 
 	// Map from NetTokenIndex -> NetTokenDataStoreKey (Index)
+	// 二维数组：第一维 = TypeId（5 bit，最多 32 个 DataStore），第二维 = NetToken 内部索引（22 bit）。
 	TArray<FNetTokenDataStore::FNetTokenStoreKey> TokenInfoArray[FNetToken::MaxTypeIdCount];
 };
 
@@ -61,6 +74,7 @@ FNetTokenDataStore::FNetTokenDataStore(FNetTokenStore& InTokenStore)
 , TypeId(FNetToken::InvalidTokenTypeId)
 {
 	// Reserve first index as invalid.
+	// 与 FNetTokenStoreState 一样，KeyIndex=0 也保留为非法值。
 	StoredTokens.Add(FNetToken());
 }
 
@@ -68,6 +82,8 @@ FNetTokenDataStore::~FNetTokenDataStore()
 {
 }
 
+// 通过 NetToken（含 Index 和 TypeId）+ TokenStoreState 反查到 DataStore 内部数组的 KeyIndex。
+// - 调用方需要保证 Token.GetTypeId() == 当前 DataStore 的 TypeId（不一致是程序员错误）。
 FNetTokenDataStore::FNetTokenStoreKey FNetTokenDataStore::GetTokenKey(FNetToken Token, const FNetTokenStoreState& TokenStoreState) const
 {
 	if (Token.GetTypeId() == GetTypeId())
@@ -84,6 +100,9 @@ FNetTokenDataStore::FNetTokenStoreKey FNetTokenDataStore::GetTokenKey(FNetToken 
 	}
 }
 
+// 为给定 KeyIndex 分配一个新的"本地 NetToken"：
+// - LocalNetTokenStoreState.TokenInfoArray[TypeId] 末尾追加 KeyIndex（=> 该 NetToken 的 Index = Num-1）；
+// - 把同一份 (KeyIndex, NetToken) 也写到 StoredTokens[KeyIndex]，便于下次 GetOrCreateToken 时直接复用 Token。
 FNetToken FNetTokenDataStore::CreateAndStoreTokenForKey(FNetTokenStoreKey Key)
 {
 	FNetTokenStoreState& LocalNetTokenStoreState = *TokenStore.GetLocalNetTokenStoreState();
@@ -118,6 +137,13 @@ FNetToken FNetTokenDataStore::GetNetTokenFromKey(FNetTokenStoreKey Key) const
 	return StoredTokens[Key.GetKeyIndex()];
 }
 
+// -----------------------------------------------------------------------------
+// 比特流编码格式（FNetSerializationContext 路径）：
+//   PackedUint32(Index)
+//   if (Index != Invalid)
+//     1 bit IsAssignedByAuthority
+//     [optional] 5 bit TypeId（仅当 bWriteTokenType=true）
+// -----------------------------------------------------------------------------
 FNetToken FNetTokenStore::InternalReadNetToken(UE::Net::FNetSerializationContext& Context, FNetToken::FTypeId TokenTypeId)
 {
 	FNetBitStreamReader* Reader = Context.GetBitStreamReader();
@@ -197,6 +223,7 @@ FNetToken FNetTokenStore::InternalReadNetToken(FArchive& Ar, FNetToken::FTypeId 
 }
 
 // Note: Be careful when modifying this methods to not affect replay compatibility.
+// 注意：修改本方法的比特流格式将破坏 replay 兼容性。
 void FNetTokenStore::InternalWriteNetToken(FArchive& Ar, FNetToken Token, bool bWriteTokenType)
 {
 	UE_NET_TRACE_DYNAMIC_NAME_SCOPE(*Token.ToString(), static_cast<FNetBitWriter&>(Ar), GetTraceCollector(static_cast<FNetBitWriter&>(Ar)), ENetTraceVerbosity::VeryVerbose);
@@ -249,11 +276,13 @@ FNetTokenStore::~FNetTokenStore()
 void FNetTokenStore::Init(FNetTokenStore::FInitParams& InParams)
 {
 	Params = InParams;
+	// 为每条连接预留一格 Remote 状态表（按 ConnectionId 索引）。
 	RemoteNetTokenStoreStates.SetNum(InParams.MaxConnections);
 }
 
 void FNetTokenStore::InitRemoteNetTokenStoreState(uint32 ConnectionId)
 {
+	// 新连接接入：清空已有状态表 / 创建新表，准备接收远端的 Token Export。
 	if (ensureMsgf((ConnectionId != InvalidConnectionId) && (ConnectionId < (uint32)RemoteNetTokenStoreStates.Num()), TEXT("Trying to init RemoteNetTokenStoreState for invalid connection %u"), ConnectionId))
 	{
 		if (FNetTokenStoreState* ExistingState = RemoteNetTokenStoreStates[ConnectionId].Get())
@@ -299,6 +328,7 @@ const FNetTokenDataStore* FNetTokenStore::GetDataStore(FName Name) const
 
 bool FNetTokenStore::RegisterDataStore(TUniquePtr<FNetTokenDataStore> DataStore, FName TokenStoreName)
 {
+	// 上限校验：FNetToken 的 TypeId 字段宽度决定最多能注册的 DataStore 数（5-bit => 32 种）。
 	if (TokenDataStores.Num() >= FNetToken::MaxTypeIdCount)
 	{
 		return false;
@@ -315,6 +345,8 @@ bool FNetTokenStore::RegisterDataStore(TUniquePtr<FNetTokenDataStore> DataStore,
 		return false;
 	}
 
+	// 必需配置：[/Script/IrisCore.NetTokenTypeIdConfig]+ReservedTypeIds=(StoreTypeName="...", TypeID=N)
+	// 否则 Token 的 TypeId 在不同进程间不稳定，会破坏跨端解码。
 	const UNetTokenTypeIdConfig* TypeIDConfig = GetDefault<UNetTokenTypeIdConfig>();
 	const uint32 TypeId = TypeIDConfig->GetTypeID(TokenStoreName);
 	DataStore->TypeId = TypeId;
@@ -330,6 +362,7 @@ bool FNetTokenStore::RegisterDataStore(TUniquePtr<FNetTokenDataStore> DataStore,
 		return false;
 	}
 
+	// 防止 ini 中两个 StoreTypeName 配成同一个 TypeID（会让运行时数据错乱）。
 	bool bLargeEnough = static_cast<uint32>(TokenDataStores.Num()) > DataStore->TypeId;
 	bool bSomethingAlreadyExists = bLargeEnough ? TokenDataStores[DataStore->TypeId].Value.IsValid() : false;
 	FName ExistingName = bLargeEnough ? TokenDataStores[DataStore->TypeId].Key : NAME_None;
@@ -340,6 +373,7 @@ bool FNetTokenStore::RegisterDataStore(TUniquePtr<FNetTokenDataStore> DataStore,
 	}
 
 	// Need to resize to
+	// 直接用 TypeId 作为下标存放，便于 O(1) 查询。
 	if (!bLargeEnough)
 	{
 		TokenDataStores.SetNum(DataStore->TypeId + 1);
@@ -369,6 +403,7 @@ bool FNetTokenStore::UnRegisterDataStore(FName TokenStoreName)
 	return false;
 }
 
+// 写入路径：根据 NetToken 的 TypeId 找到 DataStore，再通过 LocalNetTokenStoreState 反查到 KeyIndex，最后委托给 DataStore 写"具体值"。
 void FNetTokenStore::WriteTokenData(FNetSerializationContext& Context, const FNetToken NetToken) const
 {
 	if (NetToken.IsValid())
@@ -402,6 +437,10 @@ void FNetTokenStore::WriteTokenData(FArchive& Ar, const FNetToken NetToken, UPac
 	}
 }
 
+// 读取侧的核心校验：
+//   - 验证 RemoteNetTokenStoreState 中尚无该 NetTokenIndex 或已存的 KeyIndex 与新读到的一致；
+//   - 当对端发来"权威 Token"且本端不是 Authority 时，把本地 StoredTokens[KeyIndex] 替换为权威 Token，
+//     这样下次本地再 GetOrCreateToken 同一份数据，会直接拿到权威 Token，从而避免再次 export。
 bool FNetTokenStore::ValidateAndStoreNetTokenData(FNetTokenDataStore& DataStore, FNetTokenStoreState& RemoteNetTokenStoreState, const FNetToken NetToken, const FNetTokenStoreKey StoreKey)
 {
 	if (!StoreKey.IsValid() || !RemoteNetTokenStoreState.ReserveTokenCount(NetToken.GetTypeId(), NetToken.GetIndex() + 1))
@@ -490,6 +529,10 @@ void FNetTokenStore::ReadTokenData(FArchive& Ar, const FNetToken NetToken, FNetT
 	}
 }
 
+// 条件性写入：核心是"避免重复 export"。
+//   - 远端发来的 Token 不应再被本端 export → 直接写 false 跳过；
+//   - ExportContext 中已记录该 Token 已被 ACK → 写 false 跳过；
+//   - 否则写 true + Token Data，并把 Token 加入 "本批次已 export" 集合。
 void FNetTokenStore::ConditionalWriteNetTokenData(FNetSerializationContext& Context, Private::FNetExportContext* ExportContext, const FNetToken NetToken) const
 {
 	FNetBitStreamWriter* Writer = Context.GetBitStreamWriter();
@@ -516,6 +559,8 @@ void FNetTokenStore::ConditionalWriteNetTokenData(FNetSerializationContext& Cont
 	}
 }
 
+// 条件性读取：先读 1 bit；为 1 时调用 ReadTokenData 并写入 ResolveContext.RemoteNetTokenStoreState；
+// 为 0 时假设对端已 ACK 过同一 Token（或来自远端，已存在状态表中）。
 void FNetTokenStore::ConditionalReadNetTokenData(FNetSerializationContext& Context, const FNetToken NetToken)
 {
 	FNetBitStreamReader* Reader = Context.GetBitStreamReader();
@@ -534,6 +579,8 @@ void FNetTokenStore::ConditionalReadNetTokenData(FNetSerializationContext& Conte
 	}
 }
 
+// 把 Token 注入"本批次待 export"集合；真正 export 由 NetTokenDataStream::WriteData 负责。
+// 该方法被 TStructAsNetTokenNetSerializerImpl::Serialize 等大量调用。
 void FNetTokenStore::AppendExport(FNetSerializationContext& Context, FNetToken NetToken)
 {
 	using namespace UE::Net::Private;
@@ -545,6 +592,7 @@ void FNetTokenStore::AppendExport(FNetSerializationContext& Context, FNetToken N
 	}
 }
 
+// 调试/预导出：枚举本端所有已分配的 Token（用于 net.Iris.IrisPreExportExistingNetTokensOnConnect）。
 TArray<FNetToken> FNetTokenStore::GetAllNetTokens() const
 {
 	TArray<FNetToken> Result;
@@ -565,6 +613,9 @@ TArray<FNetToken> FNetTokenStore::GetAllNetTokens() const
 
 }
 
+// -----------------------------------------------------------------------------
+// UNetTokenTypeIdConfig：Engine.ini → 运行时 TypeID 反查
+// -----------------------------------------------------------------------------
 uint32 UNetTokenTypeIdConfig::GetTypeID(const FString& TypeName) const
 {
 	// Need to reevaluate every retrieval in the event of hotfixes, or ini changes due to GFP loading/unloading.

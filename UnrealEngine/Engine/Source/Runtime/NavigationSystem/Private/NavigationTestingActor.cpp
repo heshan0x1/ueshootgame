@@ -1,5 +1,19 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavigationTestingActor.cpp
+// -----------------------------------------------------------------------------
+// 参见 NavigationTestingActor.h 顶端说明。本文件实现：
+//   - FNavTestTickHelper：编辑器 Tick 钩子（驱动 ShowStepIndex 动画 + 查询刷新）
+//   - ANavigationTestingActor：
+//       * 构造：Capsule + EdRenderComp + InvokerComponent
+//       * UpdateNavData：按 NavAgentProps 从 NavigationSystem 挑一份 NavData
+//       * UpdatePathfinding：跑 FindPath，填统计字段 + LastPath
+//       * UpdateLocalQueries / UpdateTargetActorQueries：其它调试查询
+//       * PostEditChangeProperty / PostEditMove：触发刷新
+// 注意：本 Actor 是 bIsEditorOnlyActor = true，打包发布不会进入游戏世界。
+// =============================================================================
+
 #include "NavigationTestingActor.h"
 #include "NavigationSystem.h"
 #include "Engine/CollisionProfile.h"
@@ -16,6 +30,7 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(NavigationTestingActor)
 
+// FNavTestTickHelper::Tick —— 编辑器 Tick 钩子，把控制权转交 Owner->TickMe()
 void FNavTestTickHelper::Tick(float DeltaTime)
 {
 #if WITH_EDITOR
@@ -31,6 +46,8 @@ TStatId FNavTestTickHelper::GetStatId() const
 	RETURN_QUICK_DECLARE_CYCLE_STAT(FNavTestTickHelper, STATGROUP_Tickables);
 }
 
+// 构造：默认代理 34x144（玩家尺寸），QueryingExtent 采用全局默认；
+// 禁用 Capsule 导航相关（本 Actor 自己不参与导航生成，只是调试工具）。
 ANavigationTestingActor::ANavigationTestingActor(const FObjectInitializer& ObjectInitializer) : Super(ObjectInitializer)
 {
 #if WITH_EDITORONLY_DATA
@@ -329,6 +346,8 @@ FVector ANavigationTestingActor::GetNavAgentLocation() const
 	return GetActorLocation(); 
 }
 
+// 根据 NavAgentProps 选一份 NavData。只在 MyNavData 还未设时才查找——
+// 后续若 Agent 参数变化会在 PostEditChangeProperty 里手动把 MyNavData 置空再查。
 void ANavigationTestingActor::UpdateNavData()
 {
 	if (!MyNavData && GetWorld() && GetWorld()->GetNavigationSystem())
@@ -341,6 +360,12 @@ void ANavigationTestingActor::UpdateNavData()
 	}
 }
 
+// 重跑一次寻路，同时清空统计。
+// 逻辑：
+//   - 只由 "bSearchStart 的 Actor" 或其搭档发起（避免两端都跑浪费）
+//   - 若 OtherActor 未设置，会尝试在关卡里找一个合适的配对
+//   - 命中 SearchPathTo 走 FindPathSync；编辑器下还会额外调 RecastNavMesh::DebugPathfinding
+//     收集每步数据供 NavTestRenderingComponent 绘制
 void ANavigationTestingActor::UpdatePathfinding()
 {
 	PathfindingTime = 0.0f;
@@ -525,6 +550,14 @@ void ANavigationTestingActor::OnQueryTargetActorTransformUpdated(USceneComponent
 	UpdateTargetActorQueries();
 }
 
+// 主寻路函数：
+//   1) BuildPathFindingQuery 构造 FPathFindingQuery
+//   2) 根据 bBacktracking 复制过滤器并设置反向模式
+//   3) 根据 Filter.HeuristicScale + CostLimitFactor + MinimumCostLimit 算 Query.CostLimit
+//   4) NavSys->FindPathSync 同步查路径
+//   5) 填统计字段 + 给 LastPath 挂 PathObserver（用于接路径失效事件）
+//   6) 编辑器下若开 bGatherDetailedInfo，再调 DebugPathfinding 采集 A* 步骤
+// 线程：仅 GameThread（编辑器）
 void ANavigationTestingActor::SearchPathTo(ANavigationTestingActor* Goal)
 {
 #if WITH_EDITORONLY_DATA
@@ -606,6 +639,7 @@ void ANavigationTestingActor::SearchPathTo(ANavigationTestingActor* Goal)
 #endif
 }
 
+// 路径事件回调：只关心"本 Actor 当前 LastPath 被失效"的情况，失效则重跑寻路。
 void ANavigationTestingActor::OnPathEvent(FNavigationPath* InvalidatedPath, ENavPathEvent::Type Event)
 {
 	if (InvalidatedPath == NULL || InvalidatedPath != LastPath.Get())
@@ -630,6 +664,7 @@ void ANavigationTestingActor::OnPathEvent(FNavigationPath* InvalidatedPath, ENav
 	}
 }
 
+// 构造标准 FPathFindingQuery（可被子类重写以加 goal evaluator / 自定义 filter）
 FPathFindingQuery ANavigationTestingActor::BuildPathFindingQuery(const ANavigationTestingActor* Goal) const
 {
 	check(Goal);

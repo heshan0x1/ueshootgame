@@ -1,5 +1,24 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================================
+// 文件作用 (中文说明)
+//   FObjectReferenceCache 的实现, 是 Iris 复制系统中“UObject <-> 网络引用”的核心翻译层。
+//   职责对照旧框架 (NetGUIDCache + ClientPackageMap) 的取代:
+//     1) 在服务端把 UObject 映射成 FNetRefHandle (动态对象 = 自增 ID, 静态对象 = 路径 NetToken)。
+//     2) 在客户端按导出 (export) 顺序登记 RefHandle -> 元数据, 并在需要时
+//        Find / 异步 Load 真实 UObject (StartAsyncLoadingPackage / AsyncPackageCallback)。
+//     3) 维护跨连接的导出状态(NetExportContext): 防止重复发送同一引用的完整路径。
+//     4) PIE 重映射: 当 GetPlayInEditorID() != -1 时, 走 RemapPathForPIE 修正路径。
+//     5) Pending batch + GC 防护: 异步加载等待期间, 把已解析对象登记到 QueuedBatchObjectReferences,
+//        防止其在加载过程中被 GC 回收。
+//
+//   关键 CVar:
+//     - net.iris.AllowAsyncLoading                     : Iris 是否允许异步加载(还需 net.AllowAsyncLoading)
+//     - net.Iris.AsyncLoading.ForceEnable              : 调试: 强制启用异步加载
+//     - net.Iris.AsyncLoading.FailNextLoad/FailAllLoads/FailPackageName: 调试模拟加载失败
+//     - net.iris.ObjectReferenceCache.EnableRemoveReferenceFallbackPath: 控制 RemoveReference 的慢速回退路径
+// =====================================================================================================
+
 #include "ObjectReferenceCache.h"
 
 #include "HAL/IConsoleManager.h"
@@ -109,6 +128,7 @@ void FObjectReferenceCache::FPendingAsyncLoadRequest::Merge(FNetRefHandle InNetR
  * Don't allow infinite recursion of InternalLoadObject - an attacker could
  * send malicious packets that cause a stack overflow on the server.
  */
+// 防御构造攻击: 限制 ReadFullReferenceInternal 的递归深度 (outer chain 长度)
 static const int INTERNAL_READ_REF_RECURSION_LIMIT = 16;
 
 FObjectReferenceCache::FObjectReferenceCache()
@@ -157,12 +177,14 @@ bool FObjectReferenceCache::IsDynamicObject(const UObject* Object) const
 	checkSlow(Object != nullptr);
 	checkSlow(Object->IsSupportedForNetworking());
 
+	// 任何不是“稳定网络名”的对象都视为动态对象 (运行时 spawn, 必须由服务端分配 ID 后客户端才能识别)
 	// Any non net addressable object is dynamic
 	return IsDynamicInternal(Object);
 }
 
 bool FObjectReferenceCache::IsDynamicInternal(const UObject* Object) const
 {
+	// 等价: !IsFullNameStableForNetworking() => 动态
 	// Any non net addressable object is dynamic
 	return !Object->IsFullNameStableForNetworking();
 }
@@ -174,6 +196,8 @@ bool FObjectReferenceCache::IsAuthority() const
 
 bool FObjectReferenceCache::CanClientLoadObjectInternal(const UObject* Object, bool bIsDynamic) const
 {
+	// 客户端不允许 Load 关卡 (level/sublevel), 必须等 GameMode/Streaming 把 level 加载完毕,
+	// 那些引用会在 level 加载完成后随之 “级联可用”。
 	// PackageMapClient can't load maps, we must wait for the client to load the map when ready
 	// These references are special references, where the reference and all child references resolve once the map has been loaded
 	if (bIsDynamic)
@@ -187,6 +211,7 @@ bool FObjectReferenceCache::CanClientLoadObjectInternal(const UObject* Object, b
 	}
 
 #if WITH_EDITOR
+	// 编辑器: 处理 OFPA(One-File-Per-Actor) 等使用外部包的对象, 仍以最外层对象的包是否含 map 为准
 	// For objects using external package, we need to do the test on the package of their outer most object
 	// (this is currently only possible in Editor)
 	UObject* OutermostObject = Object->GetOutermostObject();
@@ -246,6 +271,8 @@ bool FObjectReferenceCache::ShouldIgnoreWhenMissing(FNetRefHandle RefHandle) con
 
 bool FObjectReferenceCache::RenamePathForPie(uint32 ConnectionId, FString& Str, bool bReading)
 {
+	// 仅在 PIE 中(GetPlayInEditorID() != -1) 才进入 Bridge 的 PIE 路径修正逻辑;
+	// Bridge 内部会根据连接所在 PIE 实例的 ID 把 PIE 前缀替换成对端可识别的形式。
 	return UE::GetPlayInEditorID() != -1 ? ReplicationBridge->RemapPathForPIE(ConnectionId, Str, bReading) : false;
 }
 
@@ -282,6 +309,14 @@ FNetRefHandle FObjectReferenceCache::PreRegisterObjectReferenceHandle(const UObj
 
 bool FObjectReferenceCache::CreateObjectReferenceInternal(const UObject* Object, FNetObjectReference& OutReference)
 {
+	// 整体流程:
+	//   1. 校验对象有效, 命中缓存且 weak ptr 一致 -> 直接复用
+	//   2. 缓存条目存在但 weak ptr 不一致 -> 说明对象被复用 (相同地址不同实例), 清理脏条目
+	//   3. PIE 实例 ID 校验 (避免跨 PIE 实例的引用)
+	//   4. 不是 “FullNameStable 或 SupportedForNetworking” -> 不可复制
+	//   5. 客户端: 通过 outer 链 + 相对路径表达, 不分配新 RefHandle
+	//   6. 服务端: AllocateNetRefHandle, 注册到 ObjectToNetReferenceHandle / ReferenceHandleToCachedReference
+
 	if (!IsValid(Object))
 	{
 		return false;
@@ -345,6 +380,8 @@ bool FObjectReferenceCache::CreateObjectReferenceInternal(const UObject* Object,
 	}
 
 #if WITH_EDITOR
+	// 跨 PIE 实例校验: 一个 ReplicationSystem 只能服务于自己所在的 PIE 实例; 若试图复制属于
+	// 其它 PIE 世界的对象, 直接拒绝(否则在另一 PIE 客户端会解析到错误的对象)。
 	const UPackage* ObjectPackage = Object->GetPackage();
 	if (ObjectPackage->HasAnyPackageFlags(PKG_PlayInEditor))
 	{
@@ -370,9 +407,12 @@ bool FObjectReferenceCache::CreateObjectReferenceInternal(const UObject* Object,
 		return false;
 	}
 
+	// 我们目前不支持客户端向服务端创建新的 RefHandle, 因此使用基于路径的引用(client-assigned reference)
 	// We currently do not support creating new references from client to server so we currently using a path based reference
 	if (!IsAuthority())
 	{
+		// 沿 outer 链向上找最近的 “已被复制” 的祖先对象, 把目标对象表达为
+		// (祖先 RefHandle, 目标相对祖先的路径 NetToken)
 		// Find known outer if there is one, and express reference as a relative path to the outer
 		for (const UObject* Outer = Object; Outer != nullptr; Outer = Outer->GetOuter())
 		{
@@ -388,6 +428,7 @@ bool FObjectReferenceCache::CreateObjectReferenceInternal(const UObject* Object,
 			}
 		}
 
+		// 找不到已复制的祖先, 但对象是静态的 -> 退化使用绝对路径
 		// For static objects we can always fall back on the full pathname
 		if (bIsStatic)
 		{
@@ -400,10 +441,12 @@ bool FObjectReferenceCache::CreateObjectReferenceInternal(const UObject* Object,
 			return true;
 		}
 
+		// 动态对象但又找不到已复制 outer, 客户端不可表达 -> 失败返回
 		// If the object is dynamic and we did not find an outer handle there's nothing we can do
 		return false;
 	}
 
+	// 服务端路径: 分配新的 NetRefHandle (静态/动态由 IsStatic 标志决定)
 	// Generate a new RefHandle
 	FNetRefHandle NetRefHandle = NetRefHandleManager->AllocateNetRefHandle(bIsStatic);
 	check(NetRefHandle.IsValid());
@@ -763,6 +806,17 @@ bool FObjectReferenceCache::IsNetRefHandlePending(FNetRefHandle NetRefHandle, co
 }
 
 // $IRIS: $TODO: Most of the logic comes from GUIDCache::GetObjectFromNetGUID so we want to keep this in sync
+//
+// 解析单个 NetRefHandle 到真实 UObject 的核心实现 (中文流程):
+//   1) 命中缓存且 weak ptr 有效 -> 直接返回
+//   2) bIsBroken / bIsPending -> 返回 nullptr (上层会择机重试或丢弃)
+//   3) 没有 RelativePath 但 RefHandle 是动态的 -> 客户端尚未收到 spawn 数据, 等待
+//   4) 递归解析 outer (失败则当前 Resolve 整体失败)
+//   5) 在 outer 内 FindObjectFast(); 找不到且允许 Load 时:
+//        - bIsPackage + ShouldAsyncLoad => StartAsyncLoadingPackage (异步)
+//        - 否则 => StaticLoadObject / LoadPackage (同步阻塞)
+//   6) 处理 “level streaming 同名包重新加载” 导致的 RefHandle 冲突: 默认采用 Id 较大的为活跃映射
+//   7) 写回 ObjectToNetReferenceHandle, 同步 QueuedBatchObjectReferences 中的对象指针
 UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHandle RefHandle, const FNetObjectResolveContext& ResolveContext, bool& bOutMustBeMapped)
 {
 	FCachedNetObjectReference* CacheObjectPtr = ReferenceHandleToCachedReference.Find(RefHandle);
@@ -825,6 +879,7 @@ UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHand
 		return nullptr;
 	}
 
+	// 先解析 outer: path 必须依赖 outer 完全加载
 	// First, resolve the outer
 	UObject* ObjOuter = nullptr;
 
@@ -875,11 +930,13 @@ UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHand
 	const TCHAR* ResolvedToken = StringTokenStore->ResolveRemoteToken(CacheObjectPtr->RelativePath, *ResolveContext.RemoteNetTokenStoreState);
 	if (ResolvedToken == nullptr)
 	{
+		// 远端 NetTokenStore 还没收到该 token 的字符串, 等待下一次推送
 		return nullptr;
 	}
 
 	FString ObjectPath(ResolvedToken);
 	constexpr bool bReading = true;
+	// PIE 重映射: 把对端写入时使用的 PIE prefix 修正为本端可识别的 PIE 前缀
 	RenamePathForPie(ResolveContext.ConnectionId, ObjectPath, bReading);
 
 #if WITH_EDITOR
@@ -911,6 +968,11 @@ UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHand
 
 		if (bIsPackage)
 		{
+			// 当前缓存表示一个 UPackage; 异步加载启动条件:
+			//   1) 真的就是一个包 (bIsPackage == true)
+			//   2) 当前还没在 PendingAsyncLoadRequests 中等待
+			//   3) ShouldAsyncLoad() 允许异步加载, 且没有 bForceSyncLoad
+			//   4) bNoLoad 为 false (level 类对象不允许由 client load)
 			// Async load the package if:
 			//	1. We are actually a package
 			//	2. We aren't already pending
@@ -943,6 +1005,7 @@ UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHand
 		}
 		else
 		{
+			// 不是包但找不到对象: 可能是包加载完毕但里面的子对象被 GC, 走一次阻塞 Load 兜底。
 			// If we have a package, but for some reason didn't find the object then do a blocking load as a last attempt
 			// This can happen for a few reasons:
 			//	1. The object was GC'd, but the package wasn't, so we need to reload
@@ -1075,6 +1138,10 @@ UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHand
 	// Promote to full handle
 	FNetRefHandle CompleteRefHandle = FNetRefHandleManager::MakeNetRefHandle(RefHandle.GetId(), ReplicationSystem->GetId());
 
+	// 处理 Level Streaming 的同名包重新加载导致的 RefHandle 冲突:
+	// 一个对象可能同时与多个 path-based RefHandle 关联(因为流式 streaming-out/in 之后
+	// weak ptr 失效, 服务端会再次分配新的 RefHandle, 客户端就会同时看到两个引用同一对象)。
+	// 策略: 让“ID 较大”的(也就是更晚分配的)那条作为 ObjectToNetReferenceHandle 的活跃映射。
 	// If we already have an existing handle associated with this object, we need do do a few additional checks.
 	// Due to level streaming (streaming in and out the same level) we might have multiple path based references 
 	// to the same object which might potentially might resolve to the same object due to how streaming works
@@ -1131,6 +1198,9 @@ UObject* FObjectReferenceCache::ResolveObjectReferenceHandleInternal(FNetRefHand
 
 ENetObjectReferenceResolveResult FObjectReferenceCache::ResolveObjectReference(const FNetObjectReference& Reference, const FNetObjectResolveContext& ResolveContext, UObject*& OutResolvedObject)
 {
+	// FNetObjectReference 有两种形态:
+	//   A) PathToken 有效  -> 客户端 -> 服务端 的引用 (path-only 或 outer + relative path)
+	//   B) PathToken 无效  -> 服务端 -> 客户端 的常规引用, 直接走 RefHandle 路径
 	UObject* ResolvedObject = nullptr;
 	bool bMustBeMapped = false;
 	
@@ -1293,6 +1363,12 @@ FNetObjectReference FObjectReferenceCache::GetOrCreateObjectReference(const FStr
 
 void FObjectReferenceCache::WriteFullReferenceInternal(FNetSerializationContext& Context, const FNetObjectReference& Ref) const
 {
+	// 写入“完整”引用 (含 outer 链 + path token)。流程:
+	//   1) 找缓存条目 (找不到 / RefHandle 无效 -> 写入 Invalid 哨兵)
+	//   2) 写 RefHandle
+	//   3) 决定是否需要导出: 服务端 + 有路径 + 当前连接尚未导出过该 Handle
+	//   4) 若导出: 写 bNoLoad、写 path token (含 token data, 必要时同时写出字符串)、递归写 outer 引用
+	//   5) 把 RefHandle 加入 ExportContext->Exported 集合, 后续 batch 不再重复写完整路径
 	FNetBitStreamWriter* Writer = Context.GetBitStreamWriter();
 	const FNetRefHandle RefHandle = Ref.GetRefHandle();
 
@@ -1343,6 +1419,8 @@ void FObjectReferenceCache::WriteFullReferenceInternal(FNetSerializationContext&
 
 void FObjectReferenceCache::ReadFullReferenceInternal(FNetSerializationContext& Context, FNetObjectReference& OutObjectRef, uint32 RecursionCount)
 {
+	// 与 WriteFullReferenceInternal 镜像。
+	// RecursionCount 上限 INTERNAL_READ_REF_RECURSION_LIMIT (16) 防止恶意构造的深 outer 链导致栈溢出。
 	FNetBitStreamReader* Reader = Context.GetBitStreamReader();
 
 	if (RecursionCount > INTERNAL_READ_REF_RECURSION_LIMIT) 
@@ -1700,6 +1778,11 @@ void FObjectReferenceCache::AddPendingExports(FNetSerializationContext& Context,
 
 FObjectReferenceCache::EWriteExportsResult FObjectReferenceCache::WritePendingExports(FNetSerializationContext& Context, FInternalNetRefIndex ObjectIndex)
 {	
+	// 在写入一个 batch 时调用, 把如下内容追加到当前 batch 头部:
+	//   1) 本次 batch 中新增的 NetToken 导出 (字符串映射)
+	//   2) 本次 batch 中新增的 NetObjectReference 完整导出 (含 path/outer 链)
+	//   3) 本次 batch 的 must-be-mapped exports (可异步加载 + 优先级)
+	// 写完后清空 pending list; 若发生溢出返回 BitStreamOverflow, 调用方需回滚整个 batch。
 	FNetBitStreamWriter& Writer = *Context.GetBitStreamWriter();
 
 	FNetExportContext* ExportContext = Context.GetExportContext();
@@ -1791,6 +1874,10 @@ FObjectReferenceCache::EWriteExportsResult FObjectReferenceCache::WritePendingEx
 
 bool FObjectReferenceCache::ReadExports(const FNetRefHandle& NetObjectHandle, FNetSerializationContext& Context, TArray<FNetRefHandle>* MustBeMappedExports, EIrisAsyncLoadingPriority& OutIrisAsyncLoadingPriority)
 {
+	// 与 WritePendingExports 对应的接收端入口。三段顺序读取:
+	//   1) NetToken exports: 把对端写出的 token <-> 字符串映射注册到本端 NetTokenStore
+	//   2) NetObjectReference exports: 调 ReadFullReference 把 RefHandle 元数据登记到缓存
+	//   3) MustBeMapped 列表: 返回给上层(NetPendingBatches)用以决定是否暂缓 batch 应用
 	if (!MustBeMappedExports)
 	{
 		Context.SetError(GNetError_InvalidValue);
@@ -2033,6 +2120,9 @@ void FObjectReferenceCache::GenerateFullPath_r(FNetRefHandle RefHandle, const FN
 
 void FObjectReferenceCache::ValidateAsyncLoadingPackage(FCachedNetObjectReference& CacheObject, FName PackagePath, const FNetRefHandle RefHandle)
 {
+	// 同名包已经在异步加载中: 把当前 RefHandle 合并到现有请求, 等同一个回调处理。
+	// 在 replay fast-forward 时常见: 之前 NetRefHandle A 引用了某包正在加载中, 由于 weak ptr 失效
+	// 服务端又发来一个新的 NetRefHandle B 指向同一个包, 这里通过 Merge 让两者复用同一加载结果。
 	// With level streaming support we may end up trying to load the same package with a different
 	// RefHandle during replay fast-forwarding. This is because if a package was unloaded, and later
 	// re-loaded, it will likely be assigned a new RefHandle (since the TWeakObjectPtr to the old package
@@ -2062,6 +2152,12 @@ void FObjectReferenceCache::ValidateAsyncLoadingPackage(FCachedNetObjectReferenc
 
 void FObjectReferenceCache::StartAsyncLoadingPackage(FCachedNetObjectReference& CacheObject, FName PackagePath, TAsyncLoadPriority AsyncLoadingPriority, const FNetRefHandle RefHandle, const bool bWasAlreadyAsyncLoading)
 {
+	// 启动一次新的异步包加载:
+	//   - AsyncLoadingPriority 必须由上层(从 must-be-mapped exports 中读取)设置,
+	//     否则 ensure 触发并退化到默认优先级(以避免直接传入 INDEX_NONE)。
+	//   - 把 PackagePath 与 (RefHandle + 起始时间戳) 加入 PendingAsyncLoadRequests; 同包的多个
+	//     RefHandle 会合并到同一请求, 完成回调时统一刷新所有相关条目的 bIsPending = false。
+	//   - 调试 CVar (FailNextLoad/FailAllLoads/FailPackageName) 命中时直接走失败回调。
 	LLM_SCOPE_BYTAG(Iris);
 
 	const bool bIsPrioritySet = AsyncLoadingPriority != INDEX_NONE;
@@ -2118,6 +2214,15 @@ void FObjectReferenceCache::StartAsyncLoadingPackage(FCachedNetObjectReference& 
 
 void FObjectReferenceCache::AsyncPackageCallback(const FName& PackageName, UPackage* Package, EAsyncLoadingResult::Type Result)
 {
+	// 异步包加载完成回调 (LoadPackageAsync 的 delegate 触发)。
+	// 注意: 此时位于引擎主线程的 Tick 中, 但调用时机不一定与 Iris 自身的 ApplyState 同步,
+	//       未来可能改为入队后在安全位置统一处理。
+	// 流程:
+	//   1) 在 PendingAsyncLoadRequests 中找到对应 PackageName 的请求
+	//   2) 对该请求里所有合并过的 RefHandle 把 bIsPending 清掉
+	//   3) Package == nullptr -> 加载失败, 把 RefHandle 标记 bIsBroken
+	//   4) 对已绑定到对象的 RefHandle 调用 UpdateTrackedQueuedBatchObjectReference 解锁等待 batch
+	//   5) 移除请求条目
 	// $TODO: $IRIS
 	// We probably want to deffer this to a safe time to process, we do not want any callbacks when we do not expect them
 	// Probably want to put this in a queue that we can guard to be processed when we are ready.
@@ -2236,6 +2341,10 @@ void FObjectReferenceCache::SetAsyncLoadMode(const EAsyncLoadMode NewMode)
 
 bool FObjectReferenceCache::ShouldAsyncLoad() const
 {
+	// 综合判断是否进入异步加载分支。优先级:
+	//   1) 调试 CVar net.Iris.AsyncLoading.ForceEnable: 直接 true
+	//   2) net.iris.AllowAsyncLoading 为 false: 直接 false
+	//   3) 否则按 AsyncLoadMode (UseCVar/ForceEnable/ForceDisable) 决定
 #if UE_NET_ASYNCLOADING_DEBUG
 	if (bForceAsyncLoading)
 	{
@@ -2258,6 +2367,9 @@ bool FObjectReferenceCache::ShouldAsyncLoad() const
 }
 void FObjectReferenceCache::AddReferencedObjects(FReferenceCollector& ReferenceCollector)
 {
+	// GC 防护: 在异步加载等待期间, 已经解析出来的对象有可能没有别处引用 (尤其是 NetSerializer 通过
+	// FQueuedBatchObjectReference 临时持有的). 在 GC 阶段把它们登记为根, 防止被回收。
+	// AddReferencedObject 会在对象被标记 PendingKill 时帮我们置 nullptr, 这里再补一条 Warning。
 	for (auto& It : QueuedBatchObjectReferences)
 	{
 		FQueuedBatchObjectReference& Ref = It.Value;

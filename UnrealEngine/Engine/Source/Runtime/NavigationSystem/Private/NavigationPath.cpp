@@ -1,5 +1,27 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// ============================================================================
+// NavigationPath.cpp —— FNavigationPath（C++ 底层路径） + UNavigationPath
+// （UObject 外壳/BP 包装）的实现。
+//
+// 本文件两大块：
+//   1) FNavigationPath：非 UObject 的"纯 C++ 路径数据"
+//      - 持有 PathPoints 数组、ShortcutNodeRefs、GoalActor/SourceActor 弱引用、
+//        Observer 多播委托、NavigationDataUsed 弱指针等；
+//      - ResetForRepath 与 InternalResetNavigationPath 的分工：
+//        前者是公开 API（派生类可 override 以保留派生字段），后者做"通用字段
+//        的物理重置"，并精心保留 GoalActor、Filter、NavigationDataUsed 等
+//        "Repath 复用"所必需的字段。
+//      - TickPathObservation：检测 GoalActor 是否偏离 TetherDistance → 请求 Repath。
+//      - Invalidate：下层 NavData 变化时广播事件并按 bDoAutoUpdateOnInvalidation
+//        决定是否自动 Repath。
+//   2) UNavigationPath：对 FNavPathSharedPtr 的 UObject 外壳
+//      - BeginDestroy 取消 observer 防回调野指针；
+//      - OnPathEvent：底层 FNavigationPath 事件 → 更新 bIsValid、PathPoints →
+//        广播到蓝图委托 PathUpdatedNotifier；
+//      - SetPath：解绑旧观察 → 绑定新观察 → 同步刷新点。
+// ============================================================================
+
 #include "NavigationPath.h"
 #include "EngineStats.h"
 #include "EngineGlobals.h"
@@ -21,6 +43,8 @@
 //----------------------------------------------------------------------//
 // FNavigationPath
 //----------------------------------------------------------------------//
+// 类型标签：所有 FNavigationPath 原生实例共用此 Type。派生类（如 FNavMeshPath、
+// FAbstractNavigationPath）会在自己的源文件中定义独立的 static Type 变量。
 const FNavPathType FNavigationPath::Type;
 
 FNavigationPath::FNavigationPath()
@@ -37,9 +61,11 @@ FNavigationPath::FNavigationPath()
 	, GoalActorLocationTetherDistanceSq(-1.f)
 	, GoalActorLastLocation(FVector::ZeroVector)
 {
+	// 调 Internal 版本把 PathPoints/Base/bUpToDate 等"每次重算都清"的字段置为初始值
 	InternalResetNavigationPath();
 }
 
+// 便捷构造：直接给一串世界坐标构造"已就绪"路径，InBase 做为 Attach 基座
 FNavigationPath::FNavigationPath(const TArray<FVector>& Points, AActor* InBase)
 	: GoalActorAsNavAgent(nullptr)
 	, SourceActorAsNavAgent(nullptr)
@@ -60,6 +86,7 @@ FNavigationPath::FNavigationPath(const TArray<FVector>& Points, AActor* InBase)
 	Base = InBase;
 
 	PathPoints.AddZeroed(Points.Num());
+	// 将输入的世界坐标包装成 FBasedPosition 以便跟随 Base 移动（相对坐标存储）
 	for (int32 i = 0; i < Points.Num(); i++)
 	{
 		FBasedPosition BasedPoint(InBase, Points[i]);
@@ -69,6 +96,13 @@ FNavigationPath::FNavigationPath(const TArray<FVector>& Points, AActor* InBase)
 
 FNavigationPath::~FNavigationPath() = default;
 
+// InternalResetNavigationPath vs ResetForRepath 的区别：
+//  - InternalResetNavigationPath 只是"物理字段重置"，不会触发 Observer 事件。
+//  - ResetForRepath 是 public API：派生类可以 override 它在重置前后做派生字段
+//    的保留/更新。
+//  关键不变量（注释里"keep"列表）：
+//    所有与"寻路目标/源/过滤器/当前 NavData/观察者/自动更新标志"相关的字段
+//    都必须保留，这样 Repath 才能 in-place 重用这条 path 实例。
 void FNavigationPath::InternalResetNavigationPath()
 {
 	ShortcutNodeRefs.Reset();
@@ -101,16 +135,21 @@ void FNavigationPath::InternalResetNavigationPath()
 	// - GoalActorLastLocation
 }
 
+// 获取寻路"终点"：若观察了 GoalActor 则以 Actor/NavAgent 当前位置为准，否则用 PathPoints 末端
 FVector FNavigationPath::GetGoalLocation() const
 {
 	return GoalActor != NULL ? (GoalActorAsNavAgent != NULL ? GoalActorAsNavAgent->GetNavAgentLocation() : GoalActor->GetActorLocation()) : GetEndLocation();
 }
 
+// 获取"起点"：同上逻辑——SourceActor 优先
 FVector FNavigationPath::GetPathFindingStartLocation() const
 {
 	return SourceActor != NULL ? (SourceActorAsNavAgent != NULL ? SourceActorAsNavAgent->GetNavAgentLocation() : SourceActor->GetActorLocation()) : GetStartLocation();
 }
 
+// 启用 GoalActor 观察：以后每次 TickPathObservation 都会检查 Actor 是否偏离
+// 超过 TetherDistance，超过则触发 Repath。
+// 只能对"由 NavData 生成的路径"启用（否则 NavigationDataUsed 为空无法 Repath）。
 void FNavigationPath::SetGoalActorObservation(const AActor& ActorToObserve, float TetherDistance)
 {
 	if (NavigationDataUsed.IsValid() == false)
@@ -122,6 +161,7 @@ void FNavigationPath::SetGoalActorObservation(const AActor& ActorToObserve, floa
 	}
 
 	// register for path observing only if we weren't registered already
+	// 若此前没有 GoalActor，则首次注册到 NavData 的 ObservedPaths 列表
 	const bool RegisterForPathUpdates = (GoalActor.IsValid() == false);
 	GoalActor = &ActorToObserve;
 	checkSlow(GoalActor.IsValid());
@@ -142,6 +182,7 @@ void FNavigationPath::SetSourceActor(const AActor& InSourceActor)
 	SourceActorAsNavAgent = Cast<INavAgentInterface>(&InSourceActor);
 }
 
+// 缓存 GoalActor 当前位置——作为下次 Tether 检测的参考点
 void FNavigationPath::UpdateLastRepathGoalLocation()
 {
 	if (GoalActor.IsValid())
@@ -150,6 +191,7 @@ void FNavigationPath::UpdateLastRepathGoalLocation()
 	}
 }
 
+// 由 NavData 每帧调用：若 GoalActor 偏离超过 TetherDistance，返回 RequestRepath
 EPathObservationResult::Type FNavigationPath::TickPathObservation()
 {
 	if (bObservingGoalActor == false || GoalActor.IsValid() == false)
@@ -169,6 +211,10 @@ void FNavigationPath::DisableGoalActorObservation()
 	bObservingGoalActor = false;
 }
 
+// 标记路径失效：
+//  - bIgnoreInvalidation 可临时屏蔽这类通知（例如批量重建期间）
+//  - 广播 Invalidated 事件给所有观察者（UNavigationPath 会收到）
+//  - 若启用 AutoUpdate 则顺便发一个 RePath 请求给 NavData
 void FNavigationPath::Invalidate()
 {
 	if (!bIgnoreInvalidation)
@@ -189,11 +235,14 @@ void FNavigationPath::RePathFailed()
 	bWaitingForRepath = false;
 }
 
+// 默认实现：直接调用 Internal 版。派生类可 override 以保留自己的附加字段。
 void FNavigationPath::ResetForRepath()
 {
 	InternalResetNavigationPath();
 }
 
+// 调试绘制：把路径点画成盒+连线。已经走过的段用灰色（VertIdx < NextPathPointIndex）。
+// 若启用了 GoalActor 观察还会画 Tether 圆柱与目标连线。
 void FNavigationPath::DebugDraw(const ANavigationData* NavData, FColor PathColor, UCanvas* Canvas, bool bPersistent, float LifeTime, const uint32 NextPathPointIndex) const
 {
 #if ENABLE_DRAW_DEBUG
@@ -235,6 +284,8 @@ void FNavigationPath::DebugDraw(const ANavigationData* NavData, FColor PathColor
 #endif
 }
 
+// 是否包含某多边形 NodeRef：先查 PathPoints[i].NodeRef 逐点，再查 ShortcutNodeRefs
+// （String-Pull 过程中被"剪掉"的中间节点）
 bool FNavigationPath::ContainsNode(NavNodeRef NodeRef) const
 {
 	for (int32 Index = 0; Index < PathPoints.Num(); Index++)
@@ -248,6 +299,8 @@ bool FNavigationPath::ContainsNode(NavNodeRef NodeRef) const
 	return ShortcutNodeRefs.Find(NodeRef) != INDEX_NONE;
 }
 
+// 从给定位置到路径末端的几何距离（给 AI 做"剩余距离"查询用）
+// NextPathPointIndex 是下一个未走到的路径点索引；SegmentStart 通常是 Agent 当前位置。
 FVector::FReal FNavigationPath::GetLengthFromPosition(FVector SegmentStart, uint32 NextPathPointIndex) const
 {
 	if (NextPathPointIndex >= (uint32)PathPoints.Num())
@@ -258,6 +311,7 @@ FVector::FReal FNavigationPath::GetLengthFromPosition(FVector SegmentStart, uint
 	const uint32 PathPointsCount = PathPoints.Num();
 	FVector::FReal PathDistance = 0.;
 
+	// 迭代目标：从 SegmentStart 出发，沿 PathPoints[NextPathPointIndex..] 顺序累加距离
 	for (uint32 PathIndex = NextPathPointIndex; PathIndex < PathPointsCount; ++PathIndex)
 	{
 		const FVector SegmentEnd = PathPoints[PathIndex].Location;
@@ -299,6 +353,10 @@ bool FNavigationPath::ContainsAnyCustomLink() const
 	return false;
 }
 
+// 路径某段与 Box 是否相交。
+// - AgentExtent 有值：用"胶囊/Box 扫掠"做相交（考虑 Agent 体积）；
+// - AgentExtent 为空：退化为线段-Box 相交。
+// 找到第一段相交就返回 true（并可选返回段号）。
 FORCEINLINE bool FNavigationPath::DoesPathIntersectBoxImplementation(const FBox& Box, const FVector& StartLocation, uint32 StartingIndex, int32* IntersectingSegmentIndex, FVector* AgentExtent) const
 {	
 	bool bIntersects = false;
@@ -447,12 +505,14 @@ UNavigationPath::UNavigationPath(const FObjectInitializer& ObjectInitializer)
 	, DebugDrawingColor(FColor::White)
 	, SharedPath(NULL)
 {	
+	// 为非 CDO 实例预构建一个以自身为 this 的委托，等 SetPath 时绑到 SharedPath 上。
 	if (HasAnyFlags(RF_ClassDefaultObject) == false)
 	{
 		PathObserver = FNavigationPath::FPathObserverDelegate::FDelegate::CreateUObject(this, &UNavigationPath::OnPathEvent);
 	}
 }
 
+// 必须在析构链里反注册 observer，避免 SharedPath 稍后事件回到野指针
 void UNavigationPath::BeginDestroy()
 {
 	if (SharedPath.IsValid())
@@ -462,6 +522,10 @@ void UNavigationPath::BeginDestroy()
 	Super::BeginDestroy();
 }
 
+// SharedPath 事件回调：
+//  - 先广播到 BP 委托；
+//  - 再根据 SharedPath 是否仍然有效同步 bIsValid；
+//  - 有效则从 NativePath 更新 PathPoints（FVector 列表）供 BP 读取。
 void UNavigationPath::OnPathEvent(FNavigationPath* UpdatedPath, ENavPathEvent::Type PathEvent)
 {
 	if (UpdatedPath == SharedPath.Get())
@@ -562,6 +626,9 @@ bool UNavigationPath::IsStringPulled() const
 	return false;
 }
 
+// 绑/解绑 SharedPath：保证同一时间只有一个 FNavigationPath 被观察。
+// 若新 Path 为空，则视作"清空"，发出 ENavPathEvent::Cleared 事件。
+// RecalculateOnInvalidation 若不是 Default，会向新路径下发"自动重算"开关。
 void UNavigationPath::SetPath(FNavPathSharedPtr NewSharedPath)
 {
 	FNavigationPath* NewPath = NewSharedPath.Get();
@@ -588,10 +655,12 @@ void UNavigationPath::SetPath(FNavPathSharedPtr NewSharedPath)
 			PathPoints.Reset();
 		}
 
+		// 手动触发一次 OnPathEvent，让下游蓝图委托立即收到 "NewPath" 或 "Cleared"
 		OnPathEvent(NewPath, NewPath != NULL ? ENavPathEvent::NewPath : ENavPathEvent::Cleared);
 	}
 }
 
+// FNavPathPoint 有额外字段（NodeRef、AreaFlags 等），BP 只关心坐标，这里做投影。
 void UNavigationPath::SetPathPointsFromPath(FNavigationPath& NativePath)
 {
 	PathPoints.Reset(NativePath.GetPathPoints().Num());

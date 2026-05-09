@@ -1,0 +1,26 @@
+Using bundled DotNet SDK version: 8.0.412 win-x64
+Running UnrealBuildTool: dotnet "..\..\Engine\Binaries\DotNET\UnrealBuildTool\UnrealBuildTool.dll" FirstPersonEditor Win64 Development -Project="D:\workspace\ShootGame\FirstPerson\FirstPerson.uproject"
+Log file: D:\workspace\UnrealEngine-Angelscript\Engine\Programs\UnrealBuildTool\Log.txt
+Using 'git status' to determine working set for adaptive non-unity build (D:\workspace\UnrealEngine-Angelscript).
+Using 'git status' to determine working set for adaptive non-unity build (D:\workspace\ShootGame).
+Waiting for 'git status' command to complete
+Building FirstPersonEditor...
+Using Visual Studio 2022 14.44.35225 toolchain (C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207) and Windows 10.0.22621.0 SDK (C:\Program Files (x86)\Windows Kits\10).
+[Adaptive Build] Excluded from FirstPerson unity file: SimpleRandomMoveBubble.cpp, SimpleRandomMoveMassProcessor.cpp, SimpleRandomMoveReplicator.cpp, SimpleRandomMoveSubsystem.cpp, SimpleRandomMoveVisualizationProcessor.cpp, USimpleRandomMoveTrait.cpp
+Determining max actions to execute in parallel (20 physical cores, 28 logical cores)
+  Executing up to 20 processes, one per physical core
+  Requested 1.5 GB memory per action, 7.66 GB available: limiting max parallel actions to 5
+Using Unreal Build Accelerator local executor to run 4 action(s)
+  Storage capacity 40Gb
+---- Starting trace: 260508_101017 ----
+UbaSessionServer - Disable remote execution (remote sessions will finish current processes)
+[1/4] Compile [x64] SimpleRandomMoveSubsystem.cpp
+[2/4] Link [x64] UnrealEditor-FirstPerson-0003.lib
+[3/4] Link [x64] UnrealEditor-FirstPerson-0003.dll
+[4/4] WriteMetadata FirstPersonEditor.target [NoUba]
+
+Trace written to file D:/workspace/UnrealEngine-Angelscript/Engine/Programs/UnrealBuildTool/Log.uba with size 4.3kb
+Total time in Unreal Build Accelerator local executor: 11.45 seconds
+
+Result: Succeeded
+Total execution time: 15.03 seconds

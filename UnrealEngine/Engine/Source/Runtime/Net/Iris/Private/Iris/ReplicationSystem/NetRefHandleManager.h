@@ -1,5 +1,58 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：NetRefHandleManager.h（Private）
+// 角色：Iris 中所有"已注册可复制对象"的中央登记表。每个 RS 实例持有一份。
+//
+// 数据组织：
+//   * ReplicatedObjectData[InternalIndex]   : 紧凑的 per-object 元数据数组（FReplicatedObjectData）
+//   * ReplicatedObjectStateBuffers[]        : per-object 量化后的内部状态 buffer 指针
+//   * ReplicatedObjectRefCount[]            : per-object 跨连接的 refcount（决定何时可回收 InternalIndex）
+//   * ReplicatedInstances[]                 : per-object UObject* 指针（弱参考语义）
+//   * SubObjects (FNetDependencyData)       : SubObject / ChildSubObject / Dependent 邻接表
+//
+// FInternalNetRefIndex（uint32）：
+//   * 紧凑下标，与一系列 FNetBitArray 共用
+//   * 0 保留（InvalidInternalIndex）
+//   * 通过 RefHandleToInternalIndex 把外部 FNetRefHandle -> 内部 Index 双向映射
+//
+// 协同的 FNetBitArray（按生命周期/含义切分）：
+//   GlobalScopableInternalIndices       : 全局"可被任意连接 scope"的索引集合
+//   ScopeFrameData.CurrentFrameScopable : 当前帧 PreSendUpdate 时的 scope 快照
+//   ScopeFrameData.PrevFrameScopable    : 上一帧 scope 快照（用于 diff 出新增/移除）
+//   RelevantObjectsInternalIndices      : 至少对一个连接 relevant 的对象
+//   PolledObjectsInternalIndices        : 本帧已被 Poll 的对象
+//   DirtyObjectsToQuantize              : 本帧需要 quantize 的脏对象
+//   AssignedInternalIndices             : 已分配过的索引集合
+//   SubObjectInternalIndices            : 标记 SubObject
+//   DependentObjectInternalIndices      : 标记依赖对象
+//   ObjectsWithDependentObjectsInternalIndices : 拥有依赖对象的父
+//   ObjectsWithCreationDependencies     : 拥有 creation dep 的对象
+//   DestroyedStartupObjectInternalIndices: 静态对象已销毁占位
+//   WantToBeDormantInternalIndices      : 想休眠的对象
+//   DormantObjectsPendingFlushNet       : 已休眠但请求一次 FlushNet 的对象
+//   ObjectsWithPreUpdate                : 标记需要 PreUpdate 的对象
+//   ObjectsWithFullPushBasedDirtiness   : 全量 PushModel 标脏的对象
+//
+// FReplicatedObjectData（每对象元数据）—— 见结构内注释。
+//
+// 帧循环钩子：
+//   OnPreSendUpdate / OnPostSendUpdate    : §4 帧循环 step 3 / EndPostSendUpdate
+//   DestroyObjectsPendingDestroy          : 推进 PendingDestroyInternalIndices 队列
+//
+// SubObject / Dependent 拓扑维护：
+//   AddSubObject / RemoveSubObject / AddDependentObject / RemoveDependentObject /
+//   AddCreationDependency / RemoveCreationDependency 等，全部走 FNetDependencyData。
+//
+// 内部索引分配/回收：
+//   GetNextFreeInternalIndex / ClearStateForFreedInternalIndex / GrowNetObjectLists /
+//   GrowNetChunkedArrayBuffers / MaxInternalNetRefIndexIncreased
+//   - 通过 OnMaxInternalNetRefIndexIncreased / OnNetChunkedArrayIncrease /
+//     OnInternalNetRefIndicesFreed 三个 multicast delegate 通知所有依赖此索引的子系统
+//     （Filtering / Conditionals / Prioritization / DC / WorldLocations / DirtyTracker）
+//     去同步其内部容器大小。
+// =====================================================================================
+
 #pragma once
 
 #include "Containers/Array.h"
@@ -44,25 +97,27 @@ namespace UE::Net::Private
 
 typedef uint32 FInternalNetRefIndex;
 
+/** AddSubObject 的细节标志。 */
 enum class EAddSubObjectFlags : uint32
 {
 	None = 0U,
-	WarnIfAlreadySubObject = 1U,
-	SkipIfAlreadySubObject = WarnIfAlreadySubObject << 1U,
-	DestroyWithOwner = SkipIfAlreadySubObject << 1U,
-	ReplicateWithSubObject = DestroyWithOwner << 1U,
+	WarnIfAlreadySubObject = 1U,                       // 已是 SubObject 时警告
+	SkipIfAlreadySubObject = WarnIfAlreadySubObject << 1U, // 已是 SubObject 时直接跳过
+	DestroyWithOwner = SkipIfAlreadySubObject << 1U,       // 父销毁时一起销毁该 SubObject
+	ReplicateWithSubObject = DestroyWithOwner << 1U,       // 与给定 SubObject 一同复制（同包）
 	// Insert the subject at the start of the list
-	InsertAtStart = ReplicateWithSubObject << 1U, 
+	InsertAtStart = ReplicateWithSubObject << 1U,          // 插入到 SubObject 列表最前
 
 	Default = WarnIfAlreadySubObject | DestroyWithOwner,
 };
 ENUM_CLASS_FLAGS(EAddSubObjectFlags);
 
+/** RemoveDependentObject 的方向标志，控制清理父→子 / 子→父哪一侧。 */
 enum class ERemoveDependentObjectFlags : uint32
 {
 	None = 0U,
-	RemoveFromDependentParentObjects = 1U,
-	RemoveFromParentDependentObjects = RemoveFromDependentParentObjects << 1U,
+	RemoveFromDependentParentObjects = 1U,                                   // 从依赖对象的"父列表"清理
+	RemoveFromParentDependentObjects = RemoveFromDependentParentObjects << 1U,// 从父的"依赖列表"清理
 	All = RemoveFromDependentParentObjects | RemoveFromParentDependentObjects,
 };
 ENUM_CLASS_FLAGS(ERemoveDependentObjectFlags);
@@ -76,6 +131,32 @@ public:
 
 	// We need to store some internal data for Replicated objects
 	// $TODO: This should be split up into separate array according to usage patterns, it is getting a bit too large
+	/**
+	 * 单个已注册对象的 per-object 元数据（按 InternalIndex 索引）。
+	 *
+	 * 字段含义：
+	 *   RefHandle            : 对外暴露的句柄
+	 *   NetHandle            : 与 NetCore 跨子系统的全局 NetHandle（可能无效）
+	 *   Protocol             : 共享的协议形态描述（FReplicationProtocol，引用计数）
+	 *   InstanceProtocol     : 每实例的 Fragment 表（指向真实 UObject 内部地址）
+	 *   ReceiveStateBuffer   : 接收端 Apply 前的"待应用"状态 buffer
+	 *   SubObjectRootIndex   : 若是 SubObject，指向其 RootObject 的 InternalIndex
+	 *   SubObjectParentIndex : 若是 SubObject，指向其直接父（可能不是 Root）
+	 *   NetFactoryId         : 创建该对象的 Factory
+	 *   IrisAsyncLoadingPriority : 该对象引用资源的 async load 优先级（SubObject 沿用 Root 的）
+	 *
+	 * Flags（位字段）：
+	 *   bShouldPropagateChangedStates : 状态变化是否需要传播给连接（停止复制后置 false）
+	 *   bTearOff                       : 已被标记 TearOff
+	 *   bDestroySubObjectWithOwner     : SubObject 是否随父一起销毁
+	 *   bIsDependentObject             : 是否为某个父的依赖对象
+	 *   bHasDependentObjects           : 自身是否有依赖
+	 *   bAllowDestroyInstanceFromRemote: 远端是否被允许销毁本地实例
+	 *   bNeedsFullCopyAndQuantize      : 下一次 Poll 强制全量拷贝量化
+	 *   bWantsFullPoll                 : 强制全量 Poll（Dormancy 唤醒等场景）
+	 *   bPendingEndReplication         : 已入队 EndReplication
+	 *   bHasCachedCreationInfo         : 是否已 Cache CreationHeader（Flush 路径用）
+	 */
 	struct FReplicatedObjectData
 	{
 		FReplicatedObjectData()

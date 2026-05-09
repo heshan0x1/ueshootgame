@@ -1,5 +1,21 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================================================
+// StructNetTokenDataStore.h —— USTRUCT 的 NetToken 化存储（按 hash + struct content）
+// -------------------------------------------------------------------------------------------------------------
+// 模块定位：把任意 USTRUCT 实例的"完整数据"压缩为一个 FNetToken；同一份数据多次发送只 export 一次。
+//
+// 三大模板：
+//   1) TStructNetTokenDataStore<T>          ：派生 FNetTokenDataStore 的具体实现，负责存储 T 的实例集合；
+//   2) TStructAsNetTokenNetSerializerImpl   ：Iris NetSerializer 实现，把 T 量化成 FNetToken；
+//   3) TStructNetTokenDataStoreHelper       ：FArchive(NetSerialize) 兼容路径的辅助器（前向声明）。
+//
+// 使用约束（详见类内 doxygen）：
+//   - T 必须实现 GetUniqueKey() -> uint64 稳定哈希；
+//   - T 不能持有指针/引用/其他 NetToken/NetGuid——否则会破坏 token 的不可变性；
+//   - 数据应"少改 + 取值有限"，否则只是无意义的内存复制。
+// =============================================================================================================
+
 #pragma once
 
 #include "Iris/ReplicationState/ReplicationStateDescriptorBuilder.h"
@@ -148,6 +164,12 @@ namespace UE::Net
 template <typename T>
 class TStructNetTokenDataStoreHelper;
 
+// -----------------------------------------------------------------------------
+// TStructNetTokenDataStore<T>
+//   - 一个按 T 类型实例化的具体 DataStore，挂在 FNetTokenStore 下；
+//   - 内部维护：HashToKey（uint64 -> KeyIndex 去重）、StoredStates（KeyIndex -> T 实例副本）；
+//   - 序列化通过 FReplicationStateDescriptor + ReadStruct/WriteStruct（IRIS 路径），或者用户提供的 NetSerializeScriptDelegate（FArchive 路径）。
+// -----------------------------------------------------------------------------
 template <typename T>
 class TStructNetTokenDataStore : public FNetTokenDataStore
 {
@@ -163,6 +185,7 @@ public:
 	}
 	
 	// Create a token for input struct
+	// 主入口：T -> NetToken。复用同 GetUniqueKey() 的实例 → 同一个 KeyIndex → 同一个 Token。
 	FNetToken GetOrCreateToken(const T& InData)
 	{
 		FNetToken Result;
@@ -181,6 +204,7 @@ public:
 	}
 
 	// Resolve NetToken, to resolve remote tokens RemoteTokenStoreState must be valid
+	// 解析 Token：返回的 const T& 直接引用 StoredStates 中的副本（生命周期 = 该 Store）。
 	const T& ResolveToken(FNetToken Token, const FNetTokenStoreState* RemoteTokenStoreState = nullptr) const
 	{
 		const FNetTokenStoreState* TokenStoreState = TokenStore.IsLocalToken(Token) ? TokenStore.GetLocalNetTokenStoreState() : RemoteTokenStoreState;
@@ -220,12 +244,14 @@ public:
 
 	// Need to declare as a delegate that is bound elsewhere to reduce the includes. We can't eliminate them, since the specialization module needs to include the engine parts necessary to make this work
 	// and we can't circular depend on the engine module to implement these details. We could write the helpers somewhere in the engine, though there isn't a great place to do this.
+	// FArchive 路径需要从外部模块（一般是游戏 / Engine）注入实际的 NetSerialize 实现，避免反向依赖。
 	DECLARE_DELEGATE_ThreeParams(TNetSerializeTokenType, T&, FArchive&, UPackageMap*);
 	inline static TNetSerializeTokenType NetSerializeScriptDelegate;
 protected:
 	friend TStructNetTokenDataStoreHelper<T>;
 	
 	// Serialize data for a token, note there is not validation in this function
+	// IRIS 路径：通过 FReplicationStateDescriptor 把 T 当成普通 USTRUCT 进行 BitStream 序列化。
 	virtual void WriteTokenData(FNetSerializationContext& Context, FNetTokenStoreKey TokenStoreKey) const override
 	{
 		if (!TokenStoreKey.IsValid() || !StoredStates.Contains(TokenStoreKey.GetKeyIndex()))
@@ -306,6 +332,8 @@ protected:
 	}
 	
 	// Creates a persistent copy of the input struct 
+	// 通过 GetUniqueKey() 哈希做去重；新值时把 T 拷贝一份到 StoredStates（生命周期 = Store）。
+	// 注意：T 的副本可能很大（无 age-out 机制），不建议放置大数据。
 	FNetTokenStoreKey GetOrCreatePersistentState(const T& InNetTokenData)
 	{
 		LLM_SCOPE_BYTAG(NetTokenStructState);
@@ -330,12 +358,14 @@ protected:
 
 private:
 	inline static UScriptStruct* Struct;
-	inline static TRefCountPtr<const FReplicationStateDescriptor> Descriptor;
-	TMap<uint64, FNetTokenStoreKey> HashToKey;
-	TMap<uint32, T> StoredStates;
-	static inline T InvalidState = T();
+	inline static TRefCountPtr<const FReplicationStateDescriptor> Descriptor; // T 对应的 FReplicationStateDescriptor，PostFreeze 阶段构建。
+	TMap<uint64, FNetTokenStoreKey> HashToKey;                                // GetUniqueKey() -> KeyIndex（去重）。
+	TMap<uint32, T> StoredStates;                                             // KeyIndex -> T 副本。
+	static inline T InvalidState = T();                                        // ResolveToken 失败时返回的占位值。
 	
 	// Helper for NetSerializerDescriptor setup
+	// 在 NetSerializer 注册系统 PostFreeze 时构建 T 的 FReplicationStateDescriptor。
+	// SkipCheckForCustomNetSerializerForStruct=1 防止递归地把内部结构再次识别为 NetToken 类型。
 	class FNetSerializerRegistryDelegates final : private UE::Net::FNetSerializerRegistryDelegates
 	{
 	public:
@@ -373,6 +403,15 @@ public:
 };
 	
 // Helper to implement a NetSerializer for a struct that should serialize using a NetTokenStore
+// -----------------------------------------------------------------------------
+// TStructAsNetTokenNetSerializerImpl<T>
+//   - 把"T 类型 → 紧凑 FNetToken"的 NetSerializer 五件套（Serialize/Deserialize/Quantize/Dequantize/IsEqual）模板化；
+//   - SourceType=T，QuantizedType=FNetToken：在 Iris 状态 buffer 中只占 8 字节（FNetToken 的大小）；
+//   - Quantize：T -> NetToken（GetOrCreateToken）；
+//   - Dequantize：NetToken -> T（ResolveToken）；
+//   - Serialize：把 NetToken 写入比特流 + AppendExport 让 NetTokenDataStream 在合适时机 export；
+//   - IsEqual：处理 Local/Authority 两个 Token 实际指向同一份数据的特殊比较。
+// -----------------------------------------------------------------------------
 template <typename T, typename NetTokenDataStoreT = TStructNetTokenDataStore<T>>
 class TStructAsNetTokenNetSerializerImpl
 {
@@ -399,15 +438,18 @@ void TStructAsNetTokenNetSerializerImpl<T, NetTokenDataStoreT>::Serialize(FNetSe
 	const FNetToken& NetToken = *reinterpret_cast<FNetToken*>(Args.Source);
 	
 	// Tokens will differ, so we cannot store them in the default statehash.
+	// 默认状态哈希用于"是否与默认值不同"判定，由于 Token 的 Index 取决于运行时分配顺序，无法稳定，因此跳过。
 	if (Context.IsInitializingDefaultState())
 	{
 		return;
 	}
 
 	// Write token without type
+	// DataStore 类型已知（NetTokenDataStoreT），跳过 5-bit TypeId 写入。
 	Context.GetNetTokenStore()->WriteNetTokenWithKnownType<NetTokenDataStoreT>(Context, NetToken);
 
 	// Add to pending exports for later export
+	// 把 Token 加入 ExportContext 待导出列表；之后由 NetTokenDataStream::WriteData 在独立流中真正写出 token data。
 	FNetTokenStore::AppendExport(Context, NetToken);
 }
 
@@ -464,6 +506,8 @@ bool TStructAsNetTokenNetSerializerImpl<T, NetTokenDataStoreT>::IsEqual(FNetSeri
 		const FNetToken& Value1 = *reinterpret_cast<const FNetToken*>(Args.Source1);
 
 		// Need to compare actual Tags to properly compare non-auth and auth token
+		// 当一边是本地 Token、另一边是权威 Token 时，FNetToken 的 Authority 标志不一致，但实际数据可能相同；
+		// 此时必须 Resolve 后再比较 T 的实际值。
 		if (Value0.IsAssignedByAuthority() != Value1.IsAssignedByAuthority())
 		{
 			NetTokenDataStoreT* NetTokenDataStore = Context.GetNetTokenStore()->GetDataStore<NetTokenDataStoreT>();
@@ -485,6 +529,7 @@ bool TStructAsNetTokenNetSerializerImpl<T, NetTokenDataStoreT>::IsEqual(FNetSeri
 	}
 	else
 	{
+		// 非量化比较走 T::operator==（一般会调到 GetUniqueKey() 比较）。
 		const SourceType& Value0 = *reinterpret_cast<SourceType*>(Args.Source0);
 		const SourceType& Value1 = *reinterpret_cast<SourceType*>(Args.Source1);
 

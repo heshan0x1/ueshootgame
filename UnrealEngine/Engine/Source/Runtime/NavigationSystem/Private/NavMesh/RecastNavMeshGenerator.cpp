@@ -1,5 +1,28 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// RecastNavMeshGenerator.cpp —— 中文总览（单文件 ~8500 行，本模块最大）
+// ---------------------------------------------------------------------------
+// 本文件实现 RecastNavMeshGenerator.h 中声明的所有生成逻辑。按照"用到就在附近"组织，
+// 大致按以下顺序排列（本文件太长，下方在每个大节的开头会补一段中文分节小标题）：
+//
+//   [A] 常量、CVar、Debug 工具           —— 如 ExportGeomToOBJFile, GNavmeshXxx
+//   [B] 碰撞 / 几何导出 helper            —— ExportRigidBodyGeometry 之类（5.5 起迁移到 FRecastGeometryExport）
+//   [C] FNavMeshBuildContext              —— Recast 日志/统计回调的 UE 适配
+//   [D] FRecastGeometryCache / VoxelCache —— 数据结构反序列化
+//   [E] FRecastTileGenerator 全套方法      —— 单 Tile 构建：Setup / Gather / Rasterize /
+//       Filter / Compact / Erode / BuildLayers / MarkDynamicAreas / BuildNavigationData /
+//       BuildTileCacheLinks 等
+//   [F] FRecastNavMeshGenerator 全套方法   —— 调度器：Init / RebuildAll / RebuildDirtyAreas /
+//       MarkDirtyTiles / ProcessTileTasks* / AddGeneratedTiles / RemoveLayers /
+//       Active Tiles / Time Slice 主循环 / TickAsyncBuild 等
+//
+// 阅读时请结合 `DevDocs/NavigationSystem_Architecture_CN.md` 第 4.3 节"Recast Tile 生成"
+// 与第 6 节"注释规约"一起看。由于文件过大，本文件按"关键结构 + 关键函数"注释，
+// 若遇到未注释的小 helper（多半是数行的工具函数，例如 float 比较、字段拷贝），请
+// 参考头文件里的中文说明自行理解。
+// =====================================================================================
+
 #include "NavMesh/RecastNavMeshGenerator.h"
 
 #include "DynamicMeshBuilder.h"
@@ -44,27 +67,31 @@
 #include "DebugUtils/DetourNavLinkDebugDraw.h"
 #endif //RECAST_INTERNAL_DEBUG_DATA
 
+// ==== [A] 常量 / CVar / 压缩参数 ====
+// 这些常量/旋钮主要由 ai.nav.* CVar 和编译宏控制，影响生成过程的行为
+
 #ifndef OUTPUT_NAV_TILE_LAYER_COMPRESSION_DATA
-	#define OUTPUT_NAV_TILE_LAYER_COMPRESSION_DATA 0
+	#define OUTPUT_NAV_TILE_LAYER_COMPRESSION_DATA 0 // 是否输出每 Tile Layer 压缩前/后尺寸到日志
 #endif
 
 #ifndef FAVOR_NAV_COMPRESSION_SPEED
-	#define FAVOR_NAV_COMPRESSION_SPEED 1
+	#define FAVOR_NAV_COMPRESSION_SPEED 1 // 1=优先速度，0=优先体积（仅 Editor Cook 时用 0）
 #endif
 
-#define SEAMLESS_REBUILDING_ENABLED 1
-
+#define SEAMLESS_REBUILDING_ENABLED 1 // 无缝重建：避免"整张地图空一帧"
 #define SHOW_NAV_EXPORT_PREVIEW 0
 
-CSV_DEFINE_CATEGORY(NAVREGEN, false);
+CSV_DEFINE_CATEGORY(NAVREGEN, false); // CSV Profiler 分类
 
 struct dtTileCacheAlloc;
 
 //Experimental debug tools
+// 强制把 Tile 生成走同步路径（阻塞主线程）；CI/排错用
 static int32 GNavmeshSynchronousTileGeneration = 0;
 static FAutoConsoleVariableRef NavmeshVarSynchronous(TEXT("ai.nav.GNavmeshSynchronousTileGeneration"), GNavmeshSynchronousTileGeneration, TEXT(""), ECVF_Default);
 
 #if RECAST_INTERNAL_DEBUG_DATA
+// 指定 Tile(X,Y) 只生成该 Tile（局部调试用）
 static int32 GNavmeshDebugTileX = MAX_int32;
 static int32 GNavmeshDebugTileY = MAX_int32;
 static bool GNavmeshGenerateDebugTileOnly = false;
@@ -74,28 +101,35 @@ static FAutoConsoleVariableRef NavmeshVarGenerateDebugTileOnly(TEXT("ai.nav.GNav
 #endif //RECAST_INTERNAL_DEBUG_DATA
 
 // Hotfixing this flag without rebuilding the data will cause decompression errors, equivalent to not having prebuilt navmesh data at all.
+// 注意：预编译数据依赖该 flag；关闭后存量数据无法解压（等同无 prebuilt）
 static bool GNavmeshUseOodleCompression = true;
 static FAutoConsoleVariableRef NavmeshVarOodleCompression(TEXT("ai.nav.NavmeshUseOodleCompression"), GNavmeshUseOodleCompression, TEXT("Use Oodle for run-time tile cache compression/decompression. Optimized for size in editor, optimized for speed in standalone."), ECVF_Default);
 
 namespace UE::NavMesh::Private
 {
+	// 新生成 Tile 的高亮时长（编辑器显示红色残影秒数）
 	static float RecentlyBuildTileDisplayTime = 0.2f;
 	static FAutoConsoleVariableRef CVarRecentlyBuildTileDisplayTime(TEXT("ai.nav.RecentlyBuildTileDisplayTime"), RecentlyBuildTileDisplayTime, TEXT("Time (in seconds) to display tiles that have recently been built."), ECVF_Default);
 
+	// 紧致边界膨胀：新行为(1*AgentRadius) vs 旧行为(2*AgentRadius)
 	static bool bUseTightBoundExpansion = true;
 	static FAutoConsoleVariableRef CVarUseTightBoundExpansion(TEXT("ai.nav.UseTightBoundExpansion"), bUseTightBoundExpansion, TEXT("Active by default. Use an expansion of one AgentRadius. Set to false to revert to the previous behavior (2 AgentRadius)."), ECVF_Default);
 
+	// Link 生成时使用非对称边界（加快构建）
 	static bool bUseAsymetricBorderSizes = false;
 	static FAutoConsoleVariableRef CVarUseAsymetricBorderSizes(TEXT("ai.nav.UseAsymetricBorderSizes"), bUseAsymetricBorderSizes, TEXT("Active by default. When generating links, use asymetric tile border sizes to improve generation speed."), ECVF_Default);
 
+	// 全局关闭 Link 自动生成
 	static bool bAllowLinkGeneration = true;
 	static FAutoConsoleVariableRef CVarAllowLinkGeneration(TEXT("ai.nav.AllowLinkGeneration"), bAllowLinkGeneration, TEXT("Set to false to force disabling link generation."), ECVF_Default);
 
 }
 
+// TileCache 压缩算法：Mermaid + HyperFast1（速度优先）
 static FOodleDataCompression::ECompressor GNavmeshTileCacheCompressor = FOodleDataCompression::ECompressor::Mermaid;
 static FOodleDataCompression::ECompressionLevel GNavmeshTileCacheCompressionLevel = FOodleDataCompression::ECompressionLevel::HyperFast1;
 
+// 点是否落在盒内（含边）
 FORCEINLINE bool DoesBoxContainOrOverlapVector(const FBox& BigBox, const FVector& In)
 {
 	return (In.X >= BigBox.Min.X) && (In.X <= BigBox.Max.X) 
@@ -103,11 +137,13 @@ FORCEINLINE bool DoesBoxContainOrOverlapVector(const FBox& BigBox, const FVector
 		&& (In.Z >= BigBox.Min.Z) && (In.Z <= BigBox.Max.Z);
 }
 /** main difference between this and FBox::ContainsBox is that this returns true also when edges overlap */
+// 判断 BigBox 是否包含 SmallBox（允许贴边）。FBox::ContainsBox 在贴边时返回 false
 FORCEINLINE bool DoesBoxContainBox(const FBox& BigBox, const FBox& SmallBox)
 {
 	return DoesBoxContainOrOverlapVector(BigBox, SmallBox.Min) && DoesBoxContainOrOverlapVector(BigBox, SmallBox.Max);
 }
 
+// 统计一个 dtNavMesh 中实际有效（含数据）的 Tile 数
 int32 GetTilesCountHelper(const dtNavMesh* DetourMesh)
 {
 	int32 NumTiles = 0;
@@ -986,6 +1022,15 @@ FORCEINLINE_DEBUGGABLE void ExportRigidBodySetup(UBodySetup& BodySetup, TNavStat
 	TemporaryShapeBuffer.Reset();
 }
 
+//----------------------------------------------------------------------//
+// ==== [B] 几何导出（Chaos / BodySetup / AggregateGeom → Recast 坐标） ====
+// 下面这一大段（到 FOffMeshData 之前）5.5 版本正在迁移到 FRecastGeometryExport 中，
+// 本文件保留的 ExportXxx 多是为兼容 / 调用 helper。
+// 核心职责：把物理体/StaticMesh/HeightField/Chaos 形状转成 Recast 能吃的顶点+索引。
+// 坐标转换：所有几何最终都要 Unreal2Recast（x,y,z → -x,z,-y）。
+//----------------------------------------------------------------------//
+
+// 从场景中一个 FNavigationElement 导出几何 + Modifier；被老 API 使用
 void ExportObject(const FNavigationElement& Element, FRecastGeometryExport& GeomExport)
 {
 	const EHasCustomNavigableGeometry::Type GeometryExportType = Element.GetGeometryExportType();
@@ -1334,11 +1379,22 @@ FORCEINLINE void GrowConvexHull(const FVector::FReal ExpandBy, const TArray<FVec
 
 //----------------------------------------------------------------------//
 
+//----------------------------------------------------------------------//
+// ==== FOffMeshData —— 收集 Tile 的 OffMeshConnection 参数 ====
+// TileGenerator 在 GatherGeometry 阶段把本 Tile 上所有 NavLink 信息收集到这里，
+// 等到 dtCreateNavMeshData 时把 LinkParams 整个交给 Detour 构建 OffMeshConnection。
+//
+// 三类 Link 入口：
+//  - AddLinks(FNavigationLink)       —— 手动定义的点对点链接
+//  - AddLinks(FGeneratedNavigationLink) —— 自动生成的链接（Area/Flag 已预解析）
+//  - AddSegmentLinks(FNavigationSegmentLink) —— 段对段链接（实验特性）
+//----------------------------------------------------------------------//
+
 struct FOffMeshData
 {
-	TArray<dtOffMeshLinkCreateParams> LinkParams;
-	const TMap<const UClass*, int32>* AreaClassToIdMap;
-	const ARecastNavMesh::FNavPolyFlags* FlagsPerArea;
+	TArray<dtOffMeshLinkCreateParams> LinkParams; // 直接交给 Detour 的创建参数
+	const TMap<const UClass*, int32>* AreaClassToIdMap; // AreaClass → ID 映射（由 NavMesh 提供）
+	const ARecastNavMesh::FNavPolyFlags* FlagsPerArea;  // 每个 Area 的 Flag 数组
 
 	FOffMeshData() : AreaClassToIdMap(NULL), FlagsPerArea(NULL) {}
 
@@ -1347,6 +1403,8 @@ struct FOffMeshData
 		LinkParams.Reserve(ElementsCount);
 	}
 
+	// 追加单条 Link：端点从 Unreal → Recast，type 位根据 direction/snap 设置
+	// AddAreaID 是回调，由具体类型（FNavigationLink 或 FGeneratedNavigationLink）提供 Area/Flag
 	void AddLink(const FNavigationLink& Link, const FTransform& LocalToWorld, float DefaultSnapHeight, TFunctionRef<void(dtOffMeshLinkCreateParams&)> AddAreaID)
 	{
 		dtOffMeshLinkCreateParams NewInfo;
@@ -1474,6 +1532,9 @@ protected:
 //----------------------------------------------------------------------//
 // FNavMeshBuildContext
 // A navmesh building reporting helper
+// ---
+// UE 侧的 rcContext/dtTileCacheLogContext 适配：接收 Recast/Detour 的日志，
+// 转发到 LogNavigation；非 Shipping 下还保留中间可视化数据 InternalDebugData。
 //----------------------------------------------------------------------//
 class FNavMeshBuildContext : public rcContext, public dtTileCacheLogContext
 {
@@ -1685,6 +1746,7 @@ struct FVoxelCacheRasterizeContext
 
 static FVoxelCacheRasterizeContext VoxelCacheContext;
 
+// 统计所有压缩 Tile 层合计字节数（统计用）
 uint32 GetTileCacheSizeHelper(TArray<FNavMeshTileData>& CompressedTiles)
 {
 	uint32 TotalMemory = 0;
@@ -1697,9 +1759,17 @@ uint32 GetTileCacheSizeHelper(TArray<FNavMeshTileData>& CompressedTiles)
 }
 
 //----------------------------------------------------------------------//
-// FRecastTileGenerator
+// ==== [E] FRecastTileGenerator —— 单 Tile 生成器实现 ====
+// 按顺序涵盖：
+//   构造/析构 → Setup → HasDataToBuild → CalculateTileBounds →
+//   DoWork / DoWorkTimeSliced → GatherGeometry 家族 →
+//   Recast 管线（Create/Rasterize/Filter/Compact/Erode/BuildLayers/BuildTileCache）→
+//   GenerateCompressedLayers → GenerateNavigationData* → MarkDynamicAreas →
+//   GetUsedMemCount / AddReferencedObjects
 //----------------------------------------------------------------------//
 
+// 构造：仅保存 Tile 坐标与父 Generator 的一次性配置快照
+// 所有时间切片状态机都初始化到起始态
 FRecastTileGenerator::FRecastTileGenerator(FRecastNavMeshGenerator& ParentGenerator, const FIntPoint& Location, const double PendingTileCreationTime)
 	: TimeSliceManager(ParentGenerator.GetTimeSliceManager())
 	, RasterizeGeometryWorldRecastCoordsBounds(ForceInit)
@@ -1742,6 +1812,7 @@ FRecastTileGenerator::FRecastTileGenerator(FRecastNavMeshGenerator& ParentGenera
 	CompactHF = nullptr;
 }
 
+// 析构：释放 Recast 中间产物；若正处于时间切片会把未完成的 Context 一并丢弃
 FRecastTileGenerator::~FRecastTileGenerator()
 {
 	rcFreeHeightField(SolidHF);
@@ -1752,6 +1823,13 @@ FRecastTileGenerator::~FRecastTileGenerator()
 	GenCompressedlayersTimeSlicedRasterContext.Reset();
 }
 
+// Setup —— 主线程同步完成，之后 DoWork 不再访问 NavOctree
+// 要点：
+//   1) 计算 TileBB + 膨胀后的 TileBBExpandedForAgent（用于收集跨边几何）
+//   2) 裁出与本 Tile 相交的 InclusionBounds 子集
+//   3) 判断 bGeometryChanged：DirtyAreas 空 ⇒ 是"整 Tile 重建"信号
+//   4) 否则拷贝已有 TileCacheLayers，确定哪些层被脏区影响（DirtyLayers 位图）
+//   5) 根据 GatherGeometryOnGameThread()：立即 GatherGeometry 或只 Prepare 来源
 void FRecastTileGenerator::Setup(const FRecastNavMeshGenerator& ParentGenerator, const TArray<FBox>& DirtyAreas)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_FRecastTileGenerator_Setup);
@@ -1855,6 +1933,7 @@ void FRecastTileGenerator::Setup(const FRecastNavMeshGenerator& ParentGenerator,
 	UsedMemoryOnStartup = GetUsedMemCount() + sizeof(FRecastTileGenerator);
 }
 
+// 是否存在任何需要构建的数据；若全为空则跳过 Recast 管线
 bool FRecastTileGenerator::HasDataToBuild() const
 {
 	return
@@ -1865,6 +1944,9 @@ bool FRecastTileGenerator::HasDataToBuild() const
 		|| (InclusionBounds.Num() && NavigationRelevantData.Num() > 0);
 }
 
+// 静态工具：(X,Y) Tile 坐标 → 世界空间 AABB
+// 注意 Recast 是 X-Z 平面，UE 是 X-Y 平面，所以中间要 Recast2UnrealBox
+// Z 方向统一取自 TotalNavBounds（单 Tile 包含整列 layer）
 FBox FRecastTileGenerator::CalculateTileBounds(int32 X, int32 Y, const FVector& RcNavMeshOrigin, const FBox& TotalNavBounds, FVector::FReal TileSizeInWorldUnits)
 {
 	FBox TileBox(
@@ -1880,6 +1962,9 @@ FBox FRecastTileGenerator::CalculateTileBounds(int32 X, int32 Y, const FVector& 
 	return TileBox;
 }
 
+// 时间切片版 DoWork：两阶段状态机（GatherGeometry → GenerateTile）
+// 每次调用处理一段后返回 CallAgainNextTimeSlice / Succeeded / Failed
+// 框架据此在多帧里把一个 Tile 跑完
 ETimeSliceWorkResult FRecastTileGenerator::DoWorkTimeSliced()
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_DoWork);
@@ -1940,6 +2025,8 @@ ETimeSliceWorkResult FRecastTileGenerator::DoWorkTimeSliced()
 	return WorkResult;
 }
 
+// 一次性版 DoWork：后台线程把整个 Tile 跑完
+// 与 DoWorkTimeSliced 的差异仅在于"不保存中间状态、不 yield"
 bool FRecastTileGenerator::DoWork()
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_DoWork);
@@ -2003,6 +2090,8 @@ void FRecastTileGenerator::SetupTileConfigFromHighestResolution(const FRecastNav
 	}
 }
 	
+// 工作线程版本：消费 NavigationRelevantData 数组，提取几何/修饰
+// 被 DoWork() 调用；主线程的 PrepareGeometrySources 只抓 Element 引用，这里解码
 void FRecastTileGenerator::GatherGeometryFromSources()
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_GatherGeometryFromSources);
@@ -2019,6 +2108,7 @@ void FRecastTileGenerator::GatherGeometryFromSources()
 	}
 }
 
+// 时间切片版本：每个 Element 后检查预算，按需返回 CallAgainNextTimeSlice
 ETimeSliceWorkResult FRecastTileGenerator::GatherGeometryFromSourcesTimeSliced()
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_GatherGeometryFromSources);
@@ -2044,6 +2134,12 @@ ETimeSliceWorkResult FRecastTileGenerator::GatherGeometryFromSourcesTimeSliced()
 	return ETimeSliceWorkResult::Succeeded;
 }
 
+// 主线程同步阶段：在 NavOctree 里做 Box 查询，把相关 Element 收到 NavigationRelevantData
+// 调用者：FRecastTileGenerator::Setup（当 GatherGeometryOnGameThread=true 时）
+// 关键点：
+//   - 用膨胀后的 TileBB 覆盖周边几何（考虑 AgentRadius / BorderSize）
+//   - 按 ShouldGenerateGeometryForOctreeElement / ShouldUseGeometry 过滤
+//   - 只保留"本次需要用几何 / 存在 Modifier / MetaArea"的 Element
 void FRecastTileGenerator::PrepareGeometrySources(const FRecastNavMeshGenerator& ParentGenerator, bool bGeometryChanged)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_PrepareGeometrySources);
@@ -2078,6 +2174,8 @@ void FRecastTileGenerator::PrepareGeometrySources(const FRecastNavMeshGenerator&
 	});
 }
 
+// 一次性收集几何（GatherGeometryOnGameThread=true 时即刻执行整个 Gather）
+// 比 PrepareGeometrySources 多做一件事：同时扫到最高 Resolution，用它覆写 TileConfig
 void FRecastTileGenerator::GatherGeometry(const FRecastNavMeshGenerator& ParentGenerator, bool bGeometryChanged)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_GatherGeometry);
@@ -2134,6 +2232,13 @@ void FRecastTileGenerator::GatherGeometry(const FRecastNavMeshGenerator& ParentG
 	}
 }
 
+// 处理一个 FNavigationRelevantData：解码几何 / 懒加载 / 应用 Meta Area / 加入 Modifier
+// 这个函数串起几何（AppendGeometry / VoxelCache）与修饰（AppendModifier）两路
+// 关键分支：
+//  - IsPendingLazyGeometryGathering → DemandLazyDataGathering 按需生成几何缓存
+//  - SupportsGatheringGeometrySlices → GeometrySliceExport（Landscape 按 Tile 切片）
+//  - HasMetaAreas → 展开成具体 Area（MetaArea 可按 Agent 切换）
+//  - VoxelCache 开启时：先查缓存，没有再 PrepareVoxelCache 存下来
 void FRecastTileGenerator::GatherNavigationDataGeometry(const TSharedRef<FNavigationRelevantData, ESPMode::ThreadSafe>& ElementDataRef, UNavigationSystemV1& NavSys, const FNavDataConfig& OwnerNavDataConfig, const bool bGeometryChanged)
 {
 	bool bDumpGeometryData = false;
@@ -2242,24 +2347,31 @@ void FRecastTileGenerator::GatherNavigationDataGeometry(const TSharedRef<FNaviga
 	}
 }
 
+// 旧 API 兼容封装：转发到不带 RasterContext 的新版 CreateHeightField
+// SolidHF/CompactHF 现已是 FRecastTileGenerator 的成员，不再放在 RasterContext
 // Deprecated
 bool FRecastTileGenerator::CreateHeightField(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	return CreateHeightField(BuildContext);
 }
 
+// 旧 API 兼容封装：转发到不带 RasterContext 的新版 GenerateRecastFilter
+// 真正的三阶过滤实现见下方 GenerateRecastFilter(FNavMeshBuildContext&)
 // Deprecated
 void FRecastTileGenerator::GenerateRecastFilter(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	GenerateRecastFilter(BuildContext);
 }
 
+// 旧 API 兼容封装：转发到不带 RasterContext 的切片版 GenerateRecastFilterTimeSliced
 // Deprecated
 ETimeSliceWorkResult FRecastTileGenerator::GenerateRecastFilterTimeSliced(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	return GenerateRecastFilterTimeSliced(BuildContext);
 }
 
+// 旧 API 兼容封装：转发到不带 RasterContext 的新版 BuildCompactHeightField
+// 内部调用 rcBuildCompactHeightfield 把 SolidHF 转成紧凑表示 CompactHF
 // Deprecated
 bool FRecastTileGenerator::BuildCompactHeightField(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
@@ -2272,6 +2384,10 @@ bool FRecastTileGenerator::RecastErodeWalkable(FNavMeshBuildContext& BuildContex
 	return RecastErodeWalkable(BuildContext);
 }
 
+// UE 扩展：Voxel 级"白名单过滤"
+// 对 HF 中每个 span，若它不在任何 InclusionBounds 内就标为 NULL_AREA
+// 目的：避免由于几何溢出 Tile 边界导致在用户划框之外产生"假崖边"
+// 注意：会把 InclusionBounds 膨胀 WalkableRadius*CellSize 缓冲
 void FRecastTileGenerator::ApplyVoxelFilter(rcHeightfield* HF, FVector::FReal WalkableRadius)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_TileVoxelFilteringAsync);
@@ -2395,6 +2511,9 @@ void FRecastTileGenerator::PrepareVoxelCache(const TNavStatArray<uint8>& RawColl
 	return PrepareVoxelCache(RawCollisionCache, FBox(ForceInit), InModifier, SpanData);
 }
 
+// 体素缓存预填：对 RawCollisionCache（FRecastGeometryCache 压缩的三角形）做一次
+// rcMarkWalkableTrianglesCos + rcRasterizeTriangles，把 span 缓存到 SpanData
+// 目的：StaticMesh 的碰撞几何通常不变，下次重建可以直接复用 span 省去体素化
 void FRecastTileGenerator::PrepareVoxelCache(const TNavStatArray<uint8>& RawCollisionCache, const FBox& RecastBounds, const FCompositeNavModifier& InModifier, TNavStatArray<rcSpanCache>& SpanData)
 {
 	// tile's geometry: voxel cache (only for synchronous rebuilds)
@@ -2486,6 +2605,11 @@ void FRecastTileGenerator::AddVoxelCache(TNavStatArray<uint8>& RawVoxelCache, co
 	FMemory::Memcpy(RawVoxelCache.GetData() + NewCacheIdx + HeaderSize, CachedVoxels, VoxelsSize);
 }
 
+// 把 CompositeNavModifier 拆解后追加到本 Tile 的 Modifiers / OffmeshLinks
+// 主要做三件事：
+//  1) OffmeshLinks.Append —— 手动定义和自定义 NavLink 统一并入本 Tile 的 Link 列表
+//  2) 根据 PerInstanceTransformDelegate 抓出当前 Tile 实例化 Transform 列表
+//  3) 若 Modifier 没有 Area 也没有 Resolution，直接跳过
 void FRecastTileGenerator::AppendModifier(const FCompositeNavModifier& Modifier, const FNavDataPerInstanceTransformDelegate& InTransformsDelegate)
 {
 	// append all offmesh links (not included in compress layers)
@@ -2609,6 +2733,9 @@ void FRecastTileGenerator::AppendGeometry(const FNavigationRelevantData& Element
 	}	
 }
 
+// GenerateTile 的时间切片版本：两大阶段 (Compressed → NavigationData)
+// 若 bRegenerateCompressedLayers=false 直接跳到第二阶段，复用已有 CompressedLayers
+// 注意：fall-through 是故意的，用来在同一帧内连续跑完两阶段（直到预算耗尽）
 ETimeSliceWorkResult FRecastTileGenerator::GenerateTileTimeSliced()
 {
 	UE_LOG(LogNavigation, Verbose, TEXT("Building tile (time sliced): (%i,%i)"), TileX, TileY);
@@ -2677,6 +2804,10 @@ ETimeSliceWorkResult FRecastTileGenerator::GenerateTileTimeSliced()
 	return WorkResult;
 }
 
+// 一次性 GenerateTile：
+//   1) 若需要：清空 CompressedLayers 并调 GenerateCompressedLayers（Recast 管线前半段）
+//   2) 用最终 PolyMesh 数据生成 NavigationData（Recast 管线后半段 + Link）
+// 即便两阶段都成功，允许结果"空"（NavigableGeometry=0 → 本 Tile 不产出任何层）
 bool FRecastTileGenerator::GenerateTile()
 {
 #if RECAST_INTERNAL_DEBUG_DATA
@@ -2725,6 +2856,10 @@ bool FRecastTileGenerator::GenerateTile()
 	return bSuccess;
 }
 
+// 单 Tile 体素/层构建过程中的临时上下文
+// - LayerSet：rcBuildHeightfieldLayers 的输出
+// - Layers：每层压缩后的数据
+// - RasterizationMasks：FillCollisionUnderneath 等 Mask 位图
 struct FTileRasterizationContext
 {
 	FTileRasterizationContext() : LayerSet(nullptr), RasterizationFlags(rcRasterizationFlags(0))
@@ -2747,6 +2882,8 @@ private:
 	rcRasterizationFlags RasterizationFlags;
 };
 
+// 创建 Solid Heightfield：根据 TileConfig.tileSize/borderSize 扩边并 rcCreateHeightfield
+// 若 RawGeometry 为空则跳过（后续会得到一个空 Tile）
 bool FRecastTileGenerator::CreateHeightField(FNavMeshBuildContext& BuildContext)
 {
 #if RECAST_INTERNAL_DEBUG_DATA
@@ -2798,6 +2935,8 @@ ETimeSliceWorkResult FRecastTileGenerator::RasterizeGeometryRecastTimeSliced(FNa
 	return RasterizeGeometryRecastTimeSliced(BuildContext, Coords, Indices, FBox(ForceInit), RasterizationFlags, RasterContext);
 }
 
+// 在 SolidHF 中标记 + 体素化一组三角形（切片版）
+// 两段式：①rcMarkWalkableTriangles 按斜率打 Area 标记 ②rcRasterizeTriangles 写 Span
 ETimeSliceWorkResult FRecastTileGenerator::RasterizeGeometryRecastTimeSliced(FNavMeshBuildContext& BuildContext, const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const FBox& CoordsBounds, const rcRasterizationFlags RasterizationFlags, FTileRasterizationContext& RasterContext)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_Navigation_RasterizeGeometryRecast);
@@ -2865,12 +3004,18 @@ ETimeSliceWorkResult FRecastTileGenerator::RasterizeGeometryRecastTimeSliced(FNa
 	return ETimeSliceWorkResult::Succeeded;
 }
 
+// 旧 API 兼容封装：未指定 CoordsBounds，转发到带 Bounds 的重载（用空 Box）
 // Deprecated
 void FRecastTileGenerator::RasterizeGeometryRecast(FNavMeshBuildContext& BuildContext, const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const rcRasterizationFlags RasterizationFlags, FTileRasterizationContext& RasterContext)
 {
 	return RasterizeGeometryRecast(BuildContext, Coords, Indices, FBox(ForceInit), RasterizationFlags, RasterContext);
 }
 
+// 单批三角形体素化（一次性版）：先 rcMarkWalkableTriangles 标记可走面
+// 再 rcRasterizeTriangles 把三角形 splat 进 SolidHF
+// 当 RasterContext.RasterizationMasks 非空时，仅在掩码格子内写入（用于 LowAreaModifier 等）
+// CoordsBounds 用作三角形整体 AABB 优化（让 Recast 早剔除范围外三角形）
+// 调用者：RasterizeGeometry / RasterizeTriangles；前置 SolidHF 已分配
 void FRecastTileGenerator::RasterizeGeometryRecast(FNavMeshBuildContext& BuildContext, const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const FBox& CoordsBounds, const rcRasterizationFlags RasterizationFlags, FTileRasterizationContext& RasterContext)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_Navigation_RasterizeGeometryRecast);
@@ -2926,6 +3071,8 @@ void FRecastTileGenerator::RasterizeGeometryTransformCoordsAndFlipIndices(const 
 	return RasterizeGeometryTransformCoordsAndFlipIndices(Coords, Indices, FBox(ForceInit), LocalToWorld);
 }
 
+// 把实例化几何从 local 坐标转换到 Recast 世界坐标；若缩放矩阵含负值（镜像）翻转索引
+// 输出写入 RasterizeGeometryWorldRecastCoords / RasterizeGeometryFlippedIndices
 void FRecastTileGenerator::RasterizeGeometryTransformCoordsAndFlipIndices(const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const FBox& CoordsBounds, const FTransform& LocalToWorld)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_Navigation_RasterizeGeometryTransformCoordsAndFlipIndices);
@@ -2967,6 +3114,8 @@ void FRecastTileGenerator::RasterizeGeometryTransformCoordsAndFlipIndices(const 
 	}
 }
 
+// 旧 API 兼容封装：与 TransformCoordsAndFlipIndices 不同，此版本只做坐标变换
+// 不处理负缩放镜像翻转，保留供旧调用者使用
 // Deprecated
 void FRecastTileGenerator::RasterizeGeometryTransformCoords(const TArray<FVector::FReal>& Coords, const FTransform& LocalToWorld)
 {
@@ -2995,6 +3144,7 @@ ETimeSliceWorkResult FRecastTileGenerator::RasterizeGeometryTimeSliced(FNavMeshB
 	return RasterizeGeometryTimeSliced(BuildContext, Coords, Indices, FBox(ForceInit), LocalToWorld, RasterizationFlags, RasterContext);
 }
 
+// 带 Transform 的单份几何体素化（切片版）：两阶段 Transform → Rasterize
 ETimeSliceWorkResult FRecastTileGenerator::RasterizeGeometryTimeSliced(FNavMeshBuildContext& BuildContext, const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const FBox& CoordsBounds, const FTransform& LocalToWorld, const rcRasterizationFlags RasterizationFlags, FTileRasterizationContext& RasterContext)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_Navigation_RasterizeGeometry);
@@ -3039,11 +3189,16 @@ ETimeSliceWorkResult FRecastTileGenerator::RasterizeGeometryTimeSliced(FNavMeshB
 	return WorkResult;
 }
 
+// 兼容重载：未指定 CoordsBounds，转发到带 Bounds 的重载（用空 Box）
 void FRecastTileGenerator::RasterizeGeometry(FNavMeshBuildContext& BuildContext, const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const FTransform& LocalToWorld, const rcRasterizationFlags RasterizationFlags, FTileRasterizationContext& RasterContext)
 {
 	return RasterizeGeometry(BuildContext, Coords, Indices, FBox(ForceInit), LocalToWorld, RasterizationFlags, RasterContext);
 }
 
+// 带 Transform 的单份几何体素化（一次性版）：两步串联
+//   1) RasterizeGeometryTransformCoordsAndFlipIndices：local 坐标转 Recast 世界坐标 + 镜像翻转
+//   2) RasterizeGeometryRecast：MarkWalkable + RasterizeTriangles 写入 SolidHF
+// 与切片版 RasterizeGeometryTimeSliced 等价，但不保留状态
 void FRecastTileGenerator::RasterizeGeometry(FNavMeshBuildContext& BuildContext, const TArray<FVector::FReal>& Coords, const TArray<int32>& Indices, const FBox& CoordsBounds, const FTransform& LocalToWorld, const rcRasterizationFlags RasterizationFlags, FTileRasterizationContext& RasterContext)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_Navigation_RasterizeGeometry);
@@ -3053,6 +3208,8 @@ void FRecastTileGenerator::RasterizeGeometry(FNavMeshBuildContext& BuildContext,
 	RasterizeGeometryRecast(BuildContext, RasterizeGeometryWorldRecastCoords, RasterizeGeometryIndices, RasterizeGeometryWorldRecastCoordsBounds, RasterizationFlags, RasterContext);
 }
 
+// 批量体素化（切片版）：遍历 RawGeometry 里每块 Element，每块再遍历 PerInstanceTransform
+// 断点保存在 RasterizeTrianglesTimeSlicedRawGeomIdx / InstTransformIdx，下帧继续
 ETimeSliceWorkResult FRecastTileGenerator::RasterizeTrianglesTimeSliced(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	// Rasterize geometry
@@ -3107,6 +3264,7 @@ ETimeSliceWorkResult FRecastTileGenerator::RasterizeTrianglesTimeSliced(FNavMesh
 	return ETimeSliceWorkResult::Succeeded;
 }
 
+// 批量体素化（一次性版）：同样的双层循环 + 实例化 Transform
 void FRecastTileGenerator::RasterizeTriangles(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	// Rasterize geometry
@@ -3129,6 +3287,11 @@ void FRecastTileGenerator::RasterizeTriangles(FNavMeshBuildContext& BuildContext
 	}
 }
 
+// Recast 三阶过滤（一次性版）：
+//   1) FilterLowHangingWalkableObstacles：去掉保守体素化造成的悬空可走面
+//   2) FilterLedgeSpans：去掉走不过去的"台边"（使用 LedgeSlopeFilterMode 决定规则）
+//   3) FilterWalkableLowHeightSpans：去掉高度不足 AgentHeight 的可走 span
+//      若 bMarkLowHeightAreas=true 改为 Mark（LowHeight 区域）而非删除
 void FRecastTileGenerator::GenerateRecastFilter(FNavMeshBuildContext& BuildContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastFilter)
@@ -3168,6 +3331,8 @@ void FRecastTileGenerator::GenerateRecastFilter(FNavMeshBuildContext& BuildConte
 	}
 }
 
+// Recast 三阶过滤（切片版）：LedgeSpans 是最耗时的一步，按 Y 行数切片
+// 其它两步一次做完（性能较轻）
 ETimeSliceWorkResult FRecastTileGenerator::GenerateRecastFilterTimeSliced(FNavMeshBuildContext& BuildContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastFilter)
@@ -3251,6 +3416,8 @@ ETimeSliceWorkResult FRecastTileGenerator::GenerateRecastFilterTimeSliced(FNavMe
 	return ETimeSliceWorkResult::Succeeded;
 }
 
+// SolidHF → CompactHF：Recast 的空间压缩表示
+// 合并同列 span、缓存邻接关系，后续区域/轮廓/PolyMesh 都基于 CompactHF
 bool FRecastTileGenerator::BuildCompactHeightField(FNavMeshBuildContext& BuildContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildCompactHeightField);
@@ -3281,6 +3448,9 @@ bool FRecastTileGenerator::BuildCompactHeightField(FNavMeshBuildContext& BuildCo
 	return true;
 }
 
+// Erode Walkable：用 AgentRadius 对可走区域做 2D 腐蚀，边沿的一圈不再可走
+// 若 bMarkLowHeightAreas=true 同时会把高度不足的地方标成 LowArea
+// 极小 Agent（<RECAST_VERY_SMALL_AGENT_RADIUS）跳过腐蚀，只做 LowArea Mark
 bool FRecastTileGenerator::RecastErodeWalkable(FNavMeshBuildContext& BuildContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastErodeWalkable);
@@ -3315,6 +3485,9 @@ bool FRecastTileGenerator::RecastErodeWalkable(FNavMeshBuildContext& BuildContex
 	return true;
 }
 
+// 把 CompactHF 拆成多个 HeightField Layer（rcHeightfieldLayer）
+// 选择分区算法：Monotone（一次扫描）/ Watershed（分水岭）/ ChunkyMonotone（分块）
+// ARecastNavMesh::RegionPartitioning / LayerPartitioning 决定
 bool FRecastTileGenerator::RecastBuildLayers(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildLayers);
@@ -3360,6 +3533,12 @@ bool FRecastTileGenerator::RecastBuildLayers(FNavMeshBuildContext& BuildContext,
 	return true;
 }
 
+// 构建 TileCache：把每个 HeightField Layer 压缩成 dtTileCacheLayer
+// 关键点：
+//  - 每层包含 heights/areas/cons（高度、Area ID、连接）
+//  - 层 AABB Z 方向扩 StepHeight，让贴边 OffMeshConnection 也能 overlap 到
+//  - 用 dtBuildTileCacheLayer + 本地 FTileCacheCompressor 做 Oodle 压缩
+// 最终结果放到 CompressedLayers，由 NavMesh 存储，支持后续 Area 动态修改而不重新体素化
 bool FRecastTileGenerator::RecastBuildTileCache(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildTileCache);
@@ -3451,6 +3630,11 @@ bool FRecastTileGenerator::RecastBuildTileCache(FNavMeshBuildContext& BuildConte
 	return true;
 }
 
+// GenerateCompressedLayers 的时间切片版本（核心状态机）
+//  整个 Recast 前半段被切成 9 个阶段：
+//  Init → CreateHeightField → RasterizeTriangles → EmptyLayers →
+//  VoxelFilter → RecastFilter → CompactHeightField → ErodeWalkable → BuildLayers → BuildTileCache
+//  每阶段结束后调 TestTimeSliceFinished 判断是否 yield
 ETimeSliceWorkResult FRecastTileGenerator::GenerateCompressedLayersTimeSliced(FNavMeshBuildContext& BuildContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildCompressedLayers);
@@ -3641,6 +3825,8 @@ ETimeSliceWorkResult FRecastTileGenerator::GenerateCompressedLayersTimeSliced(FN
 	return ETimeSliceWorkResult::Succeeded;
 }
 
+// 旧 API 兼容封装：未传 dtLinkBuilderData，构造空对象转发
+// 新版本要求显式传入 LinkBuilderData 以便在 BuildTileCacheLinks 时复用
 // Deprecated
 bool FRecastTileGenerator::GenerateCompressedLayers(FNavMeshBuildContext& BuildContext)
 {
@@ -3648,6 +3834,8 @@ bool FRecastTileGenerator::GenerateCompressedLayers(FNavMeshBuildContext& BuildC
 	return GenerateCompressedLayers(BuildContext, LinBuilderData);
 }
 
+// 旧 API 兼容封装：补一个空 dtLinkBuilderData 转发
+// 真正逻辑见下方 GenerateNavigationDataLayer(... LinkBuilderData ...)
 // Deprecated
 bool FRecastTileGenerator::GenerateNavigationDataLayer(FNavMeshBuildContext& BuildContext, FTileCacheCompressor& TileCompressor, FTileCacheAllocator& GenNavAllocator, FTileGenerationContext& GenerationContext, int32 LayerIdx)
 {
@@ -3655,6 +3843,8 @@ bool FRecastTileGenerator::GenerateNavigationDataLayer(FNavMeshBuildContext& Bui
 	return GenerateNavigationDataLayer(BuildContext, TileCompressor, GenNavAllocator, GenerationContext, LinBuilderData, LayerIdx);
 }
 
+// 旧 API 兼容封装：切片版 GenerateNavigationDataTimeSliced 的转发
+// 注意每帧重新构造空 LinBuilderData，意味着旧路径不能在层间复用 Link 数据
 // Deprecated
 ETimeSliceWorkResult FRecastTileGenerator::GenerateNavigationDataTimeSliced(FNavMeshBuildContext& BuildContext)
 {
@@ -3662,6 +3852,7 @@ ETimeSliceWorkResult FRecastTileGenerator::GenerateNavigationDataTimeSliced(FNav
 	return GenerateNavigationDataTimeSliced(BuildContext, LinBuilderData);
 }
 
+// 旧 API 兼容封装：一次性版 GenerateNavigationData 的转发
 // Deprecated
 bool FRecastTileGenerator::GenerateNavigationData(FNavMeshBuildContext& BuildContext)
 {
@@ -3671,7 +3862,11 @@ bool FRecastTileGenerator::GenerateNavigationData(FNavMeshBuildContext& BuildCon
 
 namespace UE::NavMesh::Private
 {
-	// Make sure LinkSpillDistance and CellSize has been computed before computing borders.
+	// 计算 Tile 周围的 Border 体素数
+	// 目的：确保"跨边"的 Modifier / 几何 / 生成 Link 都能正确采样到
+	// BorderForAgentVx 来自 Agent 自身尺寸；BorderForLinksVx 来自 LinkSpillDistance
+	// 最终 borderSize.low/high 取二者最大
+	// 启用 bUseAsymetricBorderSizes 时 low 可以小于 high（Link 一般只在高 Z 方向采）
 	void ComputeConfigBorderSizes(const bool bGeneratingLinks, FRecastBuildConfig& InOutConfig)
 	{
 		int BorderForLinksVx = 0;
@@ -3703,6 +3898,9 @@ namespace UE::NavMesh::Private
 #endif //RECAST_INTERNAL_DEBUG_DATA
 };
 
+// GenerateCompressedLayers 一次性版本：线性执行整个前半段
+// 与切片版 GenerateCompressedLayersTimeSliced 逻辑一致，只是不保存状态
+// 每个阶段失败立即 return false
 bool FRecastTileGenerator::GenerateCompressedLayers(FNavMeshBuildContext& BuildContext, const dtLinkBuilderData& InLinkBuilderData)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildCompressedLayers);
@@ -3812,6 +4010,12 @@ bool FRecastTileGenerator::GenerateCompressedLayers(FNavMeshBuildContext& BuildC
 	return RecastBuildTileCache(BuildContext, RasterContext);
 }
 
+// -------------------------------------------------------------------------------------
+// FTileGenerationContext —— NavigationData 生成过程中的中间容器
+// 保存当前层的 dtTileCacheLayer / DistanceField / ContourSet / PolyMesh / DetailMesh
+// 可在 ResetIntermediateData() 时一次性释放
+// NavigationData（真正给 dtNavMesh 的数据）保留，不会在 ResetIntermediateData 中清掉
+// -------------------------------------------------------------------------------------
 struct FTileGenerationContext
 {
 	FTileGenerationContext(dtTileCacheAlloc* MyAllocator) :	Allocator(MyAllocator)	{}
@@ -3855,6 +4059,14 @@ struct FTileGenerationContext
 	TArray<FNavMeshTileData> NavigationData;
 };
 
+// 把 dtNavLinkBuilder 算出的 JumpLink 转成 UE 侧的 FGeneratedNavigationLink
+// 对每条 link：
+//  - 若 up/down 共享同一个 Area：生成单条双向链接（性能更好）
+//  - 若不同：分别生成两条单向链接（各自方向用对应 Area/Flag）
+// 采样点选择：
+//  - DT_NAVLINK_CREATE_CENTER_POINT_LINK: 边中点
+//  - DT_NAVLINK_CREATE_EXTREMITY_LINKS:   边端点（首 + 末）
+// 每个点都向下偏 agentClimb，避免体素浮动影响
 static void AddGeneratedLinks(
 	TArray<FGeneratedNavigationLink>& OutGeneratedLinks,
 	const dtLinkBuilderConfig& linkBuilderConfig,
@@ -3959,6 +4171,13 @@ static void AddGeneratedLinks(
 	}
 }
 
+// 从 PolyMesh 的 ContourSet 自动生成跳跃/下落 Link
+// 流程：
+//   1) 从 TileConfig.JumpConfigs 拷出 dtLinkBuilderConfig，对每个启用的 config 做 init()
+//   2) linkBuilder.findEdges：扫出 Contour 上所有可能做 Link 的边
+//   3) 对每个 jumpConfig.enabled：linkBuilder.buildForAllEdges（或 DebugBuildEdge 单条）
+//   4) AddGeneratedLinks 把结果转成 FGeneratedNavigationLink
+// 调用者：GenerateNavigationDataLayer；需要 SolidHF 与 CompactHF 都还在
 dtStatus FRecastTileGenerator::BuildTileCacheLinks(FNavMeshBuildContext& BuildContext, dtTileCacheAlloc* alloc, const dtTileCacheLayer& layer,
                                                    const dtTileCacheContourSet& lcset, TArray<FGeneratedNavigationLink>& OutGeneratedLinks) const
 {
@@ -4080,6 +4299,10 @@ dtStatus FRecastTileGenerator::BuildTileCacheLinks(FNavMeshBuildContext& BuildCo
 	return DT_SUCCESS;
 }
 
+// 处理单层：对一个 CompressedLayer 跑"Decompress → MarkDynamicArea → BuildRegions →
+// BuildContours → BuildPolyMesh → BuildDetailMesh → BuildLinks → dtCreateNavMeshData"
+// 这是 Recast 管线的后半段（前半段在 GenerateCompressedLayers 里）
+// 输出：GenerationContext.NavigationData[LayerIdx] 将被后面收集到 this->NavigationData
 bool FRecastTileGenerator::GenerateNavigationDataLayer(FNavMeshBuildContext& BuildContext, FTileCacheCompressor& TileCompressor,
 	FTileCacheAllocator& GenNavAllocator, FTileGenerationContext& GenerationContext, const dtLinkBuilderData& InLinkBuilderData, int32 LayerIdx)
 {
@@ -4398,6 +4621,8 @@ bool FRecastTileGenerator::GenerateNavigationDataLayer(FNavMeshBuildContext& Bui
 	return true;
 }
 
+// GenerateNavigationData 时间切片版：逐层切片
+// 按 DirtyLayers 位图决定哪些层需要重刷；IsTimeSliceFinishedCached 判断 yield 点
 ETimeSliceWorkResult FRecastTileGenerator::GenerateNavigationDataTimeSliced(FNavMeshBuildContext& BuildContext, const dtLinkBuilderData& InLinkBuilderData)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildNavigation);
@@ -4476,6 +4701,8 @@ ETimeSliceWorkResult FRecastTileGenerator::GenerateNavigationDataTimeSliced(FNav
 	return WorkResult;
 }
 
+// GenerateNavigationData 一次性版：循环遍历所有 Dirty 层依次处理
+// 最终把中间上下文的 NavigationData 通过 MoveTemp 搬到 this->NavigationData
 bool FRecastTileGenerator::GenerateNavigationData(FNavMeshBuildContext& BuildContext, const dtLinkBuilderData& InLinkBuilderData)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastBuildNavigation);
@@ -4516,6 +4743,9 @@ bool FRecastTileGenerator::GenerateNavigationData(FNavMeshBuildContext& BuildCon
 	return bGenDataLayer;
 }
 
+// 计算体素化 mask：对每个 Modifier 里的 MaskFillCollisionUnderneath 形状
+// 在 SolidHF 对应 XY 位置上把 ~RC_PROJECT_TO_BOTTOM 位清零，阻止 Recast 向下填实
+// 用途：大型 Modifier 覆盖的柱体顶部"不要"被视作实心地面（保留空洞）
 void FRecastTileGenerator::ComputeRasterizationMasks(FNavMeshBuildContext& BuildContext, FTileRasterizationContext& RasterContext)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastComputeRasterizationMasks);
@@ -4548,6 +4778,13 @@ void FRecastTileGenerator::ComputeRasterizationMasks(FNavMeshBuildContext& Build
 	}
 }
 
+// 把收集到的 FAreaNavModifier 按三阶段应用到 TileCache Layer：
+//   Pass 1（仅 bMarkLowHeightAreas）：先应用 ApplyInLowPass / ReplaceInLowPass 模式
+//     把本来 NULL 的地方标成 LowArea（允许蹲伏通过）
+//   Pass 2：dtReplaceArea(NULL, LowArea) —— 把剩余 NULL 变成 LowArea
+//   Pass 3：应用其它所有 Modifier（跳过 Low* 模式）
+// 如果 Modifiers 空且启用 bMarkLowHeightAreas，直接 Pass 2
+// 注意：排序 SortAreasForGenerator 可保证 Replace/Cover 顺序一致
 void FRecastTileGenerator::MarkDynamicAreas(dtTileCacheLayer& Layer)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastMarkAreas);
@@ -4638,6 +4875,9 @@ void FRecastTileGenerator::MarkDynamicAreas(dtTileCacheLayer& Layer)
 	}
 }
 
+// MarkDynamicArea 入口：先按 Modifier.AreaClass 在 AdditionalCachedData.AreaClassToIdMap
+// 中查到 Recast 的 AreaID，再可选查到 ReplaceID（替换型 Modifier）
+// 找不到 AreaID（未注册的 NavArea）则直接跳过；找到后转发到核心实现重载
 void FRecastTileGenerator::MarkDynamicArea(const FAreaNavModifier& Modifier, const FTransform& LocalToWorld, dtTileCacheLayer& Layer)
 {
 	const int32* AreaIDPtr = AdditionalCachedData.AreaClassToIdMap.Find(Modifier.GetAreaClass());
@@ -4745,6 +4985,11 @@ void MarkConvexMask(const int mask, const FVector::FReal* verts, const int nv, r
 	}
 }
 
+// 计算并写入"光栅化掩码"：根据 Modifier 的 Box/Convex 形状把 Mask 与到 OutMaskArray
+// 用途：在体素化阶段（rcRasterizeTriangles）按 (x,z) 格子裁剪三角形
+// 比如 RC_PROJECT_TO_BOTTOM 用来对"覆盖下方碰撞填实"区域取消该效果
+// 首次调用会按 SolidHF 大小初始化为全 0xFF（允许全部）
+// 注意：仅支持 Box/Convex；与 TileBB 不相交直接 early-out
 void FRecastTileGenerator::MarkRasterizationMask(rcContext* /*BuildContext*/, rcHeightfield* InSolidHF,
 	const FAreaNavModifier& Modifier, const FTransform& LocalToWorld, const int32 Mask, TInlineMaskArray& OutMaskArray)
 {
@@ -4809,6 +5054,12 @@ void FRecastTileGenerator::MarkRasterizationMask(rcContext* /*BuildContext*/, rc
 	}
 }
 
+// 按 Modifier 类型（Cylinder/Box/Convex/Per-Instance...）调用 dt*Area 把区域 Mark 上
+// 关键 offset：
+//  - ExpandBy=AgentRadius：XY 方向膨胀，补偿 Erode 过程
+//  - OffsetZMax：顶部扩 1 cell height（bUseExtraTopCellWhenMarkingAreas）
+//  - OffsetZMin：底部扩 1 cell + 可选 AgentHeight（处理贴地 Modifier）
+// 若 ReplaceIDPtr 非空：调 dt*ReplaceArea 只替换指定 Area；否则 dt*MarkArea
 void FRecastTileGenerator::MarkDynamicArea(const FAreaNavModifier& Modifier, const FTransform& LocalToWorld, dtTileCacheLayer& Layer, const int32 AreaID, const int32* ReplaceIDPtr)
 {
 	const float ExpandBy = TileConfig.AgentRadius;
@@ -5101,16 +5352,21 @@ int32 CalculateMaxTilesCount(const TNavStatArray<FBox>& NavigableAreas, FVector:
 }
 } // UE::NavMesh::Private
 
-// Whether navmesh is static, does not support rebuild from geometry
+// 静态 NavMesh（不允许运行时重建）探测：游戏世界 + 生成模式非 Dynamic
 static bool IsGameStaticNavMesh(ARecastNavMesh* InNavMesh)
 {
 	return (InNavMesh->GetWorld()->IsGameWorld() && InNavMesh->GetRuntimeGenerationMode() != ERuntimeGenerationType::Dynamic);
 }
 
 //----------------------------------------------------------------------//
-// FRecastNavMeshGenerator
+// ==== [F] FRecastNavMeshGenerator —— 整张 NavMesh 的调度器实现 ====
+// 关键流程（对应架构文档 4.3 节）：
+//   TickAsyncBuild → ProcessTileTasksAsync/Sync → (Pending → Running) → AddGeneratedTiles
+// 本节包含：构造/析构 / Config / Init / RebuildAll / RebuildDirtyAreas / MarkDirtyTiles /
+//           Tile 任务派发和回收 / Active Tiles 管理 / 脏区→Tile 转换
 //----------------------------------------------------------------------//
 
+// 构造：设置初始容量、引用 NavMesh、MaxTileGeneratorTasks 默认为 1（Init 时再调）
 FRecastNavMeshGenerator::FRecastNavMeshGenerator(ARecastNavMesh& InDestNavMesh)
 	: NumActiveTiles(0)
 	, MaxTileGeneratorTasks(1)
@@ -5123,6 +5379,7 @@ FRecastNavMeshGenerator::FRecastNavMeshGenerator(ARecastNavMesh& InDestNavMesh)
 	INC_DWORD_STAT_BY(STAT_NavigationMemory, sizeof(*this));
 }
 
+// 析构：取消所有 Running/Pending 任务（CancelBuild）并输出统计
 PRAGMA_DISABLE_DEPRECATION_WARNINGS	// Needed for ActiveTiles
 FRecastNavMeshGenerator::~FRecastNavMeshGenerator()
 {
@@ -5132,6 +5389,9 @@ FRecastNavMeshGenerator::~FRecastNavMeshGenerator()
 }
 PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
+// 覆盖 OutConfig 的 cs/ch/walkableClimb/walkableRadius 等：根据传入的 Resolution 档
+// 同时重新计算 borderSize（依赖 CellSize 与 LinkSpillDistance）
+// 调用者：ARecastNavMesh 切 Tile 分辨率时（通过 FRecastTileGenerator::SetupTileConfigFromHighestResolution）
 void FRecastNavMeshGenerator::SetupTileConfig(const ENavigationDataResolution TileResolution, FRecastBuildConfig& OutConfig) const
 {
 	check(GetOwner());
@@ -5171,6 +5431,12 @@ void FRecastNavMeshGenerator::SetupTileConfig(const ENavigationDataResolution Ti
 	OutConfig.bIsTileSetupConfigCompleted = true;
 }
 
+// 组装初始 Config：从 ARecastNavMesh 的属性读取所有生成相关开关
+// - Agent 尺寸（AgentHeight/Radius/MaxSlope/MaxStepHeight）
+// - Region/Layer/Filter 参数
+// - JumpConfigs（若启用自动 Link）
+// - LinkSpillDistance 推算
+// - 对每个 Resolution 验证 MaxStepHeight vs MaxSlope 是否匹配（不匹配会警告）
 void FRecastNavMeshGenerator::ConfigureBuildProperties(FRecastBuildConfig& OutConfig)
 {
 	// @TODO those variables should be tweakable per navmesh actor
@@ -5281,6 +5547,15 @@ void FRecastNavMeshGenerator::ConfigureBuildProperties(FRecastBuildConfig& OutCo
 	OutConfig.TileCachePartitionType = DestNavMesh->RegionPartitioning;
 }
 
+// 初始化：
+//   1) 拿到 TimeSliceManager（NavSystem 持有）
+//   2) ConfigureBuildProperties 构建 Config
+//   3) 计算 BBoxGrowthLow/High（决定 Dirty/脏区向邻 Tile 蔓延的尺度）
+//   4) 构造 AdditionalCachedData（AreaClass→ID、NavAreaFlags 等）
+//   5) ResolveGeneratedLinkAreas（Link Area 解析）
+//   6) 决定 MaxTileGeneratorTasks（CPU 核数 × 2 但不超过 NavMesh.MaxSimultaneous）
+//   7) 开启 VoxelCacheContext
+//   8) 比对已存在的 dtNavMesh 参数，判断是否可以复用（否则重建）
 void FRecastNavMeshGenerator::Init()
 {
 	check(DestNavMesh);
@@ -5430,6 +5705,8 @@ void FRecastNavMeshGenerator::Init()
 	}
 }
 
+// 刷新 InclusionBounds / TotalNavBounds：从 NavigationSystem 拿到所有 ANavMeshBoundsVolume
+// 调用者：OnNavigationBoundsChanged / Init / RebuildAll
 void FRecastNavMeshGenerator::UpdateNavigationBounds()
 {
 	const UNavigationSystemV1* NavSys = FNavigationSystem::GetCurrent<UNavigationSystemV1>(GetWorld());
@@ -5468,6 +5745,8 @@ void FRecastNavMeshGenerator::UpdateNavigationBounds()
 	}
 }
 
+// 创建 dtNavMesh 并设置原点、Tile 尺寸、MaxTiles/MaxPolys
+// 注意 dtNavMesh 内部用 polyRef 合并 tileIndex + polyIndex + salt，需要位宽计算
 bool FRecastNavMeshGenerator::ConstructTiledNavMesh() 
 {
 	bool bSuccess = false;
@@ -5538,6 +5817,8 @@ bool FRecastNavMeshGenerator::ConstructTiledNavMesh()
 	return bSuccess;
 }
 
+// 静态工具：根据 NavMesh 尺寸/分辨率推算 polyRef 中 tile 和 poly 各占的 bit 数
+// 由 dtNavMesh::init 需要；dtNavMeshParams::maxTiles = 2^maxTileBits
 void FRecastNavMeshGenerator::CalcPolyRefBits(ARecastNavMesh* NavMeshOwner, int32& MaxTileBits, int32& MaxPolyBits)
 {
 	static const int32 TotalBits = (sizeof(dtPolyRef) * 8);
@@ -5550,11 +5831,15 @@ void FRecastNavMeshGenerator::CalcPolyRefBits(ARecastNavMesh* NavMeshOwner, int3
 #endif//USE_64BIT_ADDRESS
 }
 
+// 是否启用 Link 自动生成：NavMesh 开关 && 全局 CVar 允许
 bool FRecastNavMeshGenerator::IsGeneratingLinks() const
 {
 	return DestNavMesh && DestNavMesh->bGenerateNavLinks && UE::NavMesh::Private::bAllowLinkGeneration; 
 }
 
+// 解析 LinkGenerationConfig 里的 AreaClass → Recast AreaID + PolyFlag
+// 结果写入 Config.JumpConfigs[].downDirArea / upDirArea / downDirPolyFlag / upDirPolyFlag
+// 前置：AdditionalCachedData 必须已经构造好（AreaClassToIdMap）
 void FRecastNavMeshGenerator::ResolveGeneratedLinkAreas(FRecastBuildConfig& OutConfig)
 {
 	if (IsGeneratingLinks())
@@ -5599,6 +5884,8 @@ void FRecastNavMeshGenerator::ResolveGeneratedLinkAreas(FRecastBuildConfig& OutC
 	}
 }
 
+// 计算 MaxTiles / MaxPolysPerTile：根据 TotalNavBounds / TileSize 推算 Tile 数
+// MaxPolys 取 Tile 内最多可容纳的多边形上限
 void FRecastNavMeshGenerator::CalcNavMeshProperties(int32& MaxTiles, int32& MaxPolys)
 {
 	int32 MaxTileBits = -1;
@@ -5636,6 +5923,8 @@ void FRecastNavMeshGenerator::CalcNavMeshProperties(int32& MaxTiles, int32& MaxP
 	MaxTiles = MaxRequestedTiles;
 }
 
+// 重建全部 NavMesh：清空 dtNavMesh、重新 Construct、把 InclusionBounds 内所有 Tile 入队
+// 调用者：NavigationSystem::Build / 手动 Rebuild / 场景 Bounds 大幅变化
 bool FRecastNavMeshGenerator::RebuildAll()
 {
 	DestNavMesh->UpdateNavVersion();
@@ -5661,6 +5950,8 @@ bool FRecastNavMeshGenerator::RebuildAll()
 	return true;
 }
 
+// 阻塞直到所有 Tile 构建完成（关卡切换/退出前使用）
+// 会执行 TickAsyncBuild 多次直到 Pending + Running 都为 0
 void FRecastNavMeshGenerator::EnsureBuildCompletion()
 {
 	const bool bHadTasks = GetNumRemaningBuildTasks() > 0;
@@ -5686,6 +5977,8 @@ void FRecastNavMeshGenerator::EnsureBuildCompletion()
 	}
 }
 
+// 取消全部 Pending + Running 任务
+// Running 里的 AsyncTask 会被设置 bShouldDiscard，结果不会回补到 dtNavMesh
 void FRecastNavMeshGenerator::CancelBuild()
 {
 	DiscardCurrentBuildingTasks();
@@ -5695,6 +5988,11 @@ void FRecastNavMeshGenerator::CancelBuild()
 #endif//WITH_EDITOR
 }
 
+// 每帧由 ARecastNavMesh::TickAsyncBuild 驱动：
+//   1) 按 MaxTileGeneratorTasks 从 Pending 队列派发新任务
+//   2) 回收已完成 Task（AddGeneratedTiles → dtNavMesh）
+//   3) 若启用 Invoker Active Tiles 模式，顺带做 Active Tile 差集更新
+// DeltaSeconds 供时间切片管理器估算预算
 void FRecastNavMeshGenerator::TickAsyncBuild(float DeltaSeconds)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_TickAsyncBuild);
@@ -5773,6 +6071,7 @@ void FRecastNavMeshGenerator::TickAsyncBuild(float DeltaSeconds)
 	}
 }
 
+// 场景 NavMeshBoundsVolume 增删/移动时触发；刷 TotalNavBounds 并可能重建 dtNavMesh
 void FRecastNavMeshGenerator::OnNavigationBoundsChanged()
 {
 	check(DestNavMesh);
@@ -5813,6 +6112,8 @@ void FRecastNavMeshGenerator::OnNavigationBoundsChanged()
 	}
 }
 
+// 脏区接入点：FNavigationDirtyArea → Tile 坐标集合（MarkDirtyTiles）
+// 调用者：NavigationSystem::RebuildDirtyAreas（按 DirtyAreasUpdateFreq 节流）
 void FRecastNavMeshGenerator::RebuildDirtyAreas(const TArray<FNavigationDirtyArea>& InDirtyAreas)
 {
 	dtNavMesh* DetourMesh = DestNavMesh->GetRecastNavMeshImpl()->GetRecastMesh();
@@ -5847,6 +6148,8 @@ int32 FRecastNavMeshGenerator::FindInclusionBoundEncapsulatingBox(const FBox& Bo
 	return INDEX_NONE;
 }
 
+// 切换只生成 ActiveTile 附近模式；从 RebuildAll / NavSys 调
+// 开启后：收到的 Dirty Area 会先被 ActiveTileSet 过滤再入 Pending 队列
 void FRecastNavMeshGenerator::RestrictBuildingToActiveTiles(bool InRestrictBuildingToActiveTiles) 
 { 
 	if (bRestrictBuildingToActiveTiles != InRestrictBuildingToActiveTiles)
@@ -5875,11 +6178,16 @@ void FRecastNavMeshGenerator::RestrictBuildingToActiveTiles(bool InRestrictBuild
 	}
 }
 
+// 判断 Tile 是否在当前允许构建集合里
+// - bRestrictBuildingToActiveTiles=false: 恒真（全部允许）
+// - 否则：只允许 ActiveTileSet 内的 Tile
 bool FRecastNavMeshGenerator::IsInActiveSet(const FIntPoint& Tile) const
 {
 	return bRestrictBuildingToActiveTiles == false || ActiveTileSet.Contains(Tile);
 }
 
+// 丢弃当前时间切片处理中的 TileGenerator 并复位相关状态机
+// 典型场景：Version 变化使当前任务作废
 void FRecastNavMeshGenerator::ResetTimeSlicedTileGeneratorSync()
 {
 	SyncTimeSlicedData.TileGeneratorSync.Reset();
@@ -5894,6 +6202,8 @@ void FRecastNavMeshGenerator::ResetTimeSlicedTileGeneratorSync()
 }
 
 //@TODO Investigate removing from RunningDirtyTiles here too (or at least not using the results in any way)
+// 批量删除 Tile（Invoker 离开半径 / RemoveTileGrid）
+// 对每个 Tile：调 RemoveTileLayersAndGetUpdatedTiles 从 dtNavMesh 卸下 + 减 NumActiveTiles
 void FRecastNavMeshGenerator::RemoveTiles(const TArray<FIntPoint>& Tiles)
 {
 	dtNavMesh* DetourMesh = DestNavMesh->GetRecastNavMeshImpl()->GetRecastMesh();
@@ -5923,6 +6233,7 @@ void FRecastNavMeshGenerator::RemoveTiles(const TArray<FIntPoint>& Tiles)
 	}
 }
 
+// Invoker 重新靠近：把之前 Remove 掉的 Tile 重新放入 PendingDirtyTiles
 void FRecastNavMeshGenerator::ReAddTiles(const TArray<FNavMeshDirtyTileElement>& Tiles)
 {
 	static const FVector Expansion(1, 1, BIG_NUMBER);
@@ -6039,6 +6350,8 @@ namespace RecastTileVersionHelper
 	}
 }
 
+// 卸下 Tile 层并返回之前的 NavTileRef 列表（供上层监听变化）
+// 同时可在 OldLayerTileIdMap 里记下 LayerIdx→旧 dtPolyRef，用于 Link 重连
 TArray<FNavTileRef> FRecastNavMeshGenerator::RemoveTileLayersAndGetUpdatedTiles(const int32 TileX, const int32 TileY, TMap<int32, dtPolyRef>* OldLayerTileIdMap)
 {
 	dtNavMesh* DetourMesh = DestNavMesh->GetRecastNavMeshImpl()->GetRecastMesh();
@@ -6086,6 +6399,8 @@ TArray<FNavTileRef> FRecastNavMeshGenerator::RemoveTileLayersAndGetUpdatedTiles(
 	return UpdatedIndices;
 }
 
+// 从 dtNavMesh 卸下指定 (TileX,TileY) 的所有 Layer
+// 仅释放 detour 内部的 tile 数据，不负责 TileCache；TileCache 由 ARecastNavMesh 独立管理
 void FRecastNavMeshGenerator::RemoveTileLayers(dtNavMesh* DetourMesh, const int32 TileX, const int32 TileY)
 {
 	check(DetourMesh && !DetourMesh->isEmpty())
@@ -6121,6 +6436,7 @@ void FRecastNavMeshGenerator::RemoveTileLayers(dtNavMesh* DetourMesh, const int3
 #endif
 }
 
+// 时间切片数据初始化：若编译开启 TIME_SLICE_NAV_REGEN 则默认启用
 FRecastNavMeshGenerator::FSyncTimeSlicedData::FSyncTimeSlicedData()
 	: CurrentTileRegenDuration(0.)
 #if TIME_SLICE_NAV_REGEN
@@ -6137,6 +6453,12 @@ FRecastNavMeshGenerator::FSyncTimeSlicedData::FSyncTimeSlicedData()
 {
 }
 
+// 主线程：把 TileGenerator 生成的单个 Layer 写入 dtNavMesh
+// 细节：
+//  - 先调 RemoveTileLayers 清旧数据
+//  - dtNavMesh::addTile 接管 TileGenerator.NavigationData 内存（DT_TILE_FREE_DATA）
+//  - 记录 polyRef 映射到 OldLayerTileIdMap（后续 Link 重连用）
+//  - 把受影响的 FNavTileRef 加进 OutResultTileRefs（通知上层 NavMesh 变化）
 void FRecastNavMeshGenerator::AddGeneratedTileLayer(int32 LayerIndex, FRecastTileGenerator& TileGenerator, const TMap<int32, dtPolyRef>& OldLayerTileIdMap, TArray<FNavTileRef>& OutResultTileRefs)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastAddGeneratedTileLayer);
@@ -6283,6 +6605,7 @@ void FRecastNavMeshGenerator::LogDirtyAreas(const UObject& OwnerNav,
 }
 #endif
 
+// 时间切片版 AddGeneratedTiles：一层一层提交，减少主线程一次性卡顿
 ETimeSliceWorkResult FRecastNavMeshGenerator::AddGeneratedTilesTimeSliced(FRecastTileGenerator& TileGenerator, TArray<FNavTileRef>& OutResultTileRefs)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastAddGeneratedTiles);
@@ -6363,6 +6686,11 @@ ETimeSliceWorkResult FRecastNavMeshGenerator::AddGeneratedTilesTimeSliced(FRecas
 	return WorkResult;
 }
 
+// 主线程：把 TileGenerator 生成的所有 Dirty Layer 一次性提交
+// 流程：
+//   1) bRegenerateCompressedLayers → 先 RemoveTileLayers 清空旧数据（记录 OldLayerTileIdMap）
+//   2) 从第一个 Dirty Layer 开始遍历，调用 AddGeneratedTileLayer
+// 若 IsAllowedToAddTileLayers(Tile)=false（例如不在 ActiveTileSet）会跳过提交
 TArray<FNavTileRef> FRecastNavMeshGenerator::AddGeneratedTilesAndGetUpdatedTiles(FRecastTileGenerator& TileGenerator)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_RecastAddGeneratedTiles);
@@ -6400,6 +6728,8 @@ TArray<FNavTileRef> FRecastNavMeshGenerator::AddGeneratedTilesAndGetUpdatedTiles
 	return ResultTileRefs;
 }
 
+// 丢弃所有正在运行的任务（强制 EnsureCompletion 等待线程安全停）
+// 常见场景：NavMesh 被重建 / CancelBuild / Version 递增
 void FRecastNavMeshGenerator::DiscardCurrentBuildingTasks()
 {
 	PendingDirtyTiles.Empty();
@@ -6419,6 +6749,7 @@ void FRecastNavMeshGenerator::DiscardCurrentBuildingTasks()
 	RunningDirtyTiles.Empty();
 }
 
+// 是否还有 Tile 在构建：Pending + Running + 当前时间切片中的那个
 bool FRecastNavMeshGenerator::HasDirtyTiles() const
 {
 	return (PendingDirtyTiles.Num() > 0 
@@ -6427,6 +6758,8 @@ bool FRecastNavMeshGenerator::HasDirtyTiles() const
 		);
 }
 
+// 把 AABB 按 BorderSize 膨胀：用于"收集几何"时需要覆盖 Tile 边缘外围的元素
+// bIncludeAgentHeight=true 时还会向下扩展 AgentHeight（寻高度容差）
 FBox FRecastNavMeshGenerator::GrowBoundingBox(const FBox& BBox, bool bIncludeAgentHeight) const
 {
 	const FVector BBoxGrowOffsetMin = FVector(0, 0, bIncludeAgentHeight ? Config.AgentHeight : 0.0f);
@@ -6434,6 +6767,7 @@ FBox FRecastNavMeshGenerator::GrowBoundingBox(const FBox& BBox, bool bIncludeAge
 	return FBox(BBox.Min - BBoxGrowthLow - BBoxGrowOffsetMin, BBox.Max + BBoxGrowthHigh);
 }
 
+// 把脏区 AABB 膨胀：用于把一个局部改变"泼洒"到相邻 Tile（low/high 方向互换）
 FBox FRecastNavMeshGenerator::GrowDirtyBounds(const FBox& BBox, bool bIncludeAgentHeight) const
 {
 	const FVector BBoxGrowOffsetMin = FVector(0, 0, bIncludeAgentHeight ? Config.AgentHeight : 0.0f);
@@ -6528,6 +6862,11 @@ int32 FRecastNavMeshGenerator::GetDirtyTilesCount(const FBox& AreaBounds) const
 	return DirtyPendingCount + RunningCount;
 }
 
+// 把当前所有 InclusionBounds（导航可行区域体）整体标脏并触发重建
+// 典型调用时机：NavBounds 变化（增删 NavMeshBoundsVolume）、首次构建、RebuildAll
+// 流程：每个 InclusionBound 包成一个 DirtyArea（Flag=All|NavigationBounds），
+//       再交给 MarkDirtyTiles 转换为 Tile 坐标级的 PendingDirtyTiles
+// 返回值：是否产生了至少一个脏区（无 InclusionBounds 时返回 false）
 bool FRecastNavMeshGenerator::MarkNavBoundsDirty()
 {
 	// if rebuilding all no point in keeping "old" invalidated areas
@@ -6546,6 +6885,16 @@ bool FRecastNavMeshGenerator::MarkNavBoundsDirty()
 	return false;
 }
 
+// 把脏区转换成 Tile 坐标集合，更新 PendingDirtyTiles
+// 这是整个 Recast 生成的"入口"：外部所有"这里的几何变了"信号最终收敛到此函数
+// 关键步骤：
+//  1) 遍历 DirtyAreas，按 InclusionBounds 裁剪/扩展
+//  2) 对每个 DirtyArea：FRcTileBox 计算覆盖的 (X,Y) 范围
+//  3) 对每个 Tile：在 PendingDirtyTiles 里找现有项（UNIQUE by Coord），合并 DirtyAreas
+//  4) 若 Modifier 而非几何变化：只记录脏区而不置 bRebuildGeometry，支持 Layer 级增量
+//  5) 若 bRestrictBuildingToActiveTiles：按 ActiveTileSet 过滤
+//  6) LogDirtyAreas（VeryVerbose）便于排错
+// 注意：此函数本身不派发任务，只填入队列；派发由 ProcessTileTasksAsync/Sync 完成
 void FRecastNavMeshGenerator::MarkDirtyTiles(const TArray<FNavigationDirtyArea>& DirtyAreas)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_MarkDirtyTiles);
@@ -6819,6 +7168,9 @@ bool FRecastNavMeshGenerator::ShouldDirtyTilesRequestedByElement(
 	return (OctreeElementId == nullptr) || ShouldGenerateGeometryForOctreeElement(NavOctreeInstance.GetElementById(*OctreeElementId), NavDataConfig);
 }
 
+// 按 SeedLocations 对 PendingDirtyTiles 排序：离种子越近 → SeedDistance 越小 →
+// 排在 TArray 末尾（GetNextPendingDirtyTileToBuild 从末尾取）
+// 不同策略：SortWithSeedLocations / SortByPriority / None
 void FRecastNavMeshGenerator::SortPendingBuildTiles()
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_SortPendingBuildTiles);
@@ -6878,6 +7230,7 @@ void FRecastNavMeshGenerator::SortPendingBuildTiles()
 	}
 }
 
+// 默认 Seed 位置：优先取 Invoker 位置；若无 Invoker 则取玩家 Pawn 位置
 void FRecastNavMeshGenerator::GetSeedLocations(UWorld& World, TArray<FVector2D>& OutSeedLocations) const
 {
 	// Collect players positions
@@ -6892,6 +7245,8 @@ void FRecastNavMeshGenerator::GetSeedLocations(UWorld& World, TArray<FVector2D>&
 	}
 }
 
+// 默认 TileGenerator 工厂方法；调 ConstructTileGeneratorImpl 模板
+// 子类可 override 以返回自定义派生类
 TSharedRef<FRecastTileGenerator> FRecastNavMeshGenerator::CreateTileGenerator(const FIntPoint& Coord, const TArray<FBox>& DirtyAreas, const double PendingTileCreationTime /*=0.*/)
 {
 	SCOPE_CYCLE_COUNTER(STAT_Navigation_CreateTileGenerator);
@@ -6933,6 +7288,12 @@ void FRecastNavMeshGenerator::StoreDebugData(const FRecastTileGenerator& TileGen
 #endif
 
 #if RECAST_ASYNC_REBUILDING
+// 异步派发主循环（默认路径，ai.nav 编译默认打开）：
+//   1) 从 PendingDirtyTiles 取最多 NumTasksToProcess 个（倒序取，即优先级高的）
+//   2) 每个 Pending → CreateTileGenerator → AsyncTask::StartBackgroundTask
+//   3) 已完成（IsDone）的 Running 任务：AddGeneratedTiles + StoreCompressedTileCacheLayers
+//   4) 释放 AsyncTask 内存
+// 返回：本次影响到的 FNavTileRef 列表（上层广播给 NavMesh listeners）
 TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksAsyncAndGetUpdatedTiles(const int32 NumTasksToProcess)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_ProcessTileTasksAsync);
@@ -7037,6 +7398,7 @@ TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksAsyncAndGetUpdatedT
 #endif
 
 #if !RECAST_ASYNC_REBUILDING
+// 同步模式下从 PendingDirtyTiles 取一个（默认末尾，或强制指定 idx）并构造 TileGenerator
 TSharedRef<FRecastTileGenerator> FRecastNavMeshGenerator::CreateTileGeneratorFromPendingElement(FIntPoint& OutTileLocation, const int32 ForcedPendingTileIdx)
 {
 	ensureMsgf(PendingDirtyTiles.Num() > 0, TEXT("Its an assumption of this function that PendingDirtyTiles.Num() > 0"));
@@ -7055,6 +7417,11 @@ TSharedRef<FRecastTileGenerator> FRecastNavMeshGenerator::CreateTileGeneratorFro
 	return TileGenerator;
 }
 
+// 同步 + 时间切片模式（实验）：在主线程里把 TileGeneratorSync 按预算分段跑完
+// 整帧状态机：Init → DoWork → AddGeneratedTiles → StoreCompessedTileCacheLayers
+//   → AppendUpdateTiles → Finish（循环回 Init 处理下一个 Pending）
+// 每阶段结束检查 TimeSliceFinished，到点 yield
+// 对比 Async 模式的优点：确定性高、便于调试；缺点：吃主线程时间
 TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksSyncTimeSlicedAndGetUpdatedTiles()
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_ProcessTileTasksSyncTimeSliced);
@@ -7320,12 +7687,16 @@ TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksSyncTimeSlicedAndGe
 	return EndFunction(false /* bCalcTileRegenDuration */, bHadWorkToDo);
 }
 
+// 选择下一个要构建的 Pending Tile：默认末尾（因为 SortPendingBuildTiles 把高优先级放末尾）
+// 子类可 override 实现自定义调度
 int32 FRecastNavMeshGenerator::GetNextPendingDirtyTileToBuild() const
 {
 	return PendingDirtyTiles.IsEmpty() ? INDEX_NONE : PendingDirtyTiles.Num() - 1;
 }
 	
 //this code path is approx 10% faster than ProcessTileTasksSyncTimeSliced, however it spikes far worse for most use cases.
+// 同步模式（无切片）：从 Pending 队列一次跑完 NumTasksToProcess 个 Tile
+// 比切片版本快 ~10% 但会在当帧出现大尖峰
 TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksSyncAndGetUpdatedTiles(const int32 NumTasksToProcess)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_ProcessTileTasksSync);
@@ -7371,6 +7742,13 @@ TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksSyncAndGetUpdatedTi
 }
 #endif
 
+// 统一入口：根据编译宏 + CVar 选择合适的分派器
+//   - RECAST_ASYNC_REBUILDING：ProcessTileTasksAsync（默认）
+//   - !RECAST_ASYNC_REBUILDING + bTimeSliceRegenActive：SyncTimeSliced
+//   - !RECAST_ASYNC_REBUILDING + !bTimeSliceRegenActive：Sync（一次跑完）
+// 本函数还负责：
+//   - 为 SegmentLinks 收集新 Tile 以便后续 CreateSegmentLinkConnections
+//   - 发出 OnNavMeshGenerationFinished 通知（所有 Pending+Running 都清空时）
 TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksAndGetUpdatedTiles(const int32 NumTasksToProcess)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_RecastNavMeshGenerator_ProcessTileTasks);
@@ -7459,6 +7837,8 @@ TArray<FNavTileRef> FRecastNavMeshGenerator::ProcessTileTasksAndGetUpdatedTiles(
 }
 
 #if UE_ENABLE_DEBUG_DRAWING
+// 把 FNavigationRelevantData.CollisionData（FRecastGeometryCache 压缩格式）
+// 解码成 FNavDebugMeshData，用于 NavMeshRenderingComponent 的"参与构建的原始几何"可视化
 void FRecastNavMeshGenerator::GetDebugGeometry(const FNavigationRelevantData& EncodedData, FNavDebugMeshData& DebugMeshData)
 {
 	const uint8* RawMemory = EncodedData.CollisionData.GetData();
@@ -7634,6 +8014,7 @@ void FRecastGeometryExport::ExportAggregatedGeometry(const FKAggregateGeom& AggG
 	}
 }
 
+// 判断生成是否仍在进行：Generator 内部队列 + 脏区域管理器都要查
 bool FRecastNavMeshGenerator::IsBuildInProgressCheckDirty() const
 {
 	return RunningDirtyTiles.Num()
@@ -7662,16 +8043,20 @@ int32 FRecastNavMeshGenerator::GetNumRunningBuildTasks() const
 		+ (SyncTimeSlicedData.TileGeneratorSync.Get() ? 1 : 0);
 }
 
+// 是否在游戏线程上收集几何：当 NavMesh 配置为 GatherGeometryOnGameThread 或
+// 某些元素要求主线程访问（StaticMesh 的 NavCollision Cook）时返回 true
 bool FRecastNavMeshGenerator::GatherGeometryOnGameThread() const 
 { 
 	return DestNavMesh == nullptr || DestNavMesh->ShouldGatherDataOnGameThread() == true;
 }
 
+// 当前帧是否处于时间切片模式（只有同步模式下有意义）
 bool FRecastNavMeshGenerator::IsTimeSliceRegenActive() const
 {
 	return SyncTimeSlicedData.bTimeSliceRegenActive;
 }
 
+// 判断某 Tile 是否"最近在构建"：被 Running 队列持有 或 在 RecentlyBuiltTiles 列表里（编辑器）
 bool FRecastNavMeshGenerator::IsTileChanged(const FNavTileRef InTileRef) const
 {
 #if WITH_EDITOR	

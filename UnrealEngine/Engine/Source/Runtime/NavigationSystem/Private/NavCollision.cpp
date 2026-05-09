@@ -1,5 +1,26 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// ============================================================================
+// NavCollision.cpp —— UNavCollision 实现，以及 DDC (Derived Data Cache) 烘焙打包
+// ----------------------------------------------------------------------------
+// 关键要点：
+//   - FNavCollisionDataReader：顺序反序列化 DDC 缓存里存的 TriMesh/Convex 顶点/索引
+//     以及 ConvexShapeIndices 与 Bounds；
+//   - FDerivedDataNavCollisionCooker：DDC Plugin。GetPluginSpecificCacheKeySuffix
+//     里混入 Format / BodySetupGuid / MeshId / Version，保证几何任一改变时缓存 key 变化；
+//   - Setup 的分支逻辑（关键）：
+//       1) 已有 ConvexGeometry 或 GUID 相同 → 直接返回；
+//       2) ClearCollision 清空残留数据；
+//       3) GetCookedData 查询 DDC；
+//          - 命中 → FNavCollisionDataReader 反序列化填充；
+//          - 未命中且当前平台不需要 cooked data → GatherCollision 现场采集。
+//   - GatherCollision：从 StaticMesh 的 BodySetup 现场 cook 凸包，再把
+//     Box/Cylinder 原语折算成 FKBoxElem/FKSphylElem 一并提交给 NavigationHelper；
+//   - GetNavigationModifier：把上面结果折算成 FAreaNavModifier 交给 NavMesh 生成；
+//     - 传统模式 InitializeConvex 使用 LocalToWorld；
+//     - PerInstance 模式 InitializePerInstanceConvex 只存本地空间，由 ISM 每实例变换。
+// ============================================================================
+
 #include "NavCollision.h"
 #include "Serialization/MemoryWriter.h"
 #include "NavigationSystem.h"
@@ -22,6 +43,7 @@
 #include "DeviceProfiles/DeviceProfileManager.h"
 #endif // WITH_EDITOR
 
+// Scalability CVar：若置 0，则在 cook 阶段不产生 NavCollision 数据，运行时也不可用。
 static TAutoConsoleVariable<int32> CVarNavCollisionAvailable(
 	TEXT("ai.NavCollisionAvailable"),
 	1,
@@ -39,8 +61,11 @@ namespace NavCollisionCookStats
 }
 #endif
 
+// NavCollision 在 DDC 中的 Format 名称。Chaos 物理下专用。
 static const FName NAVCOLLISION_FORMAT = TEXT("NavCollision_Chaos");
 
+// 从 FByteBulkData 反序列化 TriMesh+Convex 几何的工具类。
+// 字节序由数据头第一个字节标记；与 cooker 写入顺序严格对应（VB/IB/shape index/Bounds）。
 class FNavCollisionDataReader
 {
 public:
@@ -77,6 +102,10 @@ public:
 //----------------------------------------------------------------------//
 // FDerivedDataNavCollisionCooker
 //----------------------------------------------------------------------//
+// DDC Plugin：把 UNavCollision 的几何 cook 成平台无关的字节流。
+// - GetPluginSpecificCacheKeySuffix 把 Format/BodySetupGuid/MeshId/Version 混在一起
+//   作为 DDC Key，任一变化都会使旧缓存失效；
+// - Build：若缺少几何先现场 GatherCollision；随后按固定顺序写入字节流。
 class FDerivedDataNavCollisionCooker : public FDerivedDataPluginInterface
 {
 private:
@@ -200,6 +229,8 @@ UNavCollision::UNavCollision(const FObjectInitializer& ObjectInitializer) : Supe
 	bCreateOnClient = true;
 }
 
+// 仅对 CDO 注册全局"构造新实例"委托，让 UNavCollisionBase 能按需创建 UNavCollision。
+// 条件：是服务器；或 bCreateOnClient；或在编辑器里。
 void UNavCollision::PostInitProperties()
 {
 	Super::PostInitProperties();
@@ -217,11 +248,19 @@ void UNavCollision::PostInitProperties()
 	}
 }
 
+// DDC Key 用：NavCollision 的 Guid 直接等于关联 BodySetup 的 Guid，物理几何一改这里就换
 FGuid UNavCollision::GetGuid() const
 {
 	return BodySetupGuid;
 }
 
+// UStaticMesh::PostLoad 最后一步调用本函数（或 NavCollision::PostLoad 内二次触发）。
+// 三段式：
+//   1) 若几何已就绪或 Guid 未变 → 直接返回（避免二次工作）；
+//   2) ClearCollision + 记录 BodySetupGuid；
+//   3) 走 GetCookedData（可能触发 DDC 同步构建）。
+//      - 命中且未锁 → FNavCollisionDataReader 反序列化，bHasConvexGeometry = true；
+//      - 未命中且 !RequiresCookedData → GatherCollision 现场采集。
 void UNavCollision::Setup(UBodySetup* BodySetup)
 {
 	// Create meshes from cooked data if not already done
@@ -251,6 +290,7 @@ void UNavCollision::Setup(UBodySetup* BodySetup)
 	}
 	else if (FPlatformProperties::RequiresCookedData() == false)
 	{
+		// 平台不要求 cooked data（编辑器/PIE）时才允许现场 gather；Shipping 会直接放弃。
 		GatherCollision();
 	}
 }
@@ -260,6 +300,12 @@ FBox UNavCollision::GetBounds() const
 	return Bounds;
 }
 
+// 现场采集几何：
+//  - 从 StaticMesh 的 BodySetup 抽 Convex 凸包（若 bGatherConvexGeometry）；
+//  - 把用户编辑的 BoxCollision / CylinderCollision 折算成 FKBoxElem/FKSphylElem，
+//    一并交给 NavigationHelper::GatherCollision 再投到 TriMesh/Convex 缓冲里。
+//  - 最终 bHasConvexGeometry 以缓冲是否非空为准。
+// 副作用：修改 TriMeshCollision/ConvexCollision/ConvexShapeIndices/Bounds。
 void UNavCollision::GatherCollision()
 {
 	ClearCollision();
@@ -271,6 +317,7 @@ void UNavCollision::GatherCollision()
 	}
 
 	FKAggregateGeom SimpleGeom;
+	// 迭代目标：把每个 FNavCollisionBox 转成 FKBoxElem（注意 Extent 是半尺寸 → *2.0 得全长）
 	for (int32 Idx = 0; Idx < BoxCollision.Num(); Idx++)
 	{
 		const FNavCollisionBox& BoxInfo = BoxCollision[Idx];
@@ -287,6 +334,8 @@ void UNavCollision::GatherCollision()
 	}
 
 	// not really a cylinder, but should be close enough 
+	// 注意：UE 的 FKSphylElem 是胶囊而不是柱体，这里做"够用"的近似；
+	// 提示位置偏移 +Z*Height/2 是为了把胶囊下端对齐原圆柱底面中心
 	for (int32 Idx = 0; Idx < CylinderCollision.Num(); Idx++)
 	{
 		const FNavCollisionCylinder& CylinderInfo = CylinderCollision[Idx];
@@ -305,6 +354,7 @@ void UNavCollision::GatherCollision()
 	bHasConvexGeometry = (TriMeshCollision.VertexBuffer.Num() > 0) || (ConvexCollision.VertexBuffer.Num() > 0);
 }
 
+// 清空所有几何缓冲；不动用户编辑字段（Box/Cylinder/AreaClass 等）。
 void UNavCollision::ClearCollision()
 {
 	TriMeshCollision.VertexBuffer.Reset();
@@ -317,6 +367,9 @@ void UNavCollision::ClearCollision()
 	bHasConvexGeometry = false;
 }
 
+// 动态障碍物入口：把每个凸包/TriMesh 翻成一条 FAreaNavModifier，附加到 Modifier 聚合器里。
+// 若本 NavCollision 还没 gather，则会先现场 gather 一次。
+// PerInstanceModifier 分支：ISM 用于多实例变换 —— 顶点保留本地空间，由 ISM 每实例解析。
 void UNavCollision::GetNavigationModifier(FCompositeNavModifier& Modifier, const FTransform& LocalToWorld)
 {
 	QUICK_SCOPE_CYCLE_COUNTER(STAT_NavCollision_GetNavigationModifier);
@@ -348,6 +401,7 @@ void UNavCollision::GetNavigationModifier(FCompositeNavModifier& Modifier, const
 	};
 
 	int32 LastVertIndex = 0;
+	// 迭代目标：按 ConvexShapeIndices 划分 ConvexCollision.VertexBuffer 成多个凸包，每凸包一条 Modifier
 	for (int32 Idx = 0; Idx < ConvexShapeIndices.Num(); Idx++)
 	{
 		const int32 FirstVertIndex = LastVertIndex;
@@ -355,6 +409,7 @@ void UNavCollision::GetNavigationModifier(FCompositeNavModifier& Modifier, const
 
 		// @todo this is a temp fix. A proper fix is making sure ConvexShapeIndices doesn't
 		// contain any duplicates (which is the original cause of UE-52123)
+		// 防守：避免空 shape（UE-52123 的历史残留）
 		if (FirstVertIndex < LastVertIndex)
 		{
 			AddModFunc(ConvexCollision.VertexBuffer, FirstVertIndex, LastVertIndex);
@@ -367,6 +422,8 @@ void UNavCollision::GetNavigationModifier(FCompositeNavModifier& Modifier, const
 	}
 }
 
+// bIsDynamicObstacle == false 时的导出入口：把几何直接喂给 NavMesh 生成器
+// （作为"真正的导航三角形"，而不是 Modifier 遮罩）。
 bool UNavCollision::ExportGeometry(const FTransform& LocalToWorld, FNavigableGeometryExport& GeoExport) const
 {
 	if (bHasConvexGeometry)
@@ -451,6 +508,7 @@ void UNavCollision::DrawSimpleGeom(FPrimitiveDrawInterface* PDI, const FTransfor
 
 
 #if WITH_EDITOR
+// 编辑器端：用户改了属性/几何 → 标脏并清空缓存，下次 Setup 再 DDC/gather
 void UNavCollision::InvalidateCollision()
 {
 	ClearCollision();
@@ -464,6 +522,11 @@ void UNavCollision::InvalidatePhysicsData()
 }
 #endif // WITH_EDITOR
 
+// Serialize：兼容多版本（VerInitial~VerShapeGeoExport）。
+//  - 首字节存 Magic，旧包没有 Magic → 回退到 VerInitial；
+//  - Cooked 情形下写入 NAVCOLLISION_FORMAT 的 BulkData；
+//  - VerShapeGeoExport 之前的旧包加载时强制 bForceGeometryRebuild=true，
+//    以便在编辑器下次 Setup 时用新版 geometry export 重新 cook。
 void UNavCollision::Serialize(FArchive& Ar)
 {
 	Super::Serialize(Ar);
@@ -540,6 +603,8 @@ void UNavCollision::Serialize(FArchive& Ar)
 	}
 }
 
+// PostLoad：确保 Outer（通常是 UStaticMesh）先完成 PostLoad，之后立刻触发 Setup。
+// 若 UStaticMesh 正在异步编译，则跳过——UStaticMesh::CreateNavCollision 会在编译完后补调。
 void UNavCollision::PostLoad()
 {
 	Super::PostLoad();
@@ -562,6 +627,10 @@ void UNavCollision::PostLoad()
 	}
 }
 
+// GetCookedData：从 CookedFormatData 取指定 Format 的 FByteBulkData；
+// 若容器没有该 Format 且运行时允许 → 构造 FDerivedDataNavCollisionCooker 同步走 DDC，
+// 命中拷贝回 BulkData，未命中则 cooker->Build 现场生成后写回。
+// 返回 nullptr：模板/无 Convex 需求/Shipping 下缺 cook data/DDC 完全失败。
 FByteBulkData* UNavCollision::GetCookedData(FName Format)
 {
 	TRACE_CPUPROFILER_EVENT_SCOPE(UNavCollision::GetCookedData);

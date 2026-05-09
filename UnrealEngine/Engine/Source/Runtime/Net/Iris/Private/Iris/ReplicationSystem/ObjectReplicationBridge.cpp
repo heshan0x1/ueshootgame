@@ -1,5 +1,80 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ObjectReplicationBridge.cpp（≈ 3200 行，模块内最大文件之一）
+// 角色：UObjectReplicationBridge 的所有上层 API + 帧循环钩子 + 配置加载 + 调试逻辑实现。
+//
+// 文件总体分区（按代码出现顺序）：
+//
+//  [Init / Deinit]
+//      - Initialize/Deinitialize : 缓存子系统指针、加载 Class 级配置、初始化 Factory、
+//                                  注册 OnCustomConditionChanged / OnDynamicConditionChanged 等委托。
+//      - InitNetObjectFactories  : 实例化所有 FNetObjectFactoryRegistry 中注册过的 Factory。
+//      - LoadConfig              : 从 UObjectReplicationBridgeConfig 读取 Filter/Prio/DC/Critical/...
+//      - CreateDestructionProtocol : 预构建 DestructionInfo 协议（不可复制对象状态，仅销毁通知）。
+//
+//  [注册 / 反注册]
+//      - StartReplicatingRootObject / StartReplicatingSubObject /
+//        StopReplicatingNetObject  : 上层游戏代码核心 API。
+//      - StartReplicatingNetObject : 内部统一路径——构建 InstanceProtocol → 注册 NetRefHandle →
+//                                    赋 PushId / Filter / Prio / Dormancy / WorldLocation。
+//      - PreRegisterNewObjectReferenceHandle / PreRegisterObjectWithReferenceHandle :
+//        与 NetDriver::CreateNetIDForObject 配合，用于"先有 Handle 再有创建头"的预注册路径。
+//
+//  [PreSendUpdate / Poll / Copy 流程]（与 §4 帧循环 step 7 对应）
+//      - OnStartPreSendUpdate -> CallPruneStaleObjects / 清理 GC 影响表
+//      - PreSendUpdate
+//          1. BuildPollList            : 收集本帧需要 Poll 的对象（结合 ObjectPollFrequencyLimiter）
+//          2. PreUpdate                : 对每个对象触发用户 PreUpdate（PreReplication）回调
+//          3. FinalizeDirtyObjects     : 锁定 DirtyTracker，避免 PreUpdate 阶段产生的脏字段被遗漏
+//          4. ReconcileNewSubObjects   : 处理 PreUpdate 中新增的 SubObject
+//          5. PollAndCopy              : 把脏字段从外部源 buffer 拷贝到内部 ReplicationState buffer
+//      - PreSendUpdateSingleHandle    : ForceNetUpdate / 立即发送路径的单对象版本
+//
+//  [WorldLocation]
+//      - UpdateInstancesWorldLocation : §4 step 5；通过 Factory.GetWorldInfo 拉取并写入 FWorldLocations
+//      - ForceUpdateWorldLocation     : 单对象立即刷新（移动 / Spawn 后调用）
+//      - UpdateRootObjectWorldInfo    : 内部辅助
+//
+//  [Dormancy]
+//      - SetObjectWantsToBeDormant / GetObjectWantsToBeDormant / NetFlushDormantObject :
+//        与 NetRefHandleManager 的 WantToBeDormantInternalIndices / DormantObjectsPendingFlushNet 协作。
+//
+//  [Dependent / Creation Dependency]
+//      - AddDependentObject / RemoveDependentObject :
+//        软依赖（依赖对象可独立复制；父复制时也调度依赖；不能被动态过滤掉除非父也被过滤）。
+//      - AddCreationDependencyLink / RemoveCreationDependencyLink :
+//        硬依赖（子必须等父创建后才会创建；父过滤了子也会被强制过滤）。
+//
+//  [Class 级配置]
+//      - GetDynamicFilter / GetPrioritizer / ShouldClassBeDeltaCompressed /
+//        IsClassCritical / GetClassIrisAsyncLoadingPriority / GetTypeStatsIndex
+//      - 都通过 ClassXxx 类映射 + ConfigClassPathNameCache 做类继承式查找。
+//
+//  [Polling 频率]
+//      - SetPollFrequency / SetPollWithObject / GetPollFrequencyOfRootObject /
+//        ConvertPollFrequencyIntoFrames : 把 Hz 转成"每 N 帧轮询一次"。
+//      - ReinitPollFrequency : MaxTickRate 改变时重算所有对象的 PollFramePeriod。
+//
+//  [接收侧]
+//      - CreateNetRefHandleFromRemote : 收到对端创建头 → 找 Factory → Instantiate → 绑定 InstanceProtocol
+//      - DestroyNetObjectFromRemote / DetachInstanceFromRemote / DetachSubObjectInstancesFromRemote :
+//        EReplicationBridgeDestroyInstanceReason 解析 + Factory.DetachedFromReplication 派发
+//      - PostApplyInitialState / SubObjectCreatedFromReplication : 状态 apply 完成后回调 Factory
+//
+//  [PIE 路径重映射]
+//      - RemapPathForPIE 默认空实现；游戏侧通常派生 UMyObjectReplicationBridge 并重写。
+//
+//  [调试 / 控制台命令]
+//      - PrintReplicatedObjects / PrintAlwaysRelevantObjects / PrintRelevantObjects /
+//        PrintRelevantObjectsForConnections / PrintNetCullDistances / PrintPushBasedStatuses /
+//        PrintDebugInfoForNetRefHandle 等——配合 ObjectReplicationBridgeDebugging.cpp。
+//
+//  [错误回报]
+//      - OnProtocolMismatchReported / OnErrorWithNetRefHandleReported :
+//        客户端报错时由对应 cvar 决定是否在服务器端 disconnect 该连接（IsClassCritical）。
+// =====================================================================================
+
 #include "Iris/ReplicationSystem/ObjectReplicationBridge.h"
 
 #include "Misc/ScopeExit.h"

@@ -1,5 +1,45 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ReplicationSystem.cpp（≈ 2200 行）
+// 角色：UReplicationSystem 门面 + FReplicationSystemImpl（PImpl 编排者）实现。
+//
+// 文件分区：
+//   1) Console Variables / 全局开关
+//   2) FReplicationSystemImpl 类定义（编排所有子系统、存储 RS 级状态）
+//   3) UReplicationSystem 公开 API 实现（多数 forward 给 Impl 或 InternalReplicationSystem）
+//   4) FReplicationSystemFactory 全局静态工厂实现
+//
+// FReplicationSystemImpl 是真正的"帧循环编排者"，其方法与 §4 帧循环一一对应：
+//
+//   ┌─ 服务器侧 NetUpdate ───────────────────────────────────────────┐
+//   │  StartPreSendUpdate            -- §4 step 3                    │
+//   │  UpdateDirtyObjectList         -- §4 step 4                    │
+//   │  UpdateWorldLocations          -- §4 step 5                    │
+//   │  UpdateFiltering               -- §4 step 6                    │
+//   │  CallPreSendUpdate (Bridge)    -- §4 step 7（Poll + Copy 并行） │
+//   │  UpdateDirtyListPostPoll       -- §4 step 8                    │
+//   │  UpdateConditionals            -- §4 step 9                    │
+//   │  QuantizeDirtyStateData        -- §4 step 10                   │
+//   │  UpdateObjectScopes            -- §4 step 12（per-conn Scope） │
+//   │  PropagateDirtyChanges         -- §4 step 13                   │
+//   │  UpdatePrioritization          -- §4 step 15                   │
+//   │  DC.PreSendUpdate (BaselineMgr)-- §4 step 16                   │
+//   └────────────────────────────────────────────────────────────────┘
+//
+//   PostSendUpdate -> EndPostSendUpdate / DC.PostSendUpdate / UpdateDataStreams(PostTickFlush)
+//
+//   PreReceiveUpdate / PostReceiveUpdate / TickPostReceive 是接收侧的对应钩子。
+//
+// 关键内部状态（FReplicationSystemImpl）：
+//   * ReplicationSystemInternal              : 聚合根，所有子系统都在它里面
+//   * Delegates                              : 系统级多播事件
+//   * NotReplicatedNetObjectGroupHandle / NetGroupOwner / NetGroupReplay : 三个保留分组
+//   * ConnectionsPendingPostTickDispatchSend : 标记下一次 TickPostReceive 必须发送的连接
+//   * CurrentSendPass                        : 当前发送阶段（PostTickDispatch / TickFlush）
+//   * AttachmentSendPolicyFlags              : Function -> SendPolicyFlags 的覆盖映射
+// =====================================================================================
+
 #include "Iris/ReplicationSystem/ReplicationSystem.h"
 #include "Iris/Core/IrisCsv.h"
 #include "Iris/Core/IrisDebugging.h"
@@ -364,6 +404,16 @@ public:
 		ReplicationSystemInternal.GetConditionals().OnInternalNetRefIndicesFreed(FreedIndices);
 	}
 
+	// =========================================================================
+	// §4 帧循环阶段方法 —— PreSendUpdate 流水线
+	// =========================================================================
+
+	/**
+	 * §4 step 3：PreSendUpdate 起点。
+	 *   1) 锁定 Filter 修改（避免 Update 阶段被外部 SetFilter 打乱）
+	 *   2) 通知 Bridge::OnStartPreSendUpdate（清理上一帧痕迹）
+	 *   3) NetRefHandleManager 同步当前帧 scope（拷贝 Global -> CurrentFrame，交换 Prev<->Current）
+	 */
 	void StartPreSendUpdate()
 	{
 		// Block unsupported operations until SendUpdate is finished
@@ -376,11 +426,22 @@ public:
 		ReplicationSystemInternal.GetNetRefHandleManager().OnPreSendUpdate();
 	}
 
+	/** §4 step 7 入口：转发 Bridge -> CallPreSendUpdate（BuildPollList + PreUpdate + PollAndCopy）。 */
 	void CallPreSendUpdate(float DeltaSeconds)
 	{
 		ReplicationSystemInternal.GetReplicationBridge()->CallPreSendUpdate(DeltaSeconds);
 	}
 
+	/**
+	 * 帧循环收尾（PostSendUpdate -> EndPostSendUpdate）：
+	 *   1) 解锁 Filter 修改
+	 *   2) ChangeMaskCache 重置（释放本帧 quantize 的临时位图）
+	 *   3) NetRefHandleManager.OnPostSendUpdate（保存本帧 scope 给下一帧 diff）
+	 *   4) Bridge::UpdateHandlesPendingEndReplication（推进延迟销毁队列）
+	 *   5) DC InvalidationTracker.PostSendUpdate（释放过期基线）
+	 *   6) WorldLocations.PostSendUpdate（解锁脏列表 / 收尾）
+	 *   7) Bridge::OnPostSendUpdate（业务侧扩展点）
+	 */
 	void EndPostSendUpdate()
 	{
 		// Unblock operations
@@ -404,11 +465,16 @@ public:
 		ReplicationSystemInternal.GetReplicationBridge()->OnPostSendUpdate();
 	}
 
+	/** §4 step 4：把 GlobalDirtyNetObjectTracker + LegacyPushModel 的标脏合并到 RS 自己的 DirtyNetObjectTracker。 */
 	void UpdateDirtyObjectList()
 	{
 		ReplicationSystemInternal.GetDirtyNetObjectTracker().UpdateDirtyNetObjects();
 	}
 
+	/**
+	 * §4 step 8：Poll 完成后立即锁定 WorldLocations 脏列表 + 累积本帧脏对象到 Accumulated 视图，
+	 * 之后用户代码不应再调用任何修改型公开 API。
+	 */
 	void UpdateDirtyListPostPoll()
 	{
 		// From here there shouldn't be any user code that calls public API functions.
@@ -417,12 +483,14 @@ public:
 		ReplicationSystemInternal.GetDirtyNetObjectTracker().UpdateAccumulatedDirtyList();
 	}
 
+	/** §4 step 5：通知 Bridge 调用 UpdateInstancesWorldLocation（拉取 Factory.GetWorldInfo）。 */
 	void UpdateWorldLocations()
 	{
 		IRIS_CSV_PROFILER_SCOPE(Iris, ReplicationSystem_UpdateWorldLocations);
 		ReplicationSystemInternal.GetReplicationBridge()->CallUpdateInstancesWorldLocation();
 	}
 
+	/** §4 step 6：FReplicationFiltering::Filter() 跑 Exclusion -> Dynamic -> Inclusion + Hysteresis。 */
 	void UpdateFiltering()
 	{
 		IRIS_CSV_PROFILER_SCOPE(Iris, ReplicationSystem_UpdateFiltering);
@@ -432,6 +500,10 @@ public:
 		Filtering.Filter();
 	}
 
+	/**
+	 * §4 step 12：把每条连接当前帧的 RelevantObjectsInScope 推送给该连接的 ReplicationWriter。
+	 * Writer.UpdateScope 会处理"新增进 Scope -> 调度创建" / "离开 Scope -> 调度销毁"。
+	 */
 	void UpdateObjectScopes()
 	{
 		LLM_SCOPE_BYTAG(Iris);
@@ -457,6 +529,7 @@ public:
 	}
 
 	// Can run at any time between scoping and replication.
+	/** §4 step 9：FReplicationConditionals::Update 计算 per-conn 的 conditional ChangeMask。 */
 	void UpdateConditionals()
 	{
 		IRIS_CSV_PROFILER_SCOPE(Iris, ReplicationSystem_UpdateConditionals);
@@ -466,6 +539,10 @@ public:
 	}
 
 	// Runs after filtering
+	/**
+	 * §4 step 15：先求 RelevantObjects ∩ AccumulatedDirtyObjects 得到本帧"既相关又脏"的对象集合，
+	 * 然后调 Prioritization.Prioritize 给 ReplicatingConnections 打分。
+	 */
 	void UpdatePrioritization(const FNetBitArrayView& ReplicatingConnections)
 	{
 		IRIS_CSV_PROFILER_SCOPE(Iris, ReplicationSystem_UpdatePrioritization);
@@ -484,6 +561,10 @@ public:
 		Prioritization.Prioritize(ReplicatingConnections, DirtyAndRelevantObjectsView);
 	}
 
+	/**
+	 * §4 step 13：把本帧的 ChangeMaskCache（哪些对象的哪些位变了）下发到所有
+	 * 非 closing 连接的 ReplicationWriter，以更新它们的 per-connection ChangeMask。
+	 */
 	void PropagateDirtyChanges()
 	{
 		IRIS_CSV_PROFILER_SCOPE(Iris, ReplicationSystem_PropagateDirtyChanges);
@@ -507,6 +588,13 @@ public:
 		ValidConnections.ForAllSetBits(UpdateDirtyChangeMasks);
 	}
 
+	/**
+	 * §4 step 10：把所有标脏对象的"外部状态" -> "内部量化状态"。
+	 *   * 输入：DirtyObjectsToQuantize 位图
+	 *   * 流程：对每个脏对象调 FReplicationInstanceOperationsInternal::QuantizeObjectStateData，
+	 *          它内部按 InstanceProtocol 的 Fragment 表逐字段量化并写 ChangeMask 到 ChangeMaskCache。
+	 *   * 输出：本帧脏字段记录在 ChangeMaskCache，待 PropagateDirtyChanges 分发到各连接。
+	 */
 	void QuantizeDirtyStateData()
 	{
 		IRIS_CSV_PROFILER_SCOPE(Iris, ReplicationSystem_QuantizeDirtyStateData);

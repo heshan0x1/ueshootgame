@@ -15,6 +15,11 @@
 namespace UE::Net
 {
 
+/**
+ * WritePackedUint64：前缀 3 位表示字节数(1~8)，之后以 ByteCountNeeded*8 位写入数值。
+ *  - GetBitsNeeded(Value | 1U) 强制把 0 也算作需要 1 位，避免 ByteCountNeeded 出现 0。
+ *  - 数值超过 32 位时分两次 WriteBits（WriteBits 每次最多 32 位）。
+ */
 void WritePackedUint64(FNetBitStreamWriter* Writer, uint64 Value)
 {
 	// As we represent the number of bytes to write with three bits we want bits needed to be >= 1 such that the number of bytes ends up in the range [1, 8].
@@ -34,6 +39,7 @@ void WritePackedUint64(FNetBitStreamWriter* Writer, uint64 Value)
 	}
 }
 
+/** ReadPackedUint64：读 3 位前缀 + ByteCount*8 位数据，重建 uint64。 */
 uint64 ReadPackedUint64(FNetBitStreamReader* Reader)
 {
 	const uint32 ByteCountToRead = Reader->ReadBits(3U) + 1U;
@@ -52,6 +58,11 @@ uint64 ReadPackedUint64(FNetBitStreamReader* Reader)
 	}
 }
 
+/**
+ * WritePackedInt64：与 Uint 版本相同的前缀编码，但值区间含负数——
+ * GetBitsNeeded(Value) 对有符号数会返回"最高位为符号位"所需总位数，故无须再 |1U。
+ * 注意 32 位边界时先 static_cast 到 uint64 避免符号扩展覆盖高位。
+ */
 void WritePackedInt64(FNetBitStreamWriter* Writer, int64 Value)
 {
 	const uint32 BitCountNeeded = GetBitsNeeded(Value);
@@ -71,6 +82,12 @@ void WritePackedInt64(FNetBitStreamWriter* Writer, int64 Value)
 	}
 }
 
+/**
+ * ReadPackedInt64：
+ *  - 先读前缀和无符号值；
+ *  - 末尾用经典的"异或-减去高位 mask"做符号扩展：(U ^ SignMask) - SignMask。
+ *    SignMask = 1 << (BitCountToRead - 1)，当第 BitCountToRead-1 位为 1 时相当于扣除 2^BitCount。
+ */
 int64 ReadPackedInt64(FNetBitStreamReader* Reader)
 {
 	const uint32 ByteCountToRead = Reader->ReadBits(3U) + 1U;
@@ -94,6 +111,7 @@ int64 ReadPackedInt64(FNetBitStreamReader* Reader)
 	return Value;
 }
 
+/** WritePackedUint32：2 位前缀 + 1~4 字节值。思路与 Uint64 版一致。 */
 void WritePackedUint32(FNetBitStreamWriter* Writer, uint32 Value)
 {
 	// As we represent the number of bytes to write with two bits we want bits needed to be >= 1
@@ -105,6 +123,7 @@ void WritePackedUint32(FNetBitStreamWriter* Writer, uint32 Value)
 	Writer->WriteBits(Value, BitCountToWrite);
 }
 
+/** ReadPackedUint32：2 位前缀 + 1~4 字节值。 */
 uint32 ReadPackedUint32(FNetBitStreamReader* Reader)
 {
 	const uint32 ByteCountToRead = Reader->ReadBits(2U) + 1U;
@@ -114,6 +133,7 @@ uint32 ReadPackedUint32(FNetBitStreamReader* Reader)
 	return Value;
 }
 
+/** WritePackedInt32：与 Uint32 同，但无须 |1U（有符号 GetBitsNeeded 已考虑符号位）。 */
 void WritePackedInt32(FNetBitStreamWriter* Writer, int32 Value)
 {
 	const uint32 BitCountNeeded = GetBitsNeeded(Value);
@@ -124,6 +144,7 @@ void WritePackedInt32(FNetBitStreamWriter* Writer, int32 Value)
 	Writer->WriteBits(Value, BitCountToWrite);
 }
 
+/** ReadPackedInt32：读前缀 + 无符号值，末尾用 (X ^ SignMask) - SignMask 做 32 位符号扩展。 */
 int32 ReadPackedInt32(FNetBitStreamReader* Reader)
 {
 	const uint32 ByteCountToRead = Reader->ReadBits(2U) + 1U;
@@ -137,6 +158,7 @@ int32 ReadPackedInt32(FNetBitStreamReader* Reader)
 	return Value;
 }
 
+/** WritePackedUint16：1 位前缀（0=1 字节，1=2 字节）+ 数值。 */
 void WritePackedUint16(FNetBitStreamWriter* Writer, uint16 Value)
 {
 	// As we represent the number of bytes to write with one bit we want bits needed to be >= 1
@@ -148,6 +170,7 @@ void WritePackedUint16(FNetBitStreamWriter* Writer, uint16 Value)
 	Writer->WriteBits(Value, BitCountToWrite);
 }
 
+/** ReadPackedUint16：1 位前缀 + 1/2 字节值。 */
 uint16 ReadPackedUint16(FNetBitStreamReader* Reader)
 {
 	const uint32 ByteCountToRead = Reader->ReadBits(1U) + 1U;
@@ -157,10 +180,21 @@ uint16 ReadPackedUint16(FNetBitStreamReader* Reader)
 	return Value;
 }
 
+/**
+ * WriteString：字符串序列化。
+ * 编码格式：
+ *   bit 0（bIsEncoded）：
+ *     1 → 内容含非 ANSI 字符，使用 UTF-8 风格编码；
+ *     0 → 纯 ANSI，直接按 8 位/字符写。
+ *   bits 1..16（Length）：编码后字节数或 ANSI 字符数，最多 65535。
+ *   之后：实际字节流（通过 WriteBitStream 32 位对齐拷贝）。
+ *
+ * 长度超限直接写入 false + 0 长度并记录 Error；调用方需要检查 Writer->IsOverflown。
+ */
 void WriteString(FNetBitStreamWriter* Writer, FStringView StringView)
 {
 	using Codec = Private::FStringNetSerializerUtils::TStringCodec<TCHAR>;
-	constexpr uint32 SizeAlignment = 4;
+	constexpr uint32 SizeAlignment = 4;                          // 编码缓冲大小按 4 字节对齐，便于按 word 拷贝
 	
 	const uint32 StringViewLength = StringView.Len();
 	if (StringViewLength > 65535)
@@ -199,6 +233,7 @@ void WriteString(FNetBitStreamWriter* Writer, FStringView StringView)
 	}
 	else
 	{
+		// 纯 ANSI 快路径：逐字符压为 uint8（TCHAR & 0xFF）后走 WriteBitStream。
 		Writer->WriteBits(StringViewLength, 16);
 		if (Writer->IsOverflown())
 		{
@@ -222,11 +257,19 @@ void WriteString(FNetBitStreamWriter* Writer, FStringView StringView)
 	}
 }
 
+/** FString 重载：转发到 FStringView 版本。 */
 void WriteString(FNetBitStreamWriter* Writer, const FString& String)
 {
 	return WriteString(Writer, FStringView(String));
 }
 
+/**
+ * ReadString：与 WriteString 对偶。
+ *  - 先读 bIsEncoded 和 Length；
+ *  - 编码路径：读字节流 → 验证 UTF-8 合法性 → Codec::Decode 到 FString；非法编码 → DoOverflow 标记错误；
+ *  - ANSI 路径：读字节流 → 直接用 FString::ConstructFromPtrSize 构造。
+ *  - 所有错误路径（解码失败/过长）都会 log Error 并可能触发 DoOverflow。
+ */
 void ReadString(FNetBitStreamReader* Reader, FString& OutString)
 {
 	using Codec = Private::FStringNetSerializerUtils::TStringCodec<TCHAR>;
@@ -295,6 +338,11 @@ void ReadString(FNetBitStreamReader* Reader, FString& OutString)
 	}
 }
 
+/**
+ * WriteVector：借助已注册的 FVectorNetSerializer 来序列化。
+ * 流程：栈上分配一小段 QuantizedState（≥ Serializer.QuantizedTypeSize）→ 调 Quantize → 调 Serialize。
+ * 避免自行处理双精度拆分、有效数字、量化的细节；也使未来修改 FVectorNetSerializer 可以自动生效。
+ */
 void WriteVector(FNetBitStreamWriter* Writer, const FVector& Vector)
 {
 	FNetSerializationContext Context(Writer);
@@ -318,6 +366,7 @@ void WriteVector(FNetBitStreamWriter* Writer, const FVector& Vector)
 	Serializer.Serialize(Context, SerializeArgs);
 }
 
+/** ReadVector：对称地 Deserialize + Dequantize 到外部 FVector。 */
 void ReadVector(FNetBitStreamReader* Reader, FVector& Vector)
 {
 	FNetSerializationContext Context(Reader);
@@ -341,6 +390,7 @@ void ReadVector(FNetBitStreamReader* Reader, FVector& Vector)
 	Serializer.Dequantize(Context, DequantizeArgs);
 }
 
+/** WriteVector（带默认值压缩）：接近默认值时只写 1 位；否则写 1 位 + 完整 Vector。 */
 void WriteVector(FNetBitStreamWriter* Writer, const FVector& Vector, const FVector& DefaultValue, float Epsilon)
 {
 	FNetSerializationContext Context(Writer);
@@ -352,6 +402,7 @@ void WriteVector(FNetBitStreamWriter* Writer, const FVector& Vector, const FVect
 	}
 }
 
+/** ReadVector（带默认值压缩）：读 1 位，为 1 则读完整 Vector，否则直接置 DefaultValue。 */
 void ReadVector(FNetBitStreamReader* Reader, FVector& OutVector, const FVector& DefaultValue)
 {
 	if (Reader->ReadBool())
@@ -364,6 +415,7 @@ void ReadVector(FNetBitStreamReader* Reader, FVector& OutVector, const FVector& 
 	}
 }
 
+/** WriteRotator：与 WriteVector 同思路，改用 FRotatorNetSerializer。 */
 void WriteRotator(FNetBitStreamWriter* Writer, const FRotator& Rotator)
 {
 	FNetSerializationContext Context(Writer);
@@ -387,6 +439,7 @@ void WriteRotator(FNetBitStreamWriter* Writer, const FRotator& Rotator)
 	Serializer.Serialize(Context, SerializeArgs);
 }
 
+/** ReadRotator：对称 Deserialize + Dequantize。 */
 void ReadRotator(FNetBitStreamReader* Reader, FRotator& Rotator)
 {
 	FNetSerializationContext Context(Reader);
@@ -410,6 +463,7 @@ void ReadRotator(FNetBitStreamReader* Reader, FRotator& Rotator)
 	Serializer.Dequantize(Context, DequantizeArgs);
 }
 
+/** WriteRotator（带默认值压缩）：与 WriteVector 同策略。 */
 void WriteRotator(FNetBitStreamWriter* Writer, const FRotator& Rotator, const FRotator& DefaultValue, float Epsilon)
 {
 	FNetSerializationContext Context(Writer);
@@ -421,6 +475,7 @@ void WriteRotator(FNetBitStreamWriter* Writer, const FRotator& Rotator, const FR
 	}
 }
 
+/** ReadRotator（带默认值压缩）。 */
 void ReadRotator(FNetBitStreamReader* Reader, FRotator& OutRotator, const FRotator& DefaultValue)
 {
 	if (Reader->ReadBool())
@@ -436,10 +491,13 @@ void ReadRotator(FNetBitStreamReader* Reader, FRotator& OutRotator, const FRotat
 namespace Private
 {
 
+/** 一次 SparseBitArray 编码分段上限：1024 位，对应 32 个 word。超出则按段分批处理。 */
 constexpr uint32 SerializeSparseArrayMaxBitCount = 1024U;
 constexpr uint32 SerializeSparseArrayMaxWordCount = SerializeSparseArrayMaxBitCount / 32U;
 
+/** UsingIndices 编码路径的"置位数量"前缀上限——最多用索引表达 3 个置位，多于此则回退到 ByteMask。 */
 const uint32 SparseUint32UsingIndices_MaxEncodedIndexBits = 3U;
+/** 用于编码"置位数量"的前缀位宽（GetBitsNeeded(3) = 2）。 */
 const uint32 SparseUint32UsingIndices_EncodedIndexBitsHeaderSize = GetBitsNeeded(SparseUint32UsingIndices_MaxEncodedIndexBits);
 
 // Note: This functions expects any stray bits to be filtered out by the caller
@@ -449,6 +507,13 @@ const uint32 SparseUint32UsingIndices_EncodedIndexBitsHeaderSize = GetBitsNeeded
 //{
 //	Value &= ~uint32(0) >> (uint32(-int32(BitCount)) & (31U));
 //}
+/**
+ * WriteSparseUint32UsingByteMask：字节级稀疏编码。
+ * 格式：
+ *   - NumMaskBits 位字节掩码：每位代表对应字节是否非零；
+ *   - 之后顺序写入所有非零字节（每个 8 位，末字节可能不满 8 位）。
+ * 适合有若干非零字节但不密集到需要全 32 位的中等稀疏情况。
+ */
 static void WriteSparseUint32UsingByteMask(FNetBitStreamWriter* Writer, uint32 Value, uint32 BitCount = 32U)
 {
 	checkSlow((Value & ~(~uint32(0) >> (uint32(-int32(BitCount)) & (31U)))) == 0U);
@@ -479,6 +544,7 @@ static void WriteSparseUint32UsingByteMask(FNetBitStreamWriter* Writer, uint32 V
 	Writer->WriteBits(ValueToWrite, ValueBitsToWrite);
 }
 
+/** ReadSparseUint32UsingByteMask：与上面的 Write 对偶，复原字节级稀疏 uint32。 */
 static uint32 ReadSparseUint32UsingByteMask(FNetBitStreamReader* Reader, uint32 BitCount = 32U)
 {
 	const uint32 NumMaskBits = (BitCount + 7U) / 8U;
@@ -488,6 +554,7 @@ static uint32 ReadSparseUint32UsingByteMask(FNetBitStreamReader* Reader, uint32 
 	const uint32 Mask = Reader->ReadBits(NumMaskBits);
 	
 	// Calculate bitcount for value based on bits set in mask, if the highest bit is set we need to subtract bits if the last byte is not a full byte
+	// 掩码置位字节数 * 8，若最高位字节不是完整 8 位（BitCount % 8 != 0），需扣除相应差值。
 	const uint32 ValueBitsToRead = FMath::CountBits(Mask) * 8U - ((Mask & HighestBitMask) ? 8U - BitCount & 7U : 0U);
 
 	// Read Value bits
@@ -520,6 +587,15 @@ static uint32 ReadSparseUint32UsingByteMask(FNetBitStreamReader* Reader, uint32 
 //{
 //	Value &= ~uint32(0) >> (uint32(-int32(BitCount)) & (31U));
 //}
+/**
+ * WriteSparseUint32UsingIndices：位索引稀疏编码（极稀疏情况最优）。
+ * 策略：
+ *  - 若置位数量 ∈ [1, 3]：写"数量"（2 位）+ 每个置位的"delta 索引"（差分 + 动态位宽）；
+ *  - 否则写"数量 = 0"作为 fallback 标记，回退到 WriteSparseUint32UsingByteMask。
+ * Delta 索引编码：
+ *  - 第 k 个 set bit 与前一个 set bit 的距离，位宽为 GetBitsNeeded(MaxIndexDeltaBits - LastWrittenBitIndex)；
+ *  - 这样既充分利用"前面已经占过的范围越大、剩余范围越小、所需位数越少"的特点。
+ */
 static void WriteSparseUint32UsingIndices(FNetBitStreamWriter* Writer, uint32 Value, uint32 BitCount = 32U)
 {
 	// Note: We expect at least 1 bit to be set so zero bits will take an unoptimal path
@@ -555,6 +631,7 @@ static void WriteSparseUint32UsingIndices(FNetBitStreamWriter* Writer, uint32 Va
 	}
 }
 
+/** ReadSparseUint32UsingIndices：对偶读取。数量 == 0 时回退到 ByteMask 路径。 */
 static uint32 ReadSparseUint32UsingIndices(FNetBitStreamReader* Reader, uint32 BitCount = 32U)
 {
 	const uint32 EncodedBitCount = Reader->ReadBits(SparseUint32UsingIndices_EncodedIndexBitsHeaderSize);
@@ -585,6 +662,19 @@ static uint32 ReadSparseUint32UsingIndices(FNetBitStreamReader* Reader, uint32 B
 	}
 }
 
+/**
+ * 模板化的 SparseBitArray 写入器：
+ *  - GetDataFunction：对每个 word 应用的变换函数（None hint → 恒等；ContainsMostlyOnes → ~Value，把"多 1"翻转成"多 0"再编码）。
+ *  - WriteSparseUint32Function：单 word 的编码实现（通常是 WriteSparseUint32UsingIndices）。
+ * 
+ * 编码结构：
+ *   1) WordCount 位 NonZeroWordMask：哪些 word 既非全 0 也非全 1；
+ *   2) 1 位 HasInvertedWords：是否存在全 1 的 word；
+ *   3) 若有 → WordCount 位 InvertedWordMask：哪些 word 是全 1（读取时直接填 ~0）；
+ *   4) 依次编码 NonZeroWordMask 中置位的 word 内容。
+ *
+ * 这种三级表达（全 0 / 全 1 / 部分非零）能最大化地压缩大量 0 或多个连续 1 的 ChangeMask。
+ */
 template<typename GetDataFunc, typename WriteSparseUint32Func>
 void WriteSparseBitArray(FNetBitStreamWriter* Writer, const uint32* Data, uint32 BitCount, GetDataFunc&& GetDataFunction, WriteSparseUint32Func&& WriteSparseUint32Function)
 {
@@ -605,6 +695,7 @@ void WriteSparseBitArray(FNetBitStreamWriter* Writer, const uint32* Data, uint32
 		{
 			const StorageWordType CurrentWord = Data[WordIt] & ((WordIt == LastWordIt) ? LastWordMask : ~0U);
 			// Set bits outside the valid range as ones when inverting the word to have the possibility of the zero word optimization.
+			// 对最后一个 word 的无效位补 1，再翻转——若翻转后为 0 则说明有效位全 1，可进全 1 优化路径。
 			const StorageWordType InvertedWord = ~(CurrentWord | (WordIt == LastWordIt ? ~LastWordMask : 0U));
 
 			NonZeroWordMask |= (CurrentWord == 0) or (InvertedWord == 0) ? 0U : CurrentBitMask;
@@ -646,6 +737,13 @@ void WriteSparseBitArray(FNetBitStreamWriter* Writer, const uint32* Data, uint32
 	}
 }
 
+/**
+ * 模板化的 SparseBitArray 读取器（对偶 WriteSparseBitArray）：
+ * 读 NonZeroWordMask + 可选 InvertedWordMask，再按标记选择：
+ *  - Non-zero：调 ReadSparseUint32Function 解码；
+ *  - Inverted：直接填 ~0（或 LastWordMask）；
+ *  - 否则 0。
+ */
 template<typename GetDataFunc, typename ReadSparseUint32Func>
 void ReadSparseBitArray(FNetBitStreamReader* Reader, uint32* OutData, uint32 BitCount, GetDataFunc&& GetDataFunction, ReadSparseUint32Func&& ReadSparseUint32Function)
 {
@@ -691,6 +789,7 @@ void ReadSparseBitArray(FNetBitStreamReader* Reader, uint32* OutData, uint32 Bit
 	}
 
 	// Last word, make sure we do not overwrite existing data
+	// 最后一个 word：保留 OutData 里"无效位"区域，仅按 LastWordMask 覆盖有效位。
 	if (RemainingBits > 0U)
 	{
 		StorageWordType ReadValue = 0U;
@@ -707,6 +806,11 @@ void ReadSparseBitArray(FNetBitStreamReader* Reader, uint32* OutData, uint32 Bit
 	}
 }
 
+/**
+ * WriteSparseBitArrayDelta：Delta 版本。
+ * 思路：把 Data ^ OldData 当作稀疏比特数组 DeltaData 编码（仅"有变动"的位置上为 1）。
+ * 不需要 InvertedWordMask——Delta 全 1 意味着整 word 翻转，通常不会发生。
+ */
 template<typename WriteSparseUint32Func>
 void WriteSparseBitArrayDelta(FNetBitStreamWriter* Writer, const uint32* Data, const uint32* OldData, uint32 BitCount, WriteSparseUint32Func&& WriteSparseUint32Function)
 {
@@ -760,6 +864,11 @@ void WriteSparseBitArrayDelta(FNetBitStreamWriter* Writer, const uint32* Data, c
 	}
 }
 
+/**
+ * ReadSparseBitArrayDelta：读 DirtyWordMask + 对每个 dirty word 解码出 DeltaWord，
+ * OutData[i] = OldData[i] ^ DeltaWord，重建新值。
+ * 末 word 同样仅覆盖 LastWordMask 范围，保留无效位。
+ */
 template<typename ReadSparseUint32Func>
 void ReadSparseBitArrayDelta(FNetBitStreamReader* Reader, uint32* OutData, const uint32* OldData, uint32 BitCount, ReadSparseUint32Func&& ReadSparseUint32Function)
 {
@@ -800,6 +909,10 @@ void ReadSparseBitArrayDelta(FNetBitStreamReader* Reader, uint32* OutData, const
 
 }
 
+/**
+ * 对外的 WriteSparseBitArray：按 1024 位分段循环调用内部模板实现。
+ * Hint == ContainsMostlyOnes 时使用 lambda [](v) → ~v 对每个 word 取反（多 1 变多 0 再编码）。
+ */
 void WriteSparseBitArray(FNetBitStreamWriter* Writer, const uint32* Data, uint32 BitCount, ESparseBitArraySerializationHint Hint)
 {
 	if (Hint == ESparseBitArraySerializationHint::None)
@@ -836,6 +949,7 @@ void WriteSparseBitArray(FNetBitStreamWriter* Writer, const uint32* Data, uint32
 	}
 }
 
+/** ReadSparseBitArray：与 WriteSparseBitArray 对偶，对 ContainsMostlyOnes 做逆向取反。 */
 void ReadSparseBitArray(FNetBitStreamReader* Reader, uint32* OutData, uint32 BitCount, ESparseBitArraySerializationHint Hint)
 {
 	if (Hint == ESparseBitArraySerializationHint::None)
@@ -872,6 +986,7 @@ void ReadSparseBitArray(FNetBitStreamReader* Reader, uint32* OutData, uint32 Bit
 	}
 }
 
+/** WriteSparseBitArrayDelta：按 1024 位分段循环调用模板实现。 */
 void WriteSparseBitArrayDelta(FNetBitStreamWriter* Writer, const uint32* Data, const uint32* OldData, uint32 BitCount)
 {
 	// Support large bit arrays
@@ -889,6 +1004,7 @@ void WriteSparseBitArrayDelta(FNetBitStreamWriter* Writer, const uint32* Data, c
 	}
 }
 
+/** ReadSparseBitArrayDelta：对偶读取。 */
 void ReadSparseBitArrayDelta(FNetBitStreamReader* Reader, uint32* OutData, const uint32* OldData, uint32 BitCount)
 {
 	// Support large bit arrays
@@ -906,12 +1022,20 @@ void ReadSparseBitArrayDelta(FNetBitStreamReader* Reader, uint32* OutData, const
 	}
 }
 
+/** 哨兵值常量。选择"不好看的"0xBAADDEAD 便于在 hex dump 中一眼识别，且非零字节密度高，错位容易检测出。 */
 const uint32 NetBitStreamSentinelValue = 0xBAADDEADU;
+
+/** 写入哨兵值的低 BitCount 位。 */
 void WriteSentinelBits(FNetBitStreamWriter* Writer, uint32 BitCount)
 {
 	Writer->WriteBits(NetBitStreamSentinelValue, BitCount);
 }
 
+/**
+ * 读取并校验哨兵：对 NetBitStreamSentinelValue 按 BitCount 截取后比较。
+ *  - 溢出 / 值不符 → ensureAlwaysMsgf 报错（ensureAlways 不可被屏蔽）。
+ *  - ErrorString 作为日志标签，便于定位哪一处哨兵失败。
+ */
 bool ReadAndVerifySentinelBits(FNetBitStreamReader* Reader, const TCHAR* ErrorString, uint32 BitCount)
 {
 	const uint32 ReadValue = Reader->ReadBits(BitCount);
@@ -920,6 +1044,13 @@ bool ReadAndVerifySentinelBits(FNetBitStreamReader* Reader, const TCHAR* ErrorSt
 	return ensureAlwaysMsgf(!Reader->IsOverflown() &&  ExpectedValue == ReadValue, TEXT("ReadAndVerifySentinelBits %s failed OverFlow %u Got 0x%u != 0x%u"), ErrorString, Reader->IsOverflown() ? 1U : 0U, ReadValue, ExpectedValue);
 }
 
+/**
+ * ReadBytes：按字节读取（源指针可能非对齐的场景）。
+ * 算法：
+ *  1. 修正目标 Dst 对齐（每次 8 位补到 4 字节边界）；
+ *  2. 对齐后批量调用 ReadBitStream（32 位为单位）；
+ *  3. 尾部残余字节再用 ReadBits(8) 逐一补齐。
+ */
 void ReadBytes(FNetBitStreamReader* Reader, uint8* Destination, uint32 BytesToRead)
 {
 	if (BytesToRead == 0)
@@ -949,6 +1080,7 @@ void ReadBytes(FNetBitStreamReader* Reader, uint8* Destination, uint32 BytesToRe
 	}
 }
 
+/** WriteBytes：与 ReadBytes 对偶，先修正源对齐，再按 word 批量写，尾部逐字节写。 */
 void WriteBytes(FNetBitStreamWriter* Writer, const uint8* Src, uint32 BytesToWrite)
 {
 	if (BytesToWrite == 0)
@@ -978,6 +1110,15 @@ void WriteBytes(FNetBitStreamWriter* Writer, const uint8* Src, uint32 BytesToWri
 	}
 }
 
+/**
+ * WriteConditionallyQuantizedVector：条件量化 Vector 序列化（常见用法：游戏对象位置的廉价同步）。
+ * 编码：
+ *   bit 0 (IsNotDefault)：若接近 DefaultValue 只写此位；
+ *   bit 1 (bQuantize)：决定用 FVectorNetQuantize10NetSerializer（每单位 0.1 精度）还是 FVectorNetSerializer（全精度）；
+ *   之后：对应 Serializer 的输出。
+ *
+ * 量化模式的 Epsilon 选 0.01f（对应 0.1 精度留出冗余），全精度模式用 UE_KINDA_SMALL_NUMBER。
+ */
 void WriteConditionallyQuantizedVector(UE::Net::FNetBitStreamWriter* Writer, const FVector& Vector, const FVector& DefaultValue, bool bQuantize)
 {
 	using namespace UE::Net::Private;
@@ -1015,6 +1156,7 @@ void WriteConditionallyQuantizedVector(UE::Net::FNetBitStreamWriter* Writer, con
 	}
 }
 
+/** ReadConditionallyQuantizedVector：对偶读取。接收端从 bQuantize 位自行选择对应 Serializer。 */
 void ReadConditionallyQuantizedVector(UE::Net::FNetBitStreamReader* Reader, FVector& OutVector, const FVector& DefaultValue)
 {
 	using namespace UE::Net::Private;

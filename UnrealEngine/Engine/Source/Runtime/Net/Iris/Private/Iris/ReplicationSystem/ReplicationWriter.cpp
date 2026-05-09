@@ -1,5 +1,88 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// ReplicationWriter.cpp —— 发送端核心实现（每连接一份）
+// -----------------------------------------------------------------------------
+// 本文件 ~4466 行，是 Iris 发送侧最复杂的实现。整体职责见 ReplicationWriter.h
+// 顶部注释 + ReplicationSystem.md §5。下面按阶段串起整个写入流程：
+//
+// ─── 帧前期 ─────────────────────────────────────────────────────────
+// UpdateScope(NetBitArrayView)            把 Filtering 输出的 RelevantObjectsInScope 反映为
+//                                          每对象状态：
+//                                            • 新进 scope → StartReplication（PendingCreate）
+//                                            • 离开 scope → 进入 PendingDestroy / SubObjectPendingDestroy
+//                                            • 对仍在 inflight 的销毁记录 → 走 CancelPendingDestroy
+// UpdateDirtyChangeMasks(ChangeMaskCache) 把 ChangeMaskCache 的 OR-合并结果应用到 PerObject ChangeMask
+// UpdatePriorities(float[])               把 Prioritization 结果累加到 SchedulingPriorities[]
+//                                          （注意是 +=，每帧累加；写成功置 0）
+//
+// ─── BeginWrite ─────────────────────────────────────────────────────
+// 1) UpdateStreamDebugFeatures 读取 cvar，决定本包是否插入 BatchSize/Sentinel
+// 2) ScheduleObjects → SortScheduledObjects（部分排序，仅排前 PartialSortObjectCount）
+// 3) 检查 ReplicationRecord 是否接近上限 → bIsInReplicationRecordStarvation
+//    → 退化模式只发 OOB / HugeObject
+//
+// ─── Write（核心循环；可能跨多包）────────────────────────────────────
+// WriteSentinel + WriteStreamDebugFeatures
+// WriteObjectsPendingDestroy   按 cvar 分两条路径：
+//                                Root-only（默认）→ 客户端原子销毁 owner+所有 SubObject
+//                                Individually    → 旧路径，逐个发销毁
+// WriteOOBAttachments          特殊 InternalIndex=0 槽：发送给"对象不在 scope"的 RPC
+// HugeObject 通道              如有进行中的 HugeObject，FHugeObjectSendQueue 优先续传分片
+// WriteObjects                 主循环：每次取最高优先级对象 → WriteObjectBatch
+//   WriteObjectBatch:
+//     • WriteObjectAndSubObjects 写 owner + 所有 dirty SubObject 进 BatchInfo（暂存）
+//     • 写完后 HandleObjectBatchSuccess：
+//         - 提交 FObjectRecord 到 ReplicationRecord（用于 ACK 回滚）
+//         - 推进对象状态机（PendingCreate → WaitOnCreateConfirmation；TearOff → WaitOnFlush 等）
+//         - 清掉 ChangeMask（已发送）
+//         - SchedulingPriority 置 0
+//     • 失败处理 HandleObjectBatchFailure：
+//         - BitStreamOverflow + 大对象 → SplitHugeObject（PrepareAndSendHugeObjectPayload）
+//         - BitStreamOverflow + 小对象 → TrySmallObject（继续尝试更小的对象）
+//         - InvalidState/NoInstanceProtocol/Error → Abort
+//
+// ─── HugeObject 通道 ───────────────────────────────────────────────
+// PrepareAndSendHugeObjectPayload：
+//   1) 在临时 buffer 中"完整"序列化对象（不受 MTU 限制）；
+//   2) 切分为 N 个 NetBlob 分片（PartialNetObjectAttachmentHandler）；
+//   3) 入队 NetBlobManager（可靠通道）；
+//   4) 把 FHugeObjectContext 入 HugeObjectSendQueue；
+//   5) 接收端 NetBlobAssembler 重组完成后再走一次 batch 解码。
+//
+// ─── EndWrite ─────────────────────────────────────────────────────
+// • 把本包累计的 RecordInfo 总数 PushRecord 到 FReplicationRecord（一包一项）；
+// • 更新 Stats / NetTrace。
+//
+// ─── ProcessDeliveryNotification（来自 NetDriver）──────────────────
+// • PopRecord → 取出最老一包的 InfoCount；
+// • 对每条 RecordInfo 走以下分支：
+//     - Delivered  → HandleDeliveredRecord：
+//                    • 推进 LastAckedBaselineIndex（让 BaselineManager 释放老 baseline）
+//                    • 状态机推进（WaitOnCreateConfirmation → Created；
+//                      WaitOnDestroyConfirmation → Destroyed 等）
+//                    • 释放 ChangeMask 副本
+//     - Lost       → HandleDroppedRecord：
+//                    • 把 ChangeMask OR 回 ObjectsWithDirtyChanges → 重发
+//                    • 状态机回退（如 WaitOnCreateConfirmation 失败仍保持，下次重发 creation）
+//                    • Baseline 失效（InvalidateBaseline）
+//                    • 对 SubObject 销毁走 SubObjectRecord，逐子对象处理
+//     - Discarded  → HandleDiscardedRecord：仅清资源，不重发（断开/关闭路径）
+//
+// ─── ChangeMask 与 in-flight 协作 ─────────────────────────────────
+// • PerObject FRecordInfoList 保存所有 in-flight 的 RecordInfo；
+// • PatchupObjectChangeMaskWithInflightChanges：写入前把 inflight 中所有未确认的位
+//   合并回当前 ChangeMask，确保丢包时不漏更新；
+// • Conditionals.ApplyFilterToChangeMask：按连接屏蔽 LifetimeCondition 位。
+//
+// CVar 总览（关键）：
+//   net.Iris.WarnAboutDroppedAttachmentsToObjectsNotInScope
+//   net.Iris.MaxFailedRecordCount        触发 starvation 的阈值
+//   net.Iris.PartialNetObjectMTU         HugeObject 分片大小
+//   net.Iris.DestroyRootAndSubObjectsIndividually 旧/新销毁路径切换
+//   net.Iris.DebugCannotSendThresholdSec 长时间无法发送的诊断阈值
+// =============================================================================
+
 #include "Iris/ReplicationSystem/ReplicationWriter.h"
 
 #include "Containers/Array.h"
@@ -344,6 +427,8 @@ bool FReplicationWriter::AreAllReliableAttachmentsSentAndAcked() const
 	return !bHasUnprocessedReliables && Attachments.AreAllObjectsReliableSentAndAcked();
 }
 
+// 状态切换辅助函数：所有状态变更都应通过此函数（便于统一打日志/Trace）。
+// PerObjectInfo.State 是 5-bit 紧凑字段，编码 EReplicatedObjectState。
 void FReplicationWriter::SetState(uint32 InternalIndex, EReplicatedObjectState NewState)
 {
 	FReplicationInfo& Info = GetReplicationInfo(InternalIndex);
@@ -494,6 +579,9 @@ void FReplicationWriter::GetInitialChangeMask(ChangeMaskStorageType* ChangeMaskD
 	ChangeMask.SetAllBits();
 }
 
+// 创建 PerObjectInfo（State=PendingCreate） + 注册到 ObjectsInScope；
+// 初始 ChangeMask 由 GetInitialChangeMask 设置（首次状态全 1，但需尊重 InitOnly 屏蔽等）；
+// SchedulingPriority bump CreatePriority；启用 DeltaCompression 时分配 baseline 槽位。
 void FReplicationWriter::StartReplication(uint32 InternalIndex)
 {
 	FReplicationInfo& Info = GetReplicationInfo(InternalIndex);
@@ -589,6 +677,12 @@ void FReplicationWriter::StartReplication(uint32 InternalIndex)
 	}
 }
 
+// 关闭对象 replication：
+//  • 释放 ChangeMask 副本 / 取消 in-flight RecordInfo；
+//  • 通知 BaselineManager 释放该对象所有 baseline；
+//  • 从 ObjectsInScope / ObjectsWithDirtyChanges / ObjectsPendingDestroy 中清除；
+//  • Info 重置为 Invalid 状态。
+// 注意：通常在 UpdateScope 检测到对象彻底退出 + Destroy 已确认 后才调用本函数。
 void FReplicationWriter::StopReplication(uint32 InternalIndex)
 {
 	FReplicationInfo& Info = GetReplicationInfo(InternalIndex);
@@ -755,6 +849,20 @@ void FReplicationWriter::SetPendingDestroyOrSubObjectPendingDestroyState(uint32 
 	Info.HasDirtyChangeMask = 0U;
 }
 
+// =============================================================================
+// UpdateScope —— 把 Filtering 输出反映到对象状态机
+// -----------------------------------------------------------------------------
+// 输入：本帧 RelevantObjectsInScope（FNetBitArrayView，来自 ReplicationFiltering）
+// 处理：对每个 InternalIndex 比较 ObjectsInScope（旧）vs UpdatedScope（新）：
+//   • 新进 scope，本端无 Info → StartReplication（创建 PerObjectInfo，State=PendingCreate）
+//   • 离开 scope（旧有，新无）→
+//        - 若已 Created → 进入 PendingDestroy 或 SubObjectPendingDestroy
+//        - 若仍 in-flight 状态 → 走 WaitOnFlush（保证 in-flight 数据先确认再销毁）
+//        - 若已发送 destroy → 状态保持
+//   • 仍在 scope（旧有，新有）→ 不做事（dirty mask 由 UpdateDirtyChangeMasks 处理）
+//   • Cancel-pending-destroy：对象被加回 scope 但已发送过 destroy → CancelPendingDestroy
+//     （需要发送一个 "creation" 来"取消"销毁，防止接收端真的销毁）
+// =============================================================================
 void FReplicationWriter::UpdateScope(const FNetBitArrayView& UpdatedScope)
 {
 	//IRIS_PROFILER_SCOPE(FReplicationWriter_ScopeUpdate);
@@ -988,6 +1096,17 @@ void FReplicationWriter::UpdateDirtyGlobalLifetimeConditionals(TArrayView<FInter
 	}
 }
 
+// =============================================================================
+// InternalUpdateDirtyChangeMasks —— 应用 ChangeMaskCache 到 PerObject ChangeMask
+// -----------------------------------------------------------------------------
+// ChangeMaskCache 是当前帧的全局脏位汇总（多 fragment / 多源标脏 OR 合并）。
+// 对每个有变化的对象：
+//   • Info.ChangeMaskOrPtr |= CachedMask；
+//   • Info.HasDirtyChangeMask = 1；ObjectsWithDirtyChanges.Set；
+//   • 处理 ExtraFlushFlags（用于 EndReplication 时附加 flush 要求）；
+//   • bMarkForTearOff=true 时把对象切到 PendingTearOff 状态。
+// 注意：本函数不发送数据，只更新内存中的 dirty 状态；真正发送在 Write 中按 priority 调度。
+// =============================================================================
 void FReplicationWriter::InternalUpdateDirtyChangeMasks(const FChangeMaskCache& CachedChangeMasks, EFlushFlags ExtraFlushFlags, bool bMarkForTearOff)
 {
 	//IRIS_PROFILER_SCOPE(FReplicationWriter_UpdateDirtyChangeMasks);
@@ -1200,6 +1319,18 @@ uint32 FReplicationWriter::SortScheduledObjects(FScheduleObjectInfo* ScheduledOb
 	return FMath::Min(ScheduledObjectCount - StartIndex, PartialSortObjectCount);
 }
 
+// =============================================================================
+// HandleDeliveredRecord —— ACK 路径
+// -----------------------------------------------------------------------------
+// 当某条 RecordInfo 对应的包被 NetDriver 报告为 Delivered：
+//  • 状态机推进：
+//      WaitOnCreateConfirmation → Created     （首次确认创建，IsCreationConfirmed=1）
+//      WaitOnDestroyConfirmation → Destroyed   （销毁确认）
+//      PermanentlyDestroyed                    （DestructionInfo 确认）
+//  • 推进 LastAckedBaselineIndex = NewBaselineIndex（让 BaselineManager 释放更老 baseline）
+//  • 释放 ChangeMask 副本（如果是 pointer 形式）
+//  • Reliable Attachment 推进 ACK
+// =============================================================================
 void FReplicationWriter::HandleDeliveredRecord(const FReplicationRecord::FRecordInfo& RecordInfo, FReplicationInfo& Info, const FNetObjectAttachmentsWriter::FReliableReplicationRecord& AttachmentRecord)
 {
 	EReplicatedObjectState DeliveredState = (EReplicatedObjectState)RecordInfo.ReplicatedObjectState;
@@ -1716,6 +1847,11 @@ void FReplicationWriter::HandleDroppedRecord<FReplicationWriter::EReplicatedObje
 	}
 }
 
+// 通用 NACK 入口（按当前状态分派到对应的 HandleDroppedRecord<State> 特化版本）。
+// 整体策略：
+//   - 把丢失的 ChangeMask OR 回 Info.ChangeMaskOrPtr → 加到 ObjectsWithDirtyChanges → 重发；
+//   - 触发 InvalidateBaseline（PendingBaseline 失效）+ SchedulingPriority bump（LostStatePriorityBump）；
+//   - 状态特化处理（WaitOnCreateConfirmation / Created / WaitOnDestroyConfirmation 等）。
 void FReplicationWriter::HandleDroppedRecord(const FReplicationRecord::FRecordInfo& RecordInfo, FReplicationInfo& Info, const FNetObjectAttachmentsWriter::FReliableReplicationRecord& AttachmentRecord)
 {
 	EReplicatedObjectState LostObjectState = (EReplicatedObjectState)RecordInfo.ReplicatedObjectState;
@@ -1790,6 +1926,19 @@ void FReplicationWriter::HandleDroppedRecord(const FReplicationRecord::FRecordIn
 	}
 }
 
+// =============================================================================
+// ProcessDeliveryNotification —— ACK/NACK 主入口（由 ReplicationDataStream 调用）
+// -----------------------------------------------------------------------------
+// • PopRecord 取出最老一包的 InfoCount；
+// • 对该包内的每条 RecordInfo：
+//     PopInfoAndRemoveFromList（从 PerObject 链表摘除并出队）
+//     ↓
+//     按 PacketDeliveryStatus 分支：
+//       Delivered → HandleDeliveredRecord
+//       Lost      → HandleDroppedRecord
+//       Discard   → HandleDiscardedRecord（关闭/异常路径，仅清资源）
+// • 对附带 Attachment / SubObject 记录：DequeueAttachmentRecord / DequeueSubObjectRecord 同步出队。
+// =============================================================================
 void FReplicationWriter::ProcessDeliveryNotification(EPacketDeliveryStatus PacketDeliveryStatus)
 {
 #if UE_NET_VALIDATE_REPLICATION_RECORD
@@ -1870,6 +2019,9 @@ void FReplicationWriter::CreateObjectRecord(const FNetBitArrayView* ChangeMask, 
 	}
 }
 
+// 把临时 FObjectRecord（含 ChangeMask 副本 + AttachmentRecord）提交到 FReplicationRecord，
+// 并链接到 PerObject FRecordInfoList 末端。
+// 调用方未提交时 ChangeMask 副本会泄漏 —— 这是热点路径，故约定"创建即提交"模式。
 void FReplicationWriter::CommitObjectRecord(uint32 InternalObjectIndex, const FObjectRecord& ObjectRecord)
 {
 	// Push and link replication record to data already in-flight
@@ -2935,6 +3087,21 @@ FReplicationWriter::EWriteObjectStatus FReplicationWriter::WriteObjectInBatch(FN
 	return EWriteObjectStatus::Success;
 }
 
+// =============================================================================
+// PrepareAndSendHugeObjectPayload —— HugeObject 通道入口
+// -----------------------------------------------------------------------------
+// 当某对象的一次完整 batch 超过单包 MTU 时调用：
+//   1) 在临时 buffer 中"完整"写入对象（不受 MTU 约束）；
+//   2) PartialNetObjectAttachmentHandler 把 buffer 切分为 N 个 NetBlob 分片；
+//   3) 通过 NetBlobManager 走"可靠"通道入队（保证有序到达）；
+//   4) 把 FHugeObjectContext（含 RootObjectInternalIndex / BatchRecord / 全部 Blob refs）
+//      入队到 HugeObjectSendQueue；
+//   5) 接收端 NetBlobAssembler 收齐分片后调用 ProcessHugeObject 走"内嵌 batch"解码。
+//
+// HugeObject 在传输期间本对象不再被普通 Write 路径选中（IsObjectPartOfActiveHugeObject）；
+// 直到所有 Blobs 引用计数归 1（被 NetBlobManager 全部 ACK），HugeObjectSendQueue.AckObjects
+// 触发回调，CommitBatchRecord 推进 PerObjectInfo 的状态机。
+// =============================================================================
 FReplicationWriter::EWriteStatus FReplicationWriter::PrepareAndSendHugeObjectPayload(FNetSerializationContext& Context, FInternalNetRefIndex InternalIndex)
 {
 	IRIS_PROFILER_SCOPE(FReplicationWriter_PrepareAndSendHugeObjectPayload);
@@ -3133,6 +3300,12 @@ FReplicationWriter::EWriteStatus FReplicationWriter::PrepareAndSendHugeObjectPay
 	return EWriteStatus::Abort;
 }
 
+// 写一个对象 batch（owner + dirty SubObject）作为一次原子操作：
+//   1) 记下 BitStream 起点 BatchStartPos（失败时回滚至此）；
+//   2) WriteObjectAndSubObjects 把数据写入 BitStream + 收集到 BatchInfo；
+//   3) 成功 → HandleObjectBatchSuccess（提交 RecordInfo / 推进状态机）；
+//   4) 失败 → 把 BitStream 回滚到 BatchStartPos，HandleObjectBatchFailure 决定下一步策略：
+//        Abort / TrySmallObject / SplitHugeObject。
 FReplicationWriter::FWriteBatchResult FReplicationWriter::WriteObjectBatch(FNetSerializationContext& Context, FInternalNetRefIndex InternalIndex, uint32 WriteObjectFlags)
 {
 	IRIS_PROFILER_SCOPE(FReplicationWriter_WriteObjectBatch);
@@ -3395,6 +3568,21 @@ uint32 FReplicationWriter::WriteOOBAttachments(FNetSerializationContext& Context
 	return WrittenObjectCount;
 }
 
+// =============================================================================
+// WriteObjects —— 主对象写入循环（按调度优先级 + 部分排序）
+// -----------------------------------------------------------------------------
+// 循环：
+//   while (!stream_full && CurrentIndex < ScheduledObjectCount):
+//     • 选下一个对象（已部分排序，前 PartialSortObjectCount 已严格降序）；
+//     • 若优先级 < SchedulingThresholdPriority → 跳出（不值得发）；
+//     • WriteObjectBatch → 根据返回处理：
+//         Written → 累加统计；
+//         Skipped → 标记 FailedToWriteSmallObjectCount（用于触发"是否还要继续尝试更小的对象"）；
+//         Abort   → 整流终止（流满）。
+//   • 处理 DependentObjectsPendingSend：父对象成功后，依赖子对象 over-commit 试发。
+// 跨包：流满后返回，等下个包的 BeginWrite/Write 续写（CurrentIndex / SortedObjectCount 在
+// FWriteContext 中持续）。
+// =============================================================================
 uint32 FReplicationWriter::WriteObjects(FNetSerializationContext& Context)
 {
 	uint32 WrittenObjectCount = 0;
@@ -3723,6 +3911,16 @@ FReplicationWriter::EWriteObjectRetryMode FReplicationWriter::HandleObjectBatchF
 	return EWriteObjectRetryMode::TrySmallObject;
 }
 
+// =============================================================================
+// BeginWrite —— 一帧（多包）写入会话开始
+// -----------------------------------------------------------------------------
+// • UpdateStreamDebugFeatures（按 cvar 启用 BatchSize/Sentinels）
+// • 检查 ReplicationRecord 余量 → 设置 bIsInReplicationRecordStarvation
+// • ScheduleObjects + SortScheduledObjects（部分排序）
+// • 计算 bHasXxxToSend 系列状态位（destroy/dirty/huge/oob 等）
+// • bIsValid 置 1 → 后续 Write 调用复用本 WriteContext
+// • 没有数据可发 → 返回 EWriteResult::NoData
+// =============================================================================
 UDataStream::EWriteResult FReplicationWriter::BeginWrite(const UDataStream::FBeginWriteParameters& Params)
 {
 	IRIS_PROFILER_SCOPE(FReplicationWriter_PrepareWrite);
@@ -3811,6 +4009,8 @@ UDataStream::EWriteResult FReplicationWriter::BeginWrite(const UDataStream::FBeg
 	return UDataStream::EWriteResult::HasMoreData;
 }
 
+// EndWrite：本包关闭。把累计的 RecordInfo 数 PushRecord 入 ReplicationRecord
+// （一包对应 Record 队列中一项，用于 ACK/NACK 时按 InfoCount 批量出队）。
 void FReplicationWriter::EndWrite()
 {
 	IRIS_PROFILER_SCOPE(FReplicationWriter_FinishWrite);
@@ -3897,6 +4097,17 @@ bool FReplicationWriter::HasDataToSend(const FWriteContext& Context) const
 	return WriteContext.bIsValid & (Context.bHasDestroyedObjectsToSend | Context.bHasUpdatedObjectsToSend | Context.bHasHugeObjectToSend | Context.bHasOOBAttachmentsToSend);
 }
 
+// =============================================================================
+// Write —— 单包写入入口（一帧内可能被多次调用）
+// -----------------------------------------------------------------------------
+// 顺序：
+//   1) WriteSentinel + WriteStreamDebugFeatures（仅 packet 起点）
+//   2) WriteObjectsPendingDestroy
+//   3) HugeObject 续传（若有 in-transit）
+//   4) WriteOOBAttachments
+//   5) WriteObjects（主对象循环）
+// 期间任何 BitStream 溢出 → 回滚到合法位置 + 返回 HasMoreData 让调用方再开新包。
+// =============================================================================
 UDataStream::EWriteResult FReplicationWriter::Write(FNetSerializationContext& Context)
 {
 	IRIS_PROFILER_SCOPE(FReplicationWriter_Write);
@@ -4036,6 +4247,8 @@ void FReplicationWriter::SetupReplicationInfoForAttachmentsToObjectsNotInScope()
 	ReplicationRecord.ResetList(ReplicatedObjectsRecordInfoLists[ObjectIndexForOOBAttachment]);
 }
 
+// 应用 Conditionals / LifetimeCondition 过滤到 ChangeMask（按连接屏蔽不应同步的位）。
+// 由 ReplicationConditionals 模块计算的 conditional ChangeMask 与对象本身的 ChangeMask 做 AND。
 void FReplicationWriter::ApplyFilterToChangeMask(uint32 ParentInternalIndex, uint32 InternalIndex, FReplicationInfo& Info, const FReplicationProtocol* Protocol, const uint8* InternalStateBuffer, bool bIsInitialState)
 {
 	const uint32* ConditionalChangeMaskPointer = (EnumHasAnyFlags(Protocol->ProtocolTraits, EReplicationProtocolTraits::HasConditionalChangeMask) ? reinterpret_cast<const uint32*>(InternalStateBuffer + Protocol->GetConditionalChangeMaskOffset()) : static_cast<const uint32*>(nullptr));
@@ -4046,6 +4259,11 @@ void FReplicationWriter::ApplyFilterToChangeMask(uint32 ParentInternalIndex, uin
 	}
 }
 
+// 让对象的 in-flight baseline 失效：
+//  • 通知 BaselineManager 释放 PendingBaseline 槽；
+//  • Info.PendingBaselineIndex / LastAckedBaselineIndex 重置；
+//  • 修复 NewBaselineIndex 字段在所有 in-flight RecordInfo 上的引用。
+// 触发场景：丢包导致 baseline 不一致；连接级 baseline 失效（DeltaCompressionBaselineInvalidationTracker）。
 void FReplicationWriter::InvalidateBaseline(uint32 InternalIndex, FReplicationInfo& Info)
 {
 	FReplicationRecord::FRecordInfoList& RecordInfoList = ReplicatedObjectsRecordInfoLists[InternalIndex];
@@ -4084,6 +4302,9 @@ bool FReplicationWriter::HasInFlightStateChanges(uint32 InternalIndex, const FRe
 	return HasInFlightStateChanges(CurrentRecordInfo);
 }
 
+// 把 in-flight 链表中所有未确认的 ChangeMask 位 OR 回当前 ChangeMask。
+// 目的：保证"对端尚未确认的修改 + 本帧新增修改"一并发送，避免丢包窗口内出现遗漏。
+// 返回是否有 in-flight 位被合并。
 bool FReplicationWriter::PatchupObjectChangeMaskWithInflightChanges(uint32 InternalIndex, FReplicationInfo& Info)
 {
 	bool bInFlightChangesAdded = false;
@@ -4181,6 +4402,8 @@ bool FReplicationWriter::IsWriteObjectSuccess(EWriteObjectStatus Status) const
 	return (Status == EWriteObjectStatus::Success) | (Status == EWriteObjectStatus::InvalidState);
 }
 
+// 关闭/异常路径：把所有 in-flight RecordInfo 当作 Discarded 处理（仅释放资源，不重发）。
+// 用于连接断开时避免 ChangeMask 副本/Attachment 资源泄漏。
 void FReplicationWriter::DiscardAllRecords()
 {
 	TReplicationRecordHelper Helper(ReplicatedObjects, ReplicatedObjectsRecordInfoLists, &ReplicationRecord);

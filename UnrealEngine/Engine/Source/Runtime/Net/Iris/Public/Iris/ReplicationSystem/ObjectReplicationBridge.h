@@ -1,5 +1,54 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ObjectReplicationBridge.h
+// 角色：UObjectReplicationBridge —— Iris 标准的"UObject 桥接"。继承自 UReplicationBridge，
+//       提供 UObject / Actor / Component 的全部上层 API：注册/反注册 / SubObject 管理 /
+//       Dependency / Dormancy / Class 级配置 / PIE 路径重映射 / 调试命令。
+//
+// 关键 API（按用途分类）：
+//   注册：
+//     StartReplicatingRootObject / StartReplicatingSubObject / StopReplicatingNetObject
+//     PreRegisterNewObjectReferenceHandle / PreRegisterObjectWithReferenceHandle
+//     AddStaticDestructionInfo / StoreDestructionInfo
+//   查询：
+//     GetReplicatedObject / GetReplicatedRefHandle / GetRootObjectOf*  /
+//     GetNetFactory / IsNetRefHandlePreRegistered / GetPreRegisteredObject
+//   引用：
+//     ResolveObjectReference / DescribeObjectReference / GetOrCreateObjectReference
+//   依赖：
+//     AddDependentObject / RemoveDependentObject /
+//     AddCreationDependencyLink / RemoveCreationDependencyLink
+//   Dormancy / Polling：
+//     SetObjectWantsToBeDormant / GetObjectWantsToBeDormant / NetFlushDormantObject /
+//     SetPollFrequency / SetPollWithObject / ConvertPollFrequencyIntoFrames /
+//     ReinitPollFrequency
+//   Class 级配置（对应 ObjectReplicationBridgeConfig）：
+//     SetClassDynamicFilterConfig / SetClassTypeStatsConfig
+//   Condition：
+//     SetSubObjectNetCondition
+//   调试 / 诊断：
+//     PrintReplicatedObjects / PrintAlwaysRelevantObjects / PrintNetCullDistances /
+//     PrintDebugInfoForNetRefHandle / ...
+//
+// 内部架构要点：
+//   * NetObjectFactories     : 每条已注册 FactoryClass 都会在 Bridge 内实例化一个对象
+//                              （Init -> InitNetObjectFactories）。
+//   * ConfigClassPathNameCache: 加速 UClass -> 配置文件中"代表名字"的查找。
+//   * ClassesWithDynamicFilter / ClassesWithPrioritizer / ClassesWithDeltaCompression /
+//     ClassesFlaggedCritical / ClassesIrisAsyncLoadingPriority / ClassesWithTypeStats :
+//     从 UObjectReplicationBridgeConfig 读取的"按类继承"配置；运行时按类名查询并缓存。
+//   * StaticObjectsPendingDestroy : 已死亡的静态对象 -> DestructionInfo 映射，
+//                                   用于"晚加入或流送关卡时通知客户端补销毁"。
+//   * ObjectsWithObjectReferences / GarbageCollectionAffectedObjects : GC 后引用修复需要的位图。
+//   * CachedCreationHeaders : 因 Flush 路径而需要"延迟写入创建头"的对象。
+//   * PIE 重映射            : 通过 RemapPathForPIE 让 PIE 多 RS 共享同一份资产路径。
+//
+// 帧循环主要钩子（与 ObjectReplicationBridge.cpp 中实现配合）：
+//   PreSendUpdate -> BuildPollList -> PreUpdate -> FinalizeDirtyObjects ->
+//                    ReconcileNewSubObjects -> PollAndCopy（可并行）
+// =====================================================================================
+
 #pragma once
 
 #include "HAL/Platform.h"
@@ -51,6 +100,10 @@ namespace UE::Net::Private
 {
 
 /** Info representing destroyed static objects */
+/**
+ * 表示一个"已被销毁的关卡静态对象"。当客户端晚加入或流送装载该关卡时，
+ * 服务器会用此信息补告知"该 static 对象在你那边应该处于已销毁状态"。
+ */
 struct FStaticDestructionInfo
 {
 	/** The reference to the static object that is considered destroyed */
@@ -68,6 +121,7 @@ struct FStaticDestructionInfo
 
 } // end namespace UE::Net::Private
 
+/** Bridge::Instantiate 路径的"基础返回值"。GameSpecific Bridge 可在此基础上扩展。 */
 struct FObjectReplicationBridgeInstantiateResult
 {
 	UObject* Object = nullptr;
@@ -78,6 +132,10 @@ struct FObjectReplicationBridgeInstantiateResult
 * Partial implementation of ReplicationBridge that can be used as a foundation for 
 * implementing support for replicating objects derived from UObject
 */
+/**
+ * 标准 UObject Bridge：处理 Actor / Component / 自定义 UObject 的 Iris 复制接入。
+ * 工程通常派生自 UObjectReplicationBridge 而非直接派生 UReplicationBridge。
+ */
 UCLASS(Transient, MinimalApi)
 class UObjectReplicationBridge : public UReplicationBridge
 {
@@ -85,23 +143,24 @@ class UObjectReplicationBridge : public UReplicationBridge
 
 public:
 
-	using EGetRefHandleFlags = UE::Net::EGetRefHandleFlags;
-
 	struct FRootObjectReplicationParams;
 	struct FSubObjectReplicationParams;
 
 	IRISCORE_API UObjectReplicationBridge();
 
 	/** Get the Object from a replicated handle, if the handle is invalid or not is a replicated handle the function will return nullptr */
+	/** 通过 NetRefHandle 反查 UObject。无效/未注册返回 nullptr。 */
 	IRISCORE_API UObject* GetReplicatedObject(FNetRefHandle Handle) const;
 
 	/** Get NetRefHandle from a replicated UObject. */
+	/** 通过 UObject 查找其 NetRefHandle；EvenIfGarbage 标志可在 GC pending 期间仍返回。 */
 	IRISCORE_API FNetRefHandle GetReplicatedRefHandle(const UObject* Object, EGetRefHandleFlags GetRefHandleFlags = EGetRefHandleFlags::None) const;
 
 	/** Get NetRefHandle from a NetHandle. */
 	IRISCORE_API FNetRefHandle GetReplicatedRefHandle(FNetHandle Handle) const;
 
 	/** Try to resolve UObject from NetObjectReference, this function tries to resolve the object by loading if necessary. */
+	/** 把 NetObjectReference 解析为 UObject*；可能触发 async load（取决于 ResolveContext）。 */
 	IRISCORE_API UObject* ResolveObjectReference(const UE::Net::FNetObjectReference& ObjectRef, const UE::Net::FNetObjectResolveContext& ResolveContext);
 
 	/** Describe the NetObjectReference */

@@ -1,5 +1,23 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavLinkRenderingComponent.cpp
+// -----------------------------------------------------------------------------
+// NavLink 的编辑器可视化实现。
+// 职责划分：
+//   - UNavLinkRenderingComponent：PrimitiveComponent 外壳。只负责创建 SceneProxy 与
+//     计算 Bounds。不参与导航生成，不存链接数据。
+//   - FNavLinkRenderingProxy：真正的调试绘制代理。构造时从 Host 接口拉链接数组并
+//     烘成 FNavLinkDrawing/FNavLinkSegmentDrawing 世界坐标快照。
+//     GetDynamicMeshElements 里读 NavSys 里所有 ARecastNavMesh 的 AgentMask + 
+//     MaxStepHeight，交给 GetLinkMeshes 画弧线 + 箭头 + 端点圆柱（snap 半径/高度）。
+//
+// DrawLinks vs GetLinkMeshes：
+//   - GetLinkMeshes 通过 FMeshElementCollector（更贴合引擎渲染管线，Mesh 可接受光照）
+//   - DrawLinks 直接向 FPrimitiveDrawInterface 发 debug 线，供没有 SceneProxy 的场景
+//     （例如 NavMeshRenderingComponent 里也要绘 link 时）复用。
+// =============================================================================
+
 #include "NavLinkRenderingComponent.h"
 #include "EngineGlobals.h"
 #include "PrimitiveViewRelevance.h"
@@ -23,6 +41,8 @@
 //----------------------------------------------------------------------//
 // UNavLinkRenderingComponent
 //----------------------------------------------------------------------//
+// 构造：Stationary + 无碰撞 + Editor Only。
+// Mobility=Stationary 让渲染在移动时依然能重建 Proxy，但静止时走优化路径。
 UNavLinkRenderingComponent::UNavLinkRenderingComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -38,6 +58,9 @@ UNavLinkRenderingComponent::UNavLinkRenderingComponent(const FObjectInitializer&
 	SetGenerateOverlapEvents(false);
 }
 
+// Bounds 计算：向 Owner 的 INavLinkHostInterface 要出链接列表并取端点 AABB。
+// 若 Host 通过 NavLinkClasses 暴露（UNavLinkDefinition 子类），则遍历所有类的端点。
+// 最终把 Actor 局部空间 Bounds 变换到 Component 局部空间再乘 InLocalToWorld。
 FBoxSphereBounds UNavLinkRenderingComponent::CalcBounds(const FTransform& InLocalToWorld) const
 {
 	AActor* LinkOwnerActor = GetOwner();
@@ -92,6 +115,7 @@ FPrimitiveSceneProxy* UNavLinkRenderingComponent::CreateSceneProxy()
 }
 
 #if WITH_EDITOR
+// 本组件在编辑器里不可被框选（绘制纯调试用途，不该干扰选择）
 bool UNavLinkRenderingComponent::ComponentIsTouchingSelectionBox(const FBox& InSelBBox, const bool bConsiderOnlyBSP, const bool bMustEncompassEntireComponent) const
 {
 	// NavLink rendering components not treated as 'selectable' in editor
@@ -108,6 +132,10 @@ bool UNavLinkRenderingComponent::ComponentIsTouchingSelectionFrustum(const FConv
 //----------------------------------------------------------------------//
 // FNavLinkRenderingProxy
 //----------------------------------------------------------------------//
+// 构造：向 Owner（或挂它的 Component）查询 INavLinkHostInterface，拉出链接数据转成绘制快照。
+// 注意：两种数据源都处理——
+//   1) GetNavigationLinksClasses + UNavLinkDefinition::GetLinksDefinition 的"模板定义"链接
+//   2) GetNavigationLinksArray 的"实例数据"链接（UNavLinkComponent 用的）
 FNavLinkRenderingProxy::FNavLinkRenderingProxy(const UPrimitiveComponent* InComponent)
 	: FPrimitiveSceneProxy(InComponent)
 {
@@ -150,6 +178,7 @@ SIZE_T FNavLinkRenderingProxy::GetTypeHash() const
 	return reinterpret_cast<size_t>(&UniquePointer);
 }
 
+// 把 FNavigationLink 数组变成 FNavLinkDrawing（世界坐标 + 颜色 + snap 参数）
 void FNavLinkRenderingProxy::StorePointLinks(const FTransform& InLocalToWorld, const TArray<FNavigationLink>& LinksArray)
 {
 	OffMeshPointLinks.Reserve(OffMeshPointLinks.Num() + LinksArray.Num());
@@ -159,6 +188,7 @@ void FNavLinkRenderingProxy::StorePointLinks(const FTransform& InLocalToWorld, c
 	}
 }
 
+// 段链接版本，处理对象是 FNavigationSegmentLink
 void FNavLinkRenderingProxy::StoreSegmentLinks(const FTransform& InLocalToWorld, const TArray<FNavigationSegmentLink>& LinksArray)
 {
 	OffMeshSegmentLinks.Reserve(OffMeshSegmentLinks.Num() + LinksArray.Num());
@@ -168,6 +198,11 @@ void FNavLinkRenderingProxy::StoreSegmentLinks(const FTransform& InLocalToWorld,
 	}
 }
 
+// 渲染入口：
+//   1) 遍历 NavSys->NavDataSet 收集"每个 RecastNavMesh 的 Agent 位 + MaxStepHeight"。
+//      - AgentMask：仅绘制开了调试显示的 NavMesh 所对应的 Agent 位。
+//      - StepHeights：端点圆柱的高度取值（反映该 Agent 的跨步高度）。
+//   2) 每个可见 View 调 GetLinkMeshes，把弧线 + 箭头 + 圆柱 塞进 Collector。
 void FNavLinkRenderingProxy::GetDynamicMeshElements(const TArray<const FSceneView*>& Views, const FSceneViewFamily& ViewFamily, uint32 VisibilityMap, FMeshElementCollector& Collector) const 
 {
 	if (LinkOwnerActor && LinkOwnerActor->GetWorld())
@@ -209,6 +244,10 @@ void FNavLinkRenderingProxy::GetDynamicMeshElements(const TArray<const FSceneVie
 	}
 }
 
+// 真正"画 Mesh 版本"的绘制函数——Collector 形式可被渲染线程复用。
+// 每条点链接：弧线 + 方向箭头 + 两端圆柱（snap 范围）。
+// 每条段链接：两条起/止弧 + 箭头 + 四端圆柱。
+// AgentMask 过滤：若链接声明了 SupportedAgents 与当前开了绘制的 NavMesh 无交集则跳过。
 void FNavLinkRenderingProxy::GetLinkMeshes(const TArray<FNavLinkDrawing>& OffMeshPointLinks, const TArray<FNavLinkSegmentDrawing>& OffMeshSegmentLinks, TArray<float>& StepHeights, FMaterialRenderProxy* const MeshColorInstance, int32 ViewIndex, FMeshElementCollector& Collector, uint32 AgentMask)
 {
 	static const FColor LinkColor(0,0,166);
@@ -324,6 +363,9 @@ void FNavLinkRenderingProxy::GetLinkMeshes(const TArray<FNavLinkDrawing>& OffMes
 	}
 }
 
+// 另一路绘制：直接调 PDI 的 DrawLine / DrawCylinder。
+// 用途：NavMeshRenderingComponent 里需要在不构造 SceneProxy 的情况下也能绘 link（如 VLog）。
+// 与 GetLinkMeshes 基本等价，只是底层 API 不同（PDI 版没有光照 mesh）。
 void FNavLinkRenderingProxy::DrawLinks(FPrimitiveDrawInterface* PDI, TArray<FNavLinkDrawing>& OffMeshPointLinks, TArray<FNavLinkSegmentDrawing>& OffMeshSegmentLinks, TArray<float>& StepHeights, FMaterialRenderProxy* const MeshColorInstance, uint32 AgentMask)
 {
 	static const FColor LinkColor(0,0,166);
@@ -439,6 +481,7 @@ void FNavLinkRenderingProxy::DrawLinks(FPrimitiveDrawInterface* PDI, TArray<FNav
 	}
 }
 
+// 可见性：只有开启导航 ShowFlag 且组件被选中时才画 —— 避免普通编辑状态下视口被 link 铺满。
 FPrimitiveViewRelevance FNavLinkRenderingProxy::GetViewRelevance(const FSceneView* View) const
 {
 	FPrimitiveViewRelevance Result;

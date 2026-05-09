@@ -1,5 +1,13 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavigationSystemModule.h
+// -----------------------------------------------------------------------------
+// NavigationSystem 模块的对外 IModuleInterface。
+// 当前接口非常单薄 —— 仅提供 Get()/IsAvailable() 便捷访问；
+// 模块初始化逻辑都在 Private/NavigationSystemModule.cpp 的 FNavigationSystemModule 里。
+// =============================================================================
+
 #pragma once
 
 #if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_4
@@ -14,6 +22,7 @@
 /**
  * The public interface to this module
  */
+// NavigationSystem 模块的对外接口。
 class INavSysModule : public IModuleInterface
 {
 
@@ -25,6 +34,7 @@ public:
 	 *
 	 * @return Returns singleton instance, loading the module on demand if needed
 	 */
+	// 单例式访问：必要时自动 Load 模块。注意：引擎关闭阶段不要再调。
 	static inline INavSysModule& Get()
 	{
 		return FModuleManager::LoadModuleChecked<INavSysModule>("NavigationSystem");
@@ -35,6 +45,7 @@ public:
 	 *
 	 * @return True if the module is loaded and ready to use
 	 */
+	// 是否已加载可用：调 Get() 前最好先 IsAvailable()。
 	static inline bool IsAvailable()
 	{
 		return FModuleManager::Get().IsModuleLoaded("NavigationSystem");

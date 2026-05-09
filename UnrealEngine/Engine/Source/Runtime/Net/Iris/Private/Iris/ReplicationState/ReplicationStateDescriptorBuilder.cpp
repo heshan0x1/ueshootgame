@@ -1,5 +1,91 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// ReplicationStateDescriptorBuilder.cpp —— 反射 → Descriptor 烘焙的核心实现（~3000 行）
+// -------------------------------------------------------------------------------------
+// 【角色】Iris 数据模型层最复杂的单文件，把 UClass / UStruct / UFunction 经反射一次性
+//        烘焙成 1 个或多个 FReplicationStateDescriptor。本文件包含三个对外入口的实现：
+//          - FReplicationStateDescriptorBuilder::CreateDescriptorsForClass
+//          - FReplicationStateDescriptorBuilder::CreateDescriptorForStruct
+//          - FReplicationStateDescriptorBuilder::CreateDescriptorForFunction
+//        以及内部工作类 FPropertyReplicationStateDescriptorBuilder。
+//
+// 【整体烘焙流程】（以 Class 为例）
+//   1) 反射枚举 UClass 的 UPROPERTY；过滤 ReplicationID / ChangeMaskStorage 等内部字段；
+//   2) 通过 GetLifetimeReplicatedProps 取 lifetime conditional + RepIndex；
+//   3) 为每个属性查 FPropertyNetSerializerInfoRegistry → 选定 NetSerializer；
+//   4) FastArray 检测：UScriptStruct->IsChildOf(FFastArraySerializer) → 走特化分支
+//      （生成 IsFastArrayReplicationState / 可能 IsNativeFastArrayReplicationState）；
+//   5) Struct 自定义 NetSerializer 判定：
+//      - IsStructWithCustomSerializer：通过 PropertyNetSerializerInfoRegistry 注册（UE_NET_IMPLEMENT_NAMED_STRUCT_NETSERIALIZER_INFO 注入）；
+//      - DerivedFromCustom            ：父类有自定义 NetSerializer，BaseStruct 指向父；
+//      - 配合 UReplicationStateDescriptorConfig::SupportsStructNetSerializerList 白名单消除警告；
+//   6) 按"高层条件"把属性切分成多个 Bucket（Init / Owner / SkipOwner / 普通），每个 Bucket
+//      最终成为一个 Descriptor；FastArray 属性独立成 Descriptor；
+//   7) 对每个 Bucket 调用 FPropertyReplicationStateDescriptorBuilder::Build：
+//        a) BuildMemberCache —— 为每个属性确定 Serializer/Config/外部&内部 size+alignment；
+//        b) BuildMemberReferenceCache / BuildMemberTagCache / BuildMemberFunctionCache；
+//        c) FMemoryLayoutUtil 累计所有"段"（Descriptor 自身 + 11 个成员数组 + SerializerConfig）
+//           的 size+alignment，最后一次 FMemory::Malloc 整块分配；
+//        d) 在整块 buffer 上写各子数组（BuildMemberDescriptors / BuildMemberSerializerDescriptors
+//           / BuildMemberChangeMaskDescriptors / BuildMemberTraitsDescriptors / ...）；
+//        e) BuildMemberRepIndexToMemberDescriptors —— 建立 RepIndex → MemberIndex 反查表
+//           （表长 = max RepIndex + 1，可能含 InvalidEntry 空洞）；
+//        f) BuildMemberLifetimeConditionDescriptors —— 仅 HasLifetimeConditionals 时；
+//        g) AllocateAndInitializeDefaultInternalStateBuffer —— 从 CDO 量化默认值；
+//        h) CalculateDefaultStateChecksum —— 序列化默认值后 CityHash64 → DefaultStateHash；
+//        i) DescriptorIdentifier.Value = CityHash64(PathName) ——稳定 ID；
+//        j) BuildReplicationStateTraits —— 汇总 EReplicationStateTraits 17+ 位；
+//        k) FixupNetRoleNetSerializerConfigs / FixupDescriptorForNativeFastArray 等收尾。
+//   8) 回填 OutCreatedDescriptors，注册到 DescriptorRegistry（如有）。
+//
+// 【关键数据结构】
+//   - FPropertyReplicationStateDescriptorBuilder::FMemberProperty：每属性烘焙参数
+//     （Property / SerializerInfo / Traits / ChangeMaskBits / LifetimeCondition / ChangeMaskGroupName）；
+//   - FMemberCache / FMemberCacheEntry：烘焙过程中缓存每属性的 size/align 等中间结果；
+//   - FBuilderContext：累计 External/Internal size+alignment、CombinedTraits、SharedTraits；
+//   - FStructInfo：当烘焙 Struct 时记录 Struct 自身 size+alignment + SerializerType；
+//
+// 【单块连续内存 Layout（Build 末尾）】
+//   FMemoryLayoutUtil 把以下段连续摆放，一次 FMemory::Malloc 出来：
+//     [FReplicationStateDescriptor]
+//     [MemberDescriptors[N]]                         // size=N
+//     [MemberChangeMaskDescriptors[N]]
+//     [MemberSerializerDescriptors[N]]
+//     [MemberTraitsDescriptors[N]]
+//     [MemberFunctionDescriptors[FunctionCount]]?
+//     [MemberTagDescriptors[TagCount]]?
+//     [MemberReferenceDescriptors[RefCount]]?
+//     [FProperty*[N]]?                                // MemberProperties
+//     [MemberPropertyDescriptors[N]]?
+//     [MemberLifetimeConditionDescriptors[N]]?
+//     [MemberRepIndexToMemberIndexDescriptors[RepIndexCount]]?
+//     [MemberDebugDescriptors[N]]?
+//     [SerializerConfig 0][...][SerializerConfig N-1]
+//   Release 时一次 Free 整块。SerializerConfig 中 NeedDestruction 的需先析构。
+//
+// 【FastArray 分支关键点】
+//   - 检测：UScriptStruct->IsChildOf(FFastArraySerializer)；
+//   - bIrisUseNativeFastArray CVar 决定是否走 FIrisFastArraySerializer (Native 路径，
+//     ChangeMaskStorage[4] = 63-bit 元素 changemask + 1-bit array + 条件位)；
+//   - FastArray Descriptor 单独烘焙 Item 类型为内嵌 Descriptor；
+//   - Descriptor->Traits 添加 IsFastArrayReplicationState [+ IsNativeFastArrayReplicationState]；
+//   - Descriptor->CreateAndRegisterReplicationFragmentFunction 指向 FastArray 的 fragment 创建函数；
+//   - FixupDescriptorForNativeFastArray 校正 ChangeMasksExternalOffset 让 Header 落在 ChangeMaskStorage 之前。
+//
+// 【lifetime conditional 合并】
+//   - 同一 ELifetimeCondition 的属性合并到同一 Descriptor（Bucket）以最大化跨连接共享；
+//   - HasLifetimeConditionals trait 启用时 Descriptor 同时分配 ConditionalChangeMask；
+//   - SetReplicationCondition(RepIndex, ...) 通过 MemberRepIndexToMemberIndexDescriptors O(1)
+//     反查到 MemberIndex，再操作 ConditionalChangeMask 对应位。
+//
+// 【CityHash64 稳定 identifier】
+//   - DescriptorIdentifier.Value      = CityHash64(PathName)
+//     PathName 由 FLazyGetPathNameHelper 取出 + 大写规范化，保证大小写无关；
+//   - DescriptorIdentifier.DefaultStateHash = CityHash64(SerializeDefault(Descriptor->DefaultStateBuffer))
+//     通过 ReplicationStateOperations::Serialize 量化 → bitstream → 哈希。
+// =====================================================================================
+
 #include "Iris/ReplicationState/ReplicationStateDescriptorBuilder.h"
 #include "CoreTypes.h"
 #include "Containers/Set.h"
@@ -84,6 +170,23 @@ static UIrisObjectReferencePackageMap* GetOrCreateIrisObjectReferencePackageMap(
 	return s_IrisObjectReferencePackageMap.Get();
 }
 
+// 【EMemberPropertyTraits】Builder 内部使用的"属性级"trait 位掩码（uint32）。
+// 仅在烘焙过程中存在，最后会汇总到 Descriptor 级 EReplicationStateTraits +
+// EReplicationStateMemberTraits。各位含义：
+//   - InitOnly                          : 属性 LifetimeCondition == COND_InitialOnly；
+//   - HasLifetimeConditionals           : 属性的 LifetimeCondition 不是 COND_None 也不是 COND_Custom；
+//   - RepNotifyOnChanged / RepNotifyAlways: RepNotify 触发模式（变更时 / 总是）；
+//   - NeedPreviousState                 : 接收侧需要保留前一帧值（RepNotify with prev value）；
+//   - HasDynamicState / HasObjectReference: 量化数据含动态分配 / 含对象引用；
+//   - HasCustomObjectReference          : Serializer 自定义引用迭代（NetSerializerTraits::HasCustomNetReference）；
+//   - IsSourceTriviallyConstructible/Destructible: External 类型 trivially ctor/dtor；
+//   - IsTArray / IsFastArray / IsNativeFastArray: 数组类型识别；
+//   - IsFastArrayWithExtraProperties    : FastArray 含额外属性（FParameters::AllowFastArrayWithExtraReplicatedProperties=true）；
+//   - IsFastArrayItem                   : 当前属性是 FastArray Item（被 outer 烘焙时的子描述）；
+//   - IsInvalidFastArray                : FastArray 不符合规范（多个数组属性等），降级为普通处理；
+//   - HasConnectionSpecificSerialization: 序列化器需每连接特化（NetRole 等）；
+//   - HasPushBasedDirtiness             : 该属性走 push-model（MARK_PROPERTY_DIRTY）；
+//   - UseSerializerIsEqual              : 比较等价用 Serializer::IsEqual。
 enum class EMemberPropertyTraits : uint32
 {
 	None								= 0U,
@@ -109,6 +212,11 @@ enum class EMemberPropertyTraits : uint32
 };
 ENUM_CLASS_FLAGS(EMemberPropertyTraits);
 
+// 【EStructNetSerializerType】Struct 序列化器选择三态：
+//   - Struct           ：默认 StructNetSerializer（递归处理子属性）；
+//   - Custom           ：Struct 注册了自定义 NetSerializer（UE_NET_IMPLEMENT_NAMED_STRUCT_NETSERIALIZER_INFO）；
+//   - DerivedFromCustom: Struct 自身无自定义 NetSerializer，但父类有 → 走父 NetSerializer，
+//                        Descriptor->BaseStruct 指向最近的有自定义 NetSerializer 的父 Struct。
 enum class EStructNetSerializerType : unsigned
 {
 	// Struct should use StructNetSerializer
@@ -611,6 +719,18 @@ TRefCountPtr<const FReplicationStateDescriptor> FPropertyReplicationStateDescrip
 	return Descriptor;
 }
 
+// 【BuildMemberCache】烘焙的第一步——为每个成员属性确定：
+//   - Serializer + Config 大小/对齐；
+//   - Internal（量化）大小/对齐 = Serializer->QuantizedTypeSize / Alignment；
+//   - External（用户态）大小/对齐 = FProperty->GetElementSize / GetMinAlignment；
+//     特殊情况：当属性是 StructProperty 或 ArrayProperty 时，递归 GetDescriptorForStructProperty
+//              / GetDescriptorForArrayProperty 拿到子 Descriptor，并把子 Descriptor 的 trait
+//              （HasObjectReference / HasDynamicState / UseSerializerIsEqual / AllMembersAreReplicated 等）
+//              传播到当前 Member。
+//   - bSomeMembersAreProperties：标记该 Descriptor 是否需要生成 PropertyDescriptors（属性反射元数据）。
+//   - CombinedPropertyTraits / SharedPropertyTraits：所有成员 trait 的"或"和"与"——
+//     用于在 BuildReplicationStateTraits 阶段汇总成 EReplicationStateTraits（如：
+//     全部 push-based → HasFullPushBasedDirtiness；任一 push-based → HasPushBasedDirtiness）。
 void FPropertyReplicationStateDescriptorBuilder::BuildMemberCache(FBuilderContext& Context, FReplicationStateDescriptorRegistry* DescriptorRegistry)
 {
 	EMemberPropertyTraits PropertyTraits = EMemberPropertyTraits::None;
@@ -864,6 +984,16 @@ void FPropertyReplicationStateDescriptorBuilder::BuildMemberFunctionCache(FBuild
 	}
 }
 
+// 【AllocateAndInitializeDefaultInternalStateBuffer】构建默认状态缓冲。
+//   1) Malloc + ZeroFill 一段 InternalSize / InternalAlignment 的 buffer；
+//   2) 对每个成员 Property，从 SrcBuffer（通常 = CDO）按 (Property->GetOffset_ForGC() +
+//      ArrayIndex * ElementSize) 取出值；
+//   3) 调用 NetSerializer::Quantize 把外部表示量化为内部表示，写入 DstStateBuffer 的
+//      MemberDescriptor.InternalMemberOffset 处。
+//   4) 设置 SetIsInitializingDefaultState(true) 让 Serializer 知道当前在做"默认值量化"，
+//      避免它去解析 NetGuid（默认状态不能含运行时 NetHandle）。
+//
+// 后续 CalculateDefaultStateChecksum 会再次序列化此 buffer 用 CityHash64 算出 DefaultStateHash。
 void FPropertyReplicationStateDescriptorBuilder::AllocateAndInitializeDefaultInternalStateBuffer(const uint8* RESTRICT SrcBuffer, const FReplicationStateDescriptor* Descriptor, UReplicationSystem* ReplicationSystem, const uint8*& OutDefaultStateBuffer) const
 {
 	// Allocate storage for incoming data, it will be freed when we destroy the descriptor
@@ -909,6 +1039,15 @@ void FPropertyReplicationStateDescriptorBuilder::AllocateAndInitializeDefaultInt
 	OutDefaultStateBuffer = DstStateBuffer;
 }
 
+// 【CalculateDefaultStateChecksum】把 Descriptor->DefaultStateBuffer 序列化到一个临时 bitstream，
+// 然后 CityHash64 计算出 64-bit DefaultStateHash 用于：
+//   - 协议版本校验（ReplicationProtocol identifier 包含此 hash）；
+//   - delta-compression 基线一致性检查；
+//   - 客户端/服务端确认默认值是否相同（防止旧代码连入新服务器）。
+//
+// 实现策略：先用 1KB 内联 buffer 试序列化；若溢出就分配 PartialNetObjectAttachmentHandlerConfig::TotalMaxPayloadBitCount/8
+// 大小再试。若仍溢出（极大 struct）则返回 false，跳过 hash 计算。
+// 末尾 byte 不足 8-bit 时填零，保证 hash 输入对齐。
 bool FPropertyReplicationStateDescriptorBuilder::CalculateDefaultStateChecksum(const FReplicationStateDescriptor* Descriptor, UReplicationSystem* ReplicationSystem, const uint8* OutDefaultStateBuffer, uint64& OutHashValue) const
 {
 	const UPartialNetObjectAttachmentHandlerConfig* PartialNetObjectAttachmentHandlerConfig = GetDefault<UPartialNetObjectAttachmentHandlerConfig>();
@@ -970,6 +1109,11 @@ bool FPropertyReplicationStateDescriptorBuilder::CalculateDefaultStateChecksum(c
 	return true;
 }
 
+// 【BuildMemberDescriptors】计算每个 Member 在 External / Internal 缓冲中的偏移。
+// 普通 ReplicationState 路径：从 Context.External.Size 起紧凑铺开（按各成员对齐 Align），
+// 不与原 UStruct 内存布局保持一致。Internal 同理。
+// 累加结果回填 Context.External.Size / Alignment 与 Internal，供后续 BuildMemberChangeMaskDescriptors
+// 等阶段继续累加（最终拼成完整的 ExternalSize/InternalSize）。
 void FPropertyReplicationStateDescriptorBuilder::BuildMemberDescriptors(FReplicationStateMemberDescriptor* MemberDescriptors, FReplicationStateDescriptor* Descriptor, FBuilderContext& Context) const
 {
 	const FMemberCache& MemberCache = Context.MemberCache;
@@ -1023,6 +1167,14 @@ void FPropertyReplicationStateDescriptorBuilder::BuildMemberDescriptors(FReplica
 /**
   * A struct's external state will be the same size as the struct. This in order to be able to handle rep notifies with the previous value as parameter.
   * That means we cannot compact the representation. We must use the offsets stored in the properties.
+  *
+  * 【BuildMemberDescriptorsForStruct】Struct 路径专用。与普通路径的关键区别：
+  *   - External 偏移直接采用 Property->GetOffset_ForGC()（保持与原 UStruct 内存布局一致），
+  *     这样 RepNotify 的 "previous value" 参数可以直接传一个 struct 拷贝；
+  *   - Context.External.Size 直接累加整个 Struct 的 sizeof，而非每个成员紧凑铺开；
+  *   - 静态数组属性（C 数组）多次出现在 Members 中，用 ArrayIndex 区分，External 偏移
+  *     = Property 偏移 + ArrayIndex * ElementSize。
+  *   - Internal 仍然紧凑铺开（量化表示与 Struct 内存布局解耦）。
   */
 void FPropertyReplicationStateDescriptorBuilder::BuildMemberDescriptorsForStruct(FReplicationStateMemberDescriptor* MemberDescriptors, FReplicationStateDescriptor* Descriptor, FBuilderContext& Context) const
 {
@@ -1078,6 +1230,9 @@ void FPropertyReplicationStateDescriptorBuilder::BuildMemberDescriptorsForStruct
 	Context.Internal.Size = InternalOffset;
 }
 
+// 【BuildReplicationStateInternal】在 ExternalState 起始处预留 FReplicationStateHeader 空间。
+// Header 必须是 ExternalState 的第一个成员（offset 0）—— 这是 ReplicationStateUtil::GetReplicationStateHeader
+// 默认偏移为 0 的契约。NativeFastArray 路径稍后会被 FixupDescriptorForNativeFastArray 调整。
 void FPropertyReplicationStateDescriptorBuilder::BuildReplicationStateInternal(FReplicationStateDescriptor* Descriptor, FBuilderContext& Context) const
 {
 	// Reserve space for internals
@@ -1091,6 +1246,22 @@ void FPropertyReplicationStateDescriptorBuilder::BuildReplicationStateInternal(F
 	Context.External.Alignment =  FMath::Max(Context.External.Alignment, InternalStateAlignment);
 }
 
+// 【BuildMemberChangeMaskDescriptors】为每个成员分配 ChangeMask 中的 BitOffset/BitCount，
+// 同时累计三块 Mask（ChangeMask + ConditionalChangeMask + MemberPollMask）的总大小并
+// 更新 Context.External.Size 以反映 ExternalState 末尾还需追加的字节数。
+//
+// 三种成员处理：
+//   1) ChangeMaskGroupName 为空（多数情况）：分配新的连续 BitCount 位；
+//   2) ChangeMaskGroupName 已存在于 ChangemaskGroups：复用同组的 BitOffset/BitCount —— 让多个属性
+//      共用同一脏位（成员声明 UPROPERTY(meta=(NetChangemaskGroup="..."))）；
+//   3) 新建 group：分配位 + 加入 ChangemaskGroups。
+//
+// Init State：Member 不占任何 ChangeMask 位（BitCount=0、BitOffset=0），因为 InitState 共用 Header 的 bInitStateIsDirty。
+//
+// 内存预留：
+//   ChangeMaskMemberSize = ceil(BitCount/32) * 4 字节；
+//   若 HasLifetimeConditionals → 再加同样大小的 ConditionalChangeMask；
+//   再加 ceil(MemberCount/32)*4 字节的 MemberPollMask。
 void FPropertyReplicationStateDescriptorBuilder::BuildMemberChangeMaskDescriptors(FReplicationStateMemberChangeMaskDescriptor* MemberChangeMaskDescriptors, FReplicationStateDescriptor* Descriptor, FBuilderContext& Context) const
 {	
 	check(Descriptor->MemberDescriptors == nullptr);
@@ -1348,6 +1519,9 @@ void FPropertyReplicationStateDescriptorBuilder::BuildMemberPropertyDescriptors(
 	Descriptor->MemberPropertyDescriptors = MemberPropertyDescriptors;
 }
 
+// 【BuildMemberLifetimeConditionDescriptors】仅在 Descriptor->Traits 含 HasLifetimeConditionals
+// 时调用——把每个 Member 的 ELifetimeCondition 压成 int8 写入数组（紧凑存储）。
+// Member 与 LifetimeConditionDescriptor 一一对应（同 MemberIndex）。
 void FPropertyReplicationStateDescriptorBuilder::BuildMemberLifetimeConditionDescriptors(FReplicationStateMemberLifetimeConditionDescriptor* MemberLifetimeConditionDescriptors, FReplicationStateDescriptor* Descriptor) const
 {
 	FReplicationStateMemberLifetimeConditionDescriptor* CurrentMemberLifetimeConditionDescriptors = MemberLifetimeConditionDescriptors;
@@ -1360,6 +1534,15 @@ void FPropertyReplicationStateDescriptorBuilder::BuildMemberLifetimeConditionDes
 	Descriptor->MemberLifetimeConditionDescriptors = MemberLifetimeConditionDescriptors;
 }
 
+// 【BuildMemberRepIndexToMemberDescriptors】构建 RepIndex → MemberIndex 反查表。
+//
+// 1) 表长 = max(RepIndex)+1，可能远大于 MemberCount —— 因为 Class 内 RepIndex 是全局
+//    连续编号但本 Descriptor 只取部分 Bucket。空洞用 InvalidEntry (=65535) 填充，
+//    用 memset 0xFF 一次性初始化（依赖 InvalidEntry == 0xFFFF）。
+// 2) 遍历 Members，对静态数组属性（C 数组）逐元素分配（ArrayIndex 递增），
+//    把 (Property->RepIndex + ArrayIndex) → MemberIndex 写入对应槽位。
+// 3) 后续 SetReplicationCondition(RepIndex) → 反查 MemberIndex → 操作 ConditionalChangeMask
+//    对应位。这是"按 RepIndex 启停属性"的 O(1) 路径。
 void FPropertyReplicationStateDescriptorBuilder::BuildMemberRepIndexToMemberDescriptors(FReplicationStateMemberRepIndexToMemberIndexDescriptor* MemberRepIndexToMemberIndexDescriptors, FReplicationStateDescriptor* Descriptor) const
 {
 	const uint32 RepIndexCount = GetRepIndexCount(MakeConstArrayView(Members));
@@ -1489,6 +1672,15 @@ void FPropertyReplicationStateDescriptorBuilder::BuildMemberSerializerConfigs(ui
 }
 
 // Need to do this to support role swapping.
+// 【FixupNetRoleNetSerializerConfigs】NetRole 和 RemoteRole 在 UClass 中是两个独立属性，
+// 但客户端需要"角色互换"（远端的 Role/RemoteRole 在客户端要交换显示），需要让一个 NetRoleNetSerializer
+// 知道另一个 NetRole 的相对偏移以便互相读取。
+// 本函数：
+//   - 扫一遍找出两个 NetRoleNetSerializer 的 MemberIndex；
+//   - 计算 InternalOffset / ExternalOffset 差值；
+//   - 写入 FNetRoleNetSerializerConfig::RelativeInternalOffsetToOtherRole / Relative...External...
+//     第一个 Role 写正向差值，第二个 Role 写负向差值。
+// 这样反量化时单个 NetRoleNetSerializer 即可访问到"另一半角色"的字段。
 void FPropertyReplicationStateDescriptorBuilder::FixupNetRoleNetSerializerConfigs(FReplicationStateDescriptor* Descriptor)
 {
 	FReplicationStateMemberSerializerDescriptor* MemberSerializerDescriptors = const_cast<FReplicationStateMemberSerializerDescriptor*>(Descriptor->MemberSerializerDescriptors);
@@ -1533,6 +1725,13 @@ void FPropertyReplicationStateDescriptorBuilder::FixupNetRoleNetSerializerConfig
 	}
 }
 
+// 【FixupDescriptorForNativeFastArray】NativeFastArray 路径专用收尾。
+// NativeFastArray 不像普通 ReplicationState 那样把 Header 放在 ExternalState 起点，
+// 而是直接复用 FIrisFastArraySerializer 内嵌的 Header + ChangeMaskStorage[4]：
+//   1) ExternalMemberOffset = 0  —— 量化直接从 FastArray 自身起始位置读取（不留 Header 槽位）；
+//   2) ChangeMasksExternalOffset 改为 GetFastArrayChangeMaskOffset（即 ChangeMaskStorage 在 FastArray 内的偏移）；
+//   3) GetReplicationStateHeader 通过 (ChangeMasksExternalOffset - sizeof(Header)) 反算 Header 位置，
+//      恰好对应 FIrisFastArraySerializer 内 ChangeMaskStorage 之前的 FReplicationStateHeader 槽位。
 void FPropertyReplicationStateDescriptorBuilder::FixupDescriptorForNativeFastArray(FReplicationStateDescriptor* Descriptor) const
 {
 	// Native fast arrays quantized directly from the src state data which is the fastarray itself so the offset must be set to zero.
@@ -1540,6 +1739,32 @@ void FPropertyReplicationStateDescriptorBuilder::FixupDescriptorForNativeFastArr
 	Descriptor->ChangeMasksExternalOffset = static_cast<uint32>(GetFastArrayChangeMaskOffset(Descriptor->MemberProperties[0]));
 }
 
+// 【BuildReplicationStateTraits】把 BuildMemberCache 累积的 Combined / Shared 属性 trait
+// 汇总成 Descriptor 级 EReplicationStateTraits（17+ 位）。位映射规则：
+//
+//  - HasLifetimeConditionals      = Combined.HasLifetimeConditionals && !bIsInitState
+//                                   （Init State 没有 ChangeMask，不支持 conditionals）
+//  - InitOnly                     = bIsInitState
+//  - HasRepNotifies / KeepPreviousState = 任一成员有 RepNotify (And NeedPreviousState)
+//  - HasDynamicState              = 任一成员含动态分配
+//  - HasObjectReference           = 任一成员含对象引用
+//  - HasConnectionSpecificSerialization = 任一成员需要每连接特化（如 NetRole）
+//  - UseSerializerIsEqual         = 任一成员用 Serializer::IsEqual 比较
+//  - HasPushBasedDirtiness        = 任一成员是 push-based
+//  - HasFullPushBasedDirtiness    = ALL 成员都是 push-based（Shared 而非 Combined）
+//                                   —— 此时 PropertyReplicationFragment 可完全跳过 poll
+//  - IsStructWithCustomSerializer = Struct 路径 + SerializerType==Custom
+//  - IsDerivedFromStructWithCustomSerializer = Struct 路径 + SerializerType==DerivedFromCustom
+//  - AllMembersAreReplicated      = bAllMembersAreReplicated（递归传播：子 struct 不全复制 → 本 struct 也不全复制）
+//  - IsSourceTriviallyConstructible/Destructible = AllMembersAreReplicated 且
+//      （所有成员都满足 + ScriptStruct 无 STRUCT_HasInstancedReference 等"特殊构造/析构"标记）
+//  - IsFastArrayReplicationState  = SharedTraits.IsFastArray && Members.Num()==1
+//  - IsNativeFastArrayReplicationState = + Combined.IsNativeFastArray
+//  - SupportsDeltaCompression     = !bIsInitState && !Function && Members.Num()>0
+//      （此时假设支持 delta；具体每成员是否真支持由 NetSerializer 决定）
+//  - HasPushBasedDirtiness/HasFullPushBasedDirtiness（无 member 但有 function 的特殊 Function State）
+//      = true（RPC 永远 push-based）
+//  - NeedsRefCount                = 总是 true（运行时构造的 Descriptor 必须引用计数）
 EReplicationStateTraits FPropertyReplicationStateDescriptorBuilder::BuildReplicationStateTraits(const FBuilderContext& Context) const
 {
 	const EMemberPropertyTraits PropertyTraits = Context.CombinedPropertyTraits;
@@ -1668,6 +1893,8 @@ EReplicationStateTraits FPropertyReplicationStateDescriptorBuilder::BuildReplica
 	return Traits;
 }
 
+// 【FinalizeDescriptor】把累计的 Context.External/Internal Size 对齐到对应 Alignment，
+// 写入 Descriptor 的 ExternalSize / InternalSize 字段。这是 Build 流程的最后一步几何校正。
 void FPropertyReplicationStateDescriptorBuilder::FinalizeDescriptor(FReplicationStateDescriptor* Descriptor, FBuilderContext& Context) const
 {
 	const SIZE_T AlignedExternalSize = Align(Context.External.Size, Context.External.Alignment);
@@ -1685,6 +1912,27 @@ void FPropertyReplicationStateDescriptorBuilder::FinalizeDescriptor(FReplication
 	Descriptor->InternalSize = static_cast<uint32>(AlignedInternalSize);
 }
 
+// 【Build —— 烘焙主函数】把已经 AddMemberProperty 进来的成员列表组装为单个 Descriptor。
+//
+// 流程概览：
+//   1) BuildMemberCache 等阶段（已注释）—— 收集每成员 size/align/Serializer。
+//   2) BuildReplicationStateTraits 提前计算 Traits，因为后续要根据 Traits 决定哪些
+//      子数组需要分配（如 LifetimeCondition 表只在 HasLifetimeConditionals 时分配）。
+//   3) 用 FMemoryLayoutUtil::FLayout 累计所有"段"的 size/align —— 包括：
+//        Descriptor 自身 / MemberDescriptors / ChangeMaskDescriptors / SerializerDescriptors /
+//        TraitsDescriptors / TagDescriptors / ReferenceDescriptors / FunctionDescriptors /
+//        MemberProperties (FProperty*) / MemberPropertyDescriptors / LifetimeConditionDescriptors /
+//        RepIndexToMemberIndexDescriptors / DebugDescriptors / SerializerConfigBuffer。
+//   4) 一次 FMemory::Malloc 分配整块连续内存 —— 这就是"单块连续内存 layout"的来源。
+//   5) 在整块 buffer 上 placement new Descriptor，并把每个子数组的指针填进去。
+//   6) 调用各 Build* 函数填充内容（已分别注释）。
+//   7) 默认状态构造 + Hash 计算（如果 DefaultStateSourceData 非空）。
+//   8) 计算 DescriptorIdentifier.Value = CityHash64(PathName)。
+//   9) 收尾：FixupNetRoleNetSerializerConfigs / FixupDescriptorForNativeFastArray / FinalizeDescriptor。
+//  10) 注册到 DescriptorRegistry（如有）。
+//
+// 注意：此函数返回 TRefCountPtr，调用方持有；Descriptor 内 RefCount 通过 NeedsRefCount trait
+//      管理生命周期，最终在所有引用 Release 后整块 Free。
 TRefCountPtr<const FReplicationStateDescriptor>
 FPropertyReplicationStateDescriptorBuilder::Build(const FString& StateName, FReplicationStateDescriptorRegistry* DescriptorRegistry, const FBuildParameters& BuildParams)
 {
@@ -2054,6 +2302,24 @@ EMemberPropertyTraits FPropertyReplicationStateDescriptorBuilder::GetHasObjectRe
 	return Traits;
 }
 
+// 【GetIrisPropertyTraits】对单个 FProperty 收集 Iris 属性 trait 位（EMemberPropertyTraits）。
+//
+// 主要工作：
+//   1) 调用 GetSerializerTraits 拿到 Serializer 自身的 trait（HasObjectReference 等）；
+//   2) 处理 LifetimeProperties：
+//      - 在 LifetimeProperties 中查找该属性的 RepIndex；
+//      - 写入 OutMemberProperty.ReplicationCondition；
+//      - 推断 InitOnly / HasLifetimeConditionals / RepNotifyAlways / RepNotifyOnChanged trait；
+//   3) 处理 PushModel：
+//      - 通过 IsPushModelEnabled / 检查 CPF_Net 等 Flag → HasPushBasedDirtiness；
+//   4) 处理 RepNotify：
+//      - 查找 OnRep_<PropertyName> UFunction 写入 OutMemberProperty.PropertyRepNotifyFunction；
+//      - REPNOTIFY_Always vs REPNOTIFY_OnChanged 决定 RepNotifyAlways/RepNotifyOnChanged；
+//      - 若 RepNotify 函数有 prev value 参数 → NeedPreviousState；
+//   5) 处理 CPF_NoDestructor / STRUCT_IsPlainOldData → IsSourceTriviallyConstructible/Destructible；
+//   6) 处理 TArray / FastArray 的特殊 trait（GetFastArrayPropertyTraits）。
+//
+// 最终所有 trait 累计到 OutMemberProperty.Traits，被 BuildMemberCache 收集到 Combined/Shared 中。
 void FPropertyReplicationStateDescriptorBuilder::GetIrisPropertyTraits(FMemberProperty& OutMemberProperty, const FProperty* Property, const TArray<FLifetimeProperty>* LifeTimeProperties, UClass* ObjectClass)
 {
 	EMemberPropertyTraits Traits = EMemberPropertyTraits::None;
@@ -2155,6 +2421,11 @@ bool FPropertyReplicationStateDescriptorBuilder::IsSupportedProperty(FMemberProp
 	return true;
 }
 
+// 【FindSuperStructWithCustomSerializer】沿 GetSuperStruct 链向上找最近一个注册了
+// 自定义 NetSerializer 的父 Struct（通过 FPropertyNetSerializerInfoRegistry::FindStructSerializerInfo
+// 查询，UE_NET_IMPLEMENT_NAMED_STRUCT_NETSERIALIZER_INFO 注册）。
+// 用于 CreateDescriptorForStruct 在 DerivedFromCustom 路径中追溯到祖先的 Custom 序列化器，
+// 然后烘焙"父类外的额外属性"（即子类新增的属性）。
 const UStruct* FPropertyReplicationStateDescriptorBuilder::FindSuperStructWithCustomSerializer(const UStruct* Struct)
 {
 	for (const UStruct* SuperStruct = Struct->GetSuperStruct(); SuperStruct != nullptr; SuperStruct = SuperStruct->GetSuperStruct())
@@ -2168,6 +2439,17 @@ const UStruct* FPropertyReplicationStateDescriptorBuilder::FindSuperStructWithCu
 	return nullptr;
 }
 
+// 【IsSupportedStructWithCustomSerializer】判定 Struct 的 NetSerializer 类型并填入"包装" MemberProperty。
+//
+// 三态返回值：
+//   - Custom            : Struct 自身在 PropertyNetSerializerInfoRegistry 注册了自定义 NetSerializer
+//                         （UE_NET_IMPLEMENT_NAMED_STRUCT_NETSERIALIZER_INFO）；
+//   - DerivedFromCustom : Struct 自身没有，但父类有；返回最近祖先的 NetSerializer；
+//   - Struct            : 都没有 → 走默认 StructNetSerializer 递归子属性。
+//
+// 当返回 Custom / DerivedFromCustom 时，OutMemberProperty 被填成"包装成员"：
+//   Property==nullptr，SerializerInfo=找到的 Info，ChangeMaskBits=1，ExternalSize=Struct.GetStructureSize。
+// 这意味着整个 Struct 被当作单个 Member 处理（量化/比较/复制都委托给自定义 NetSerializer）。
 EStructNetSerializerType FPropertyReplicationStateDescriptorBuilder::IsSupportedStructWithCustomSerializer(FMemberProperty& OutMemberProperty, const UStruct* InStruct)
 {
 	// See if we got a matching custom serializer for the entire struct
@@ -2211,6 +2493,9 @@ EStructNetSerializerType FPropertyReplicationStateDescriptorBuilder::IsSupported
 	return SerializerType;
 }
 
+// 【IsStructWithCustomSerializer】递归查询：当前 Struct 或任一祖先是否有自定义 NetSerializer。
+// 与 IsSupportedStructWithCustomSerializer 不同的是，本函数仅返回 bool，不填充 MemberProperty。
+// 用于 ValidateStructPropertyDescriptor、GetFastArrayPropertyTraits 等的快速判断。
 bool FPropertyReplicationStateDescriptorBuilder::IsStructWithCustomSerializer(const UStruct* InStruct)
 {
 	// See if we got a matching custom serializer for the entire struct
@@ -2225,6 +2510,10 @@ bool FPropertyReplicationStateDescriptorBuilder::IsStructWithCustomSerializer(co
 }
 
 // Returns true if the named struct is marked as working using the default StructNetSerializer
+// 【CanStructUseStructNetSerializer】检查白名单——某 struct 是否在 ini 配置的
+// SupportsStructNetSerializerList 中（DefaultEngine.ini）。
+// 用途：消除"struct 有 NetSerialize 但无自定义 Iris NetSerializer"的警告。
+// CVar net.Iris.UseSupportsStructNetSerializerList 可一键关闭白名单（不推荐）。
 bool FPropertyReplicationStateDescriptorBuilder::CanStructUseStructNetSerializer(FName StructName)
 {
 	if (bUseSupportsStructNetSerializerList)
@@ -2239,6 +2528,12 @@ bool FPropertyReplicationStateDescriptorBuilder::CanStructUseStructNetSerializer
 }
 
 // RepTags are not intended to be derived from arbitrary properties, but rather be explicitly declared on a member. This is a hack.
+// 【GetRepTagFromProperty】临时实现——按属性名/类型猜出 RepTag（应该等真正的 USTRUCT
+// 标签机制就位后移除）。
+// 当前识别：
+//   - "Role" / "RemoteRole" + FNetRoleNetSerializer → RepTag_NetRole / RepTag_NetRemoteRole；
+//   - "NetCullDistanceSquared" + FFloatProperty     → RepTag_CullDistanceSqr；
+// 标签后续被 ReplicationSystem 用于查询特定语义属性（如自动 Cull 距离）。
 FRepTag FPropertyReplicationStateDescriptorBuilder::GetRepTagFromProperty(const FMemberCacheEntry& MemberCacheEntry, const FMemberProperty& MemberProperty)
 {
 	const FProperty* Property = MemberProperty.Property;
@@ -2285,6 +2580,11 @@ FRepTag FPropertyReplicationStateDescriptorBuilder::GetRepTagFromProperty(const 
 	return GetInvalidRepTag();
 }
 
+// 【GetRepIndexCount】计算 RepIndex → MemberIndex 反查表所需大小。
+// 表长 = max(RepIndex) + 1。注意 RepIndex 在整个 UClass 内连续编号但本 Descriptor
+// 只取部分（按 Bucket 分），因此表中可能含 InvalidEntry 空洞，但内存仍按完整范围预留。
+//
+// 静态数组属性（C 数组）多次出现 Members 中，每次 ArrayIndex+1，对应的 RepIndex 也递增。
 uint32 FPropertyReplicationStateDescriptorBuilder::GetRepIndexCount(const TConstArrayView<FMemberProperty>& Members)
 {
 	uint16 MaxRepIndex = 0;
@@ -2304,6 +2604,10 @@ uint32 FPropertyReplicationStateDescriptorBuilder::GetRepIndexCount(const TConst
 	return RepIndexCount;
 }
 
+// 【GetPropertyPathName】取出 Property 的完整 PathName 用于 CityHash64 计算。
+// 用 FFieldVariant 链向上追溯到最近的 UClass 或 UStruct，然后正向拼接 Name 用 '.' 分隔。
+// 例：Outer.Class.Struct.Property —— 这种 path 在跨进程是稳定的，作为 hash 输入可以保证
+// 服务端/客户端生成相同的 DescriptorIdentifier。
 void FPropertyReplicationStateDescriptorBuilder::GetPropertyPathName(const FProperty* Property, FString& PathName)
 {
 	constexpr uint32 MaxHierarchyDepth = 64;
@@ -2341,6 +2645,10 @@ void FPropertyReplicationStateDescriptorBuilder::GetPropertyPathName(const FProp
 	}
 }
 
+// 【GetFastArrayChangeMaskOffset】对 FIrisFastArraySerializer 派生 struct，找到内嵌的
+// ChangeMaskStorage 字段偏移。该字段必须打 RepSkip（不参与常规 RepLayout）。
+// 返回值用于 FixupDescriptorForNativeFastArray 把 ChangeMasksExternalOffset 重定向到
+// FastArray 内部的 ChangeMaskStorage 位置——以便 GetMemberChangeMask 直接读取 FastArray 自带的位图。
 SIZE_T FPropertyReplicationStateDescriptorBuilder::GetFastArrayChangeMaskOffset(const FProperty* Property)
 {
 	if (const FStructProperty* StructProperty = CastField<FStructProperty>(Property))
@@ -2363,6 +2671,27 @@ SIZE_T FPropertyReplicationStateDescriptorBuilder::GetFastArrayChangeMaskOffset(
 	return 0U;
 }
 
+// 【GetFastArrayPropertyTraits】为属性识别 FastArray 相关 trait 位。
+//
+// 三种识别路径：
+//   A) StructNetSerializer + Struct 派生 FFastArraySerializer：
+//      "外层" FastArray 容器 struct。校验：
+//        - 不能再有自定义 NetSerializer（否则 InvalidFastArray）；
+//        - 必须含至少一个 FastArrayItem 子属性（否则 Invalid）；
+//        - 如果不允许 ExtraProperties，必须严格只含 1 个 FArrayProperty 子属性（否则 Invalid）；
+//      满足后：
+//        - 启用 NativeFastArray（CVar bIrisUseNativeFastArray=true 且 ReplicatedPropertyCount==1
+//          且派生自 FIrisFastArraySerializer）：返回 IsFastArray | IsNativeFastArray | HasPushBasedDirtiness；
+//        - 多属性场景：返回 IsFastArray | IsFastArrayWithExtraProperties；
+//        - 普通：返回 IsFastArray。
+//   B) StructNetSerializer + Struct 派生 FFastArraySerializerItem：
+//      "内层" FastArray Item，返回 IsFastArrayItem。
+//      Item 有自定义 NetSerializer 不被支持（用警告 + ensureMsgf 提示），需要在 wrapper 里包一层。
+//   C) ArrayPropertyNetSerializer + Inner 是 FastArrayItem 派生：
+//      普通 TArray<...Item> 也视为 IsFastArrayItem，让外层 FastArray 容器能识别其元素类型。
+//
+// 这些 trait 进一步驱动 BuildReplicationStateTraits 设置 IsFastArrayReplicationState /
+// IsNativeFastArrayReplicationState 等 Descriptor 级 flag。
 EMemberPropertyTraits FPropertyReplicationStateDescriptorBuilder::GetFastArrayPropertyTraits(const FNetSerializer* NetSerializer, const FProperty* InProperty, bool bAllowFastArrayWithExtraProperties)
 {
 	if (IsStructNetSerializer(NetSerializer))
@@ -2484,6 +2813,28 @@ FReplicationStateDescriptorBuilder::FParameters::FParameters()
  */
 
 // For a struct we only create a single state.
+//
+// 【CreateDescriptorForStruct —— Struct → 单 Descriptor 入口】
+//
+// 关键分支：
+//   A) Registry 命中：直接返回缓存条目（一个 struct 在缓存中只有一项 Descriptor）。
+//   B) FastArrayItem（继承 FFastArraySerializerItem）：标记 bIsFastArraySerializerItem，
+//      允许保留 ReplicationID 字段（虽然 RepSkip 但 Iris 仍要它跟踪元素身份）。
+//   C) FastArraySerializer（继承 FFastArraySerializer）+ EnableFastArrayHandling：
+//      走 FastArray 特化（Item 类型递归烘焙；外层只允许 1 个 TArray<Item> 属性，除非
+//      AllowFastArrayWithExtraReplicatedProperties=true）。
+//   D) 自定义 NetSerializer 三态：
+//        - SerializerType == Custom         : Builder 仅添加 1 个"包装"成员（Property == nullptr，
+//          Serializer = 注册的自定义 NetSerializer）；不递归处理子属性；
+//        - SerializerType == DerivedFromCustom: 添加包装成员 + 父类外的"额外属性"（按反射继承顺序
+//          排列，先父后子，保证哈希稳定）；
+//        - SerializerType == Struct         : 普通路径——遍历所有 UPROPERTY，逐个 IsSupportedProperty
+//          后 AddMemberProperty。CPF_RepSkip 标记的属性跳过（FastArrayItem 的 ReplicationID 例外）。
+//   E) 警告路径：
+//      - struct 有 NetSerialize/NetDeltaSerialize 但未注册 Iris 自定义 NetSerializer，
+//        且不在 SupportsStructNetSerializerList 白名单 → 警告（默认开启 bWarnAboutStructsWithCustomSerialization）；
+//      - struct 全部属性可复制但无任何属性（即"空 struct"）→ 警告并设为 bAllMembersAreReplicated=false。
+//   F) Build 调用 + 注册：传入 PathName（用于 CityHash），DescriptorType=Struct。
 TRefCountPtr<const FReplicationStateDescriptor> FReplicationStateDescriptorBuilder::CreateDescriptorForStruct(const UStruct* InStruct, const FParameters& Parameters)
 {
 	using namespace UE::Net::Private;
@@ -2655,6 +3006,16 @@ TRefCountPtr<const FReplicationStateDescriptor> FReplicationStateDescriptorBuild
 	return Descriptor;
 };
 
+// 【CreateDescriptorForFunction —— UFunction 参数列表 → Descriptor 入口】
+//
+// 流程：
+//   1) Registry 命中检查（每 Function 仅一个 Descriptor）；
+//   2) 遍历 Function 的 Parm 属性（CPF_Parm 但非 CPF_ReturnParm）；CPF_RepSkip 跳过；
+//   3) RPC 参数永远 ArrayDim==1（不允许传递 C 数组）—— 用 checkfSlow 校验；
+//   4) IsSupportedProperty 通过则 AddMemberProperty；不支持则警告并跳过（但仍允许编译，
+//      该参数最终被 RPC 序列化器视为 0 字节 —— 调用方需自行确认）；
+//   5) bAllMembersAreReplicated=true：RPC 不关心非 replicated 参数（因为参数本身就是值传递的）；
+//   6) Build 调用 + 注册。
 TRefCountPtr<const FReplicationStateDescriptor> FReplicationStateDescriptorBuilder::CreateDescriptorForFunction(const UFunction* Function, const FParameters& Parameters)
 {
 	using namespace UE::Net::Private;
@@ -2713,6 +3074,14 @@ TRefCountPtr<const FReplicationStateDescriptor> FReplicationStateDescriptorBuild
 	return Descriptor;
 }
 
+// 【InternalPropertyReplicationStateTypes】Class 烘焙时的 4 个固定 Bucket，最终生成 4 个 Descriptor：
+//   0) _Functions             ：所有 NetMulticast/Server/Client RPC 的 Function 列表（不含成员属性）；
+//   1) _InitOnly              ：COND_InitialOnly 的属性（首次复制下发，无 ChangeMask）；
+//   2) _LifetimeConditionals  ：所有非 COND_None 的属性（OwnerOnly / SkipOwner / ...）；
+//   3) _State                 ：默认 COND_None 的"普通"属性。
+// FastArray 属性单独成 Descriptor（不在此 4 个 Bucket 中），但同样 push 到结果数组。
+//
+// 后缀仅用于 DebugName 拼接，CityHash64 时也会反映到 DescriptorIdentifier 上以保证 4 个 Descriptor 互不相同。
 struct FPropertyReplicationStateType
 {
 	const TCHAR* NamePostFix;
@@ -2731,6 +3100,32 @@ static constexpr SIZE_T InitPropertyReplicationStateBuilderIndex = 1;
 static constexpr SIZE_T LifetimeConditionalsReplicationStateBuilderIndex = 2;
 static constexpr SIZE_T RegularPropertyReplicationStateBuilderIndex = 3;
 
+// 【CreateDescriptorsForClass —— Class → 多 Descriptor 入口（最复杂的烘焙路径）】
+//
+// 整体流程：
+//   1) Registry 命中：直接返回缓存（注：UClass 缓存 key 是 DefaultStateSource，因为同一 Class
+//      在不同 PIE world 可能有不同 CDO，需以 CDO 实例为键）。
+//   2) DefaultStateSource = Parameters.DefaultStateSource ?? Class CDO（默认值的来源）。
+//   3) 遍历 Class 的 UPROPERTY，按 RepIndex 顺序处理：
+//      - 调 IsSupportedProperty 过滤；获取 LifetimeProperties 取 ELifetimeCondition；
+//      - GetIrisPropertyTraits 推导 Member trait 位（push-based / RepNotify / DynamicState 等）；
+//      - 按"高层条件"分桶：
+//          COND_InitialOnly        → InitOnly Bucket
+//          COND_None / Custom      → State Bucket
+//          其它（OwnerOnly/SkipOwner/...） → LifetimeConditionals Bucket
+//        （注：所有 Bucket 内的属性都共享同一类高层条件，最大化跨连接共享）
+//      - FastArray 属性单独烘焙 Descriptor（CreateDescriptorForStruct 递归 + 标记 IsFastArray*）；
+//   4) 收集 NetMulticast/Server/Client RPC 列表 → Functions Bucket；
+//   5) 处理 SinglePropertyOverride（仅烘焙单个属性，用于 SetPropertyCustomCondition 等单属性场景）；
+//   6) 4 个 Bucket 各调用一次 Build()：
+//      - 每个 Build 内部用 FMemoryLayoutUtil 一次 malloc 整块 Descriptor；
+//      - 计算 DescriptorIdentifier 时 PathName 包含 Class.PathName + 类型后缀（_State / _InitOnly 等）；
+//   7) NetCullDistanceSquared / RoleGroup 等 RepTag 通过 BuildMemberTagCache 注入；
+//   8) 注册到 Registry：以 Class 为 Key，CDO 为 ObjectForPruning，4+ 个 Descriptor 为 Value。
+//   9) 可选：ValidateIsFullyPushModelClassDescriptor 强制 push-model 检查
+//      （若 EnsureFullyPushModelClassNames 命中或 bEnsureAllClassesAreFullyPushModel）。
+//
+// 返回创建的 Descriptor 总数（包括 FastArray 单独成的）。
 SIZE_T FReplicationStateDescriptorBuilder::CreateDescriptorsForClass(FResult& CreatedDescriptors, UClass* InObjectClass, const FParameters& Parameters)
 {
 	using namespace UE::Net::Private;

@@ -1,5 +1,32 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================
+// 文件：ReplicationBridge.cpp
+// 角色：UReplicationBridge 抽象基类的实现集合（约 900 行）。
+//
+// 主要职责（按代码段顺序）：
+//   1) Initialize/Deinitialize    : 把 RS 内部子系统指针缓存到 Bridge（NetRefHandleManager、
+//                                    ObjectReferenceCache、ProtocolManager、Groups 等）。
+//   2) StopReplicatingNetRefHandle: 解析 EEndReplicationFlags，将句柄分流到
+//                                    "立即销毁 / TearOff / Flush / 延迟 PendingEndReplication"。
+//   3) AddPendingEndReplication   : 维护 HandlesPendingEndReplication 队列；每帧
+//                                    UpdateHandlesPendingEndReplication 推进其状态。
+//   4) Internal* 系列              : 把 NetRefHandle 创建 / 绑定 / 销毁 / SubObject 拓扑等
+//                                    操作统一收敛在基类，派生 Bridge 通过 protected 接口调用。
+//   5) LevelGroup 系列             : Create/Destroy/Get LevelGroup —— ULevel 的过滤分组。
+//   6) NotifyStreamingLevelUnload : 在关卡卸载前清理对应 Group + DestructionInfo。
+//   7) PreReceiveUpdate / PostReceiveUpdate :
+//                                    处理 bInReceiveUpdate 标志 + HandlesToStopReplicating
+//                                    （收包阶段收到的 Stop 请求需延后到 PostReceive 处理，
+//                                     避免破坏正在解析的 batch）。
+//   8) Flush / TearOff             : InternalFlushStateData / InternalTearOff 拷贝
+//                                    最终态到 ChangeMaskCache，使后续帧仍能给所有连接补齐数据。
+//
+// 与 §4 帧循环对应钩子：
+//   * OnStartPreSendUpdate / PreSendUpdate / PreSendUpdateSingleHandle / UpdateInstancesWorldLocation
+//   * OnPostSendUpdate / OnPostReceiveUpdate / PreReceiveUpdate / PostReceiveUpdate
+// =====================================================================================
+
 #include "Iris/ReplicationSystem/ReplicationBridge.h"
 
 #include "Containers/ArrayView.h"

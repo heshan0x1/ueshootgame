@@ -1,5 +1,36 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavigationSystem.h
+// -----------------------------------------------------------------------------
+// 本文件定义 UE5 导航系统的"主类" UNavigationSystemV1 及其辅助类。
+// 架构文档见 Runtime/NavigationSystem/DevDocs/NavigationSystem_Architecture_CN.md。
+//
+// 本文件内容概览：
+//   1) FNavigationSystem 命名空间：常用静态帮助符号（坐标转换除外见 RecastHelpers）。
+//   2) FNavigationSystemExec：接收控制台命令。
+//   3) ENavigationBuildLock：多路锁位集合（Editor/PIE/Initial/Custom）。
+//   4) FNavRegenTimeSlicer + FNavRegenTimeSliceManager：Tile 重建的时间切片器，
+//      用于非异步模式下分帧生成 Tile，防止卡顿。
+//   5) UNavigationSystemV1：主系统类（UObject），生命周期归属 UWorld，持有：
+//        - NavDataSet / MainNavData / AbstractNavData
+//        - DefaultOctreeController / DefaultDirtyAreasController
+//        - PendingNavBoundsUpdates / RegisteredNavBounds
+//        - Invokers / InvokerLocations（Navigation Invokers 系统）
+//        - 各种蓝图接口 K2_* + C++ 接口 FindPathSync/Async / ProjectPoint / ...
+//
+// 关键执行流程（详见 UNavigationSystemV1 类内注释 + 架构文档 4 节）：
+//   启动：PostInitProperties → ConditionalPopulateNavOctree
+//         → RegisterNavigationDataInstances → ProcessRegistrationCandidates
+//   Octree 注册：OnComponentRegistered/UpdateComponentInNavOctree/...
+//                → FNavigationDataHandler → PendingUpdates
+//   脏区域：AddDirtyArea → FNavigationDirtyAreasController → Tick
+//           → ANavigationData::RebuildDirtyAreas
+//   Tile 重建：FRecastNavMeshGenerator::Tick（由各 NavData 驱动）
+//   寻路：FindPathSync/Async → ANavigationData::FindPath → FPImpl...
+//   Invoker：RegisterInvoker → Invokers → UpdateInvokers/UpdateNavDataActiveTiles
+// =============================================================================
+
 #pragma once
 
 #if UE_ENABLE_INCLUDE_ORDER_DEPRECATED_IN_5_4
@@ -125,6 +156,11 @@ TIME_SLICER.DebugSetSectionName(TIME_SLICE_FNAME);
 #define MARK_TIMESLICE_SECTION_DEBUG(TIME_SLICER, TIME_SLICE_FNAME) ;
 #endif
 
+// FNavRegenTimeSlicer：单个时间切片器实例。
+// 用法：每帧先 SetupTimeSlice(预算) + StartTimeSlice，
+//       在 Tile 生成热循环里反复调用 TestTimeSliceFinished() 判断是否需要让出；
+//       中途可 EndTimeSliceAndAdjustDuration 释放本段耗时并保留剩余预算给其他段。
+// 见 ALLOW_TIME_SLICE_NAV_REGEN 编译开关。
 class FNavRegenTimeSlicer
 {
 public:
@@ -208,6 +244,15 @@ struct FTileHistoryData
 };
 #endif // !UE_BUILD_SHIPPING
 
+// FNavRegenTimeSliceManager：时间切片预算的自适应管理器。
+// 关键状态：
+//   - MovingWindowTileRegenTime：最近 256 个 Tile 的平均重建耗时
+//   - MovingWindowDeltaTime：帧间隔移动平均
+//   - TileWaitTimes/TileHistoryData：每份 NavData 的等待时间/详细历史（非 shipping）
+//   - MinTimeSliceDuration / MaxTimeSliceDuration：每帧预算上下限
+//   - MaxDesiredTileRegenDuration：整批 Pending Tile 的期望总耗时（跨帧）
+// 算法：CalcTimeSliceDuration 根据"当前 Pending 数 × 平均耗时 / 期望总耗时"动态
+//       推算本帧应给多少时间；被 clamp 到 [Min, Max]。
 class FNavRegenTimeSliceManager
 {
 public:
@@ -291,6 +336,19 @@ protected:
 	bool bDoTimeSlicedUpdate;
 };
 
+// =============================================================================
+// UNavigationSystemV1：NavigationSystem 模块的"主类"。
+// -----------------------------------------------------------------------------
+// 一个 UWorld 持有一份 UNavigationSystemV1（UClass 的 Within=World，Config=Engine）。
+// 职责：
+//   1) 按 SupportedAgents 为每种代理创建/匹配 ANavigationData（通常是 ARecastNavMesh）。
+//   2) 维护一个 FNavigationOctree 追踪所有"可能影响导航的对象"（几何 / Modifier / Link）。
+//   3) 聚合 Dirty Area 并在 Tick 时推送给各 NavData 做增量重建。
+//   4) 维护 Invokers 表，实现"只在玩家附近生成"。
+//   5) 对外提供同步/异步寻路、投影、随机点、RayCast 等 API（C++ 与蓝图 K2_*）。
+// 线程：绝大多数 API 限主线程；FindPathAsync 会把查询丢到异步；
+//       Tile 生成本身的重活在 FRecastNavMeshGenerator 里做到后台线程/时间切片。
+// =============================================================================
 UCLASS(Within=World, config=Engine, defaultconfig, MinimalAPI)
 class UNavigationSystemV1 : public UNavigationSystemBase
 {
@@ -304,10 +362,12 @@ public:
 
 	NAVIGATIONSYSTEM_API void GatherDebugLabels(TArray<FString>& InOutDebugLabels) const;
 
+	// 所谓"主 NavData"：蓝图无指定时默认使用的这份。由 MainNavDataName / DefaultAgent 决定。
 	UPROPERTY(Transient)
 	TObjectPtr<ANavigationData> MainNavData;
 
 	/** special navigation data for managing direct paths, not part of NavDataSet! */
+	// 占位 NavData —— 当某个 Agent 暂无真实 NavData 时用于返回"直线路径"。不进入 NavDataSet。
 	UPROPERTY(Transient)
 	TObjectPtr<ANavigationData> AbstractNavData;
 
@@ -420,16 +480,20 @@ protected:
 
 public:
 	/** Bounds of tiles to be built */
+	// 本次生成限定的 World AABB（为空表示"世界全局"）；用于 DirtyTilesInBuildBounds
 	UPROPERTY(Transient)
 	FBox BuildBounds;
 
+	// 当前注册的所有 NavData（按 Agent 分槽）
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<ANavigationData>> NavDataSet;
 
+	// 待注册 NavData 队列（由 RequestRegistration 塞入，ProcessRegistrationCandidates 消费）
 	UPROPERTY(Transient)
 	TArray<TObjectPtr<ANavigationData>> NavDataRegistrationQueue;
 
 	// List of pending navigation bounds update requests (add, remove, update size)
+	// NavMeshBoundsVolume 增/删/改尺寸的请求队列；在 PerformNavigationBoundsUpdate 里处理
 	TArray<FNavigationBoundsUpdateRequest> PendingNavBoundsUpdates;
 
  	UPROPERTY(/*BlueprintAssignable, */Transient)
@@ -451,13 +515,18 @@ protected:
 	TSet<FNavigationBounds> RegisteredNavBounds;
 
 private:
+	// Invoker Actor → FNavigationInvoker 映射（存半径/Agent 位/Priority）
 	TMap<UObject*, FNavigationInvoker> Invokers;
 	/** Contains pre-digested and cached invokers' info. Generated by UpdateInvokers */
+	// 上面的只读快照（位置 + 半径 + 优先级等），避免每次 Tile 生成都重查 Map
 	TArray<FNavigationInvokerRaw> InvokerLocations;
 
+	// 当配置了"Invoker Seed"时，本数组限定 Invoker 的可达范围
 	TArray<FBox> InvokersSeedBounds;
 
+	// 下一次 UpdateInvokers 的时间戳（每 ActiveTilesUpdateInterval 秒一次）
 	double NextInvokersUpdateTime;
+	// 扫描 Invokers Map → 生成 InvokerLocations 快照
 	NAVIGATIONSYSTEM_API void UpdateInvokers();
 
 public:
@@ -466,6 +535,7 @@ public:
 #endif // !UE_BUILD_SHIPPING
 
 protected:
+	// UpdateInvokers 之后的驱动：按 Invoker 半径差集计算每份 NavData 的活跃 Tile 集，触发重建/丢弃
 	NAVIGATIONSYSTEM_API virtual void UpdateNavDataActiveTiles();
 
 private:
@@ -596,6 +666,8 @@ public:
 	};
 
 	//~ Begin UObject Interface
+	// UObject 初始化末尾的钩子：这里构造 OctreeController / DirtyController / Invokers、
+	// 订阅全局委托、调用 ConditionalPopulateNavOctree 决定是否要建 Octree。
 	NAVIGATIONSYSTEM_API virtual void PostInitProperties() override;
 	NAVIGATIONSYSTEM_API virtual void FinishDestroy() override;
 	static NAVIGATIONSYSTEM_API void AddReferencedObjects(UObject* InThis, FReferenceCollector& Collector);
@@ -605,6 +677,12 @@ public:
 #endif // WITH_EDITOR
 	//~ End UObject Interface
 
+	// 主 Tick：
+	//  1) 消化 NavBoundsUpdates 队列 → 调 PerformNavigationBoundsUpdate
+	//  2) 处理 NavDataRegistrationQueue → ProcessRegistrationCandidates
+	//  3) Octree PendingUpdates → 真正入 Octree + AddDirtyArea
+	//  4) 按 DirtyAreasUpdateFreq 推 Dirty Areas 给各 NavData
+	//  5) 每 ActiveTilesUpdateInterval 跑一次 Invoker 更新 + UpdateNavDataActiveTiles
 	NAVIGATIONSYSTEM_API virtual void Tick(float DeltaSeconds) override;	
 
 	UWorld* GetWorld() const override { return GetOuterUWorld(); }
@@ -633,6 +711,8 @@ public:
 	 *	@param NavData optional navigation data that will be used instead of the one that would be deducted from AgentProperties
 	 *  @param Mode switch between normal and hierarchical path finding algorithms
 	 */
+	// 同步寻路（核心入口）：按 AgentProperties 挑 NavData 并调 NavData->FindPath。
+	// 蓝图 K2_ 版与 C++ 版最后都落在这里。阻塞 GameThread。
 	NAVIGATIONSYSTEM_API FPathFindingResult FindPathSync(const FNavAgentProperties& AgentProperties, FPathFindingQuery Query, EPathFindingMode::Type Mode = EPathFindingMode::Regular);
 
 	/** 
@@ -641,6 +721,7 @@ public:
 	 *	@param NavData optional navigation data that will be used instead main navigation data
 	 *  @param Mode switch between normal and hierarchical path finding algorithms
 	 */
+	// 同步寻路的简化版：Query 里已指定 NavData。
 	NAVIGATIONSYSTEM_API FPathFindingResult FindPathSync(FPathFindingQuery Query, EPathFindingMode::Type Mode = EPathFindingMode::Regular);
 
 	/** 
@@ -651,6 +732,8 @@ public:
 	 *  @param Mode switch between normal and hierarchical path finding algorithms
 	 *	@return request ID
 	 */
+	// 异步寻路：返回 RequestID；完成后回调 ResultDelegate（主线程）。
+	// 内部把 Query 放进 AsyncPathFindingQueries，TriggerAsyncQueries 驱动后台线程处理。
 	NAVIGATIONSYSTEM_API uint32 FindPathAsync(const FNavAgentProperties& AgentProperties, FPathFindingQuery Query, const FNavPathQueryDelegate& ResultDelegate, EPathFindingMode::Type Mode = EPathFindingMode::Regular);
 
 	/** Removes query indicated by given ID from queue of path finding requests to process. */
@@ -804,6 +887,10 @@ public:
 	
 	//----------------------------------------------------------------------//
 	// Active tiles
+	// Invoker 管理：同名重载 —— 成员函数版 + 静态版。
+	// 典型流转：AActor::Register 组件 → UNavigationInvokerComponent::Activate
+	//           → UNavigationSystemV1::RegisterNavigationInvoker (static)
+	//           → NavSys.RegisterInvoker (member) → Invokers Map
 	//----------------------------------------------------------------------//
 	NAVIGATIONSYSTEM_API virtual void RegisterInvoker(AActor& Invoker, float TileGenerationRadius, float TileRemovalRadius, const FNavAgentSelector& Agents, ENavigationInvokerPriority InPriority);
 
@@ -845,18 +932,23 @@ protected:
 	/** called in places where we need to spawn the NavOctree, but is checking additional conditions if we really want to do that
 	 *	depending on navigation data setup among others 
 	 *	@return true if NavOctree instance has been created, or if one is already present */
+	// "条件性"构造 NavOctree：会检查 bSupportRebuilding、是否编辑器等；已存在则直接返回 true
 	NAVIGATIONSYSTEM_API virtual bool ConditionalPopulateNavOctree();
 
 	/** called to instantiate NavigationSystem's NavOctree instance */
+	// 真正 new 一个 FNavigationOctree 实例并塞进 DefaultOctreeController
 	NAVIGATIONSYSTEM_API virtual void ConstructNavOctree();
 
 	/** Processes registration of candidates queues via RequestRegistration and stored in NavDataRegistrationQueue */
+	// 处理待注册的 NavData：按 SupportedAgents 分槽、调 RegisterNavData、选 MainNavData
 	NAVIGATIONSYSTEM_API virtual void ProcessRegistrationCandidates();
 
 	/** Registers custom navigation links awaiting registration in the navigation object repository */
+	// 消化 NavigationObjectRepository 里 pending 的 Custom Link
 	NAVIGATIONSYSTEM_API void ProcessCustomLinkPendingRegistration();
 
 	/** used to apply updates of nav volumes in navigation system's tick */
+	// 处理 NavMeshBoundsVolume 的 Add/Remove/Resize 请求，同步 RegisteredNavBounds
 	NAVIGATIONSYSTEM_API virtual void PerformNavigationBoundsUpdate(const TArray<FNavigationBoundsUpdateRequest>& UpdateRequests);
 	
 	/** adds data to RegisteredNavBounds */
@@ -886,27 +978,35 @@ public:
 
 	//----------------------------------------------------------------------//
 	// navigation octree related functions
+	// Octree 静态入口 —— 提供给组件/Actor 生命周期回调使用。
+	// 这些方法会定位当前 World 的 NavigationSystem 再委托到 FNavigationDataHandler。
 	//----------------------------------------------------------------------//
 	static NAVIGATIONSYSTEM_API bool SupportsDynamicChanges(UWorld* World);
+	// 手动注入一个 FNavigationElement（例如外部 UObject 想参与导航时）
 	static NAVIGATIONSYSTEM_API FNavigationElementHandle AddNavigationElement(UWorld* World, FNavigationElement&& Element);
 	static NAVIGATIONSYSTEM_API void RemoveNavigationElement(UWorld* World, FNavigationElementHandle ElementHandle);
 	static NAVIGATIONSYSTEM_API void OnNavigationElementUpdated(UWorld* World, FNavigationElementHandle ElementHandle, FNavigationElement&& Element);
 
+	// UObject 形式 NavRelevant 对象的注册/反注册/更新（走 NavigationObjectRepository）
 	static NAVIGATIONSYSTEM_API void OnNavRelevantObjectRegistered(UObject& Object);
 	static NAVIGATIONSYSTEM_API void UpdateNavRelevantObjectInNavOctree(UObject& Object);
 	static NAVIGATIONSYSTEM_API void OnNavRelevantObjectUnregistered(UObject& Object);
 
+	// 组件生命周期钩子 —— 由 UNavRelevantComponent::OnRegister/OnUnregister 调
 	static NAVIGATIONSYSTEM_API void OnComponentRegistered(UActorComponent* Comp);
 	static NAVIGATIONSYSTEM_API void OnComponentUnregistered(UActorComponent* Comp);
 	static NAVIGATIONSYSTEM_API void RegisterComponent(UActorComponent* Comp);
 	static NAVIGATIONSYSTEM_API void UnregisterComponent(UActorComponent* Comp);
+	// Actor 生命周期钩子
 	static NAVIGATIONSYSTEM_API void OnActorRegistered(AActor* Actor);
 	static NAVIGATIONSYSTEM_API void OnActorUnregistered(AActor* Actor);
 
 	/** update navoctree entry for specified actor/component */
+	// 通知 NavigationSystem "这个 Actor/Component 的导航相关数据可能变了"，进入 PendingUpdates。
 	static NAVIGATIONSYSTEM_API void UpdateActorInNavOctree(AActor& Actor);
 	static NAVIGATIONSYSTEM_API void UpdateComponentInNavOctree(UActorComponent& Comp);
 	/** update all navoctree entries for actor and its components */
+	// 更新 Actor 及其所有组件；典型场景：Actor 整体移动后。
 	static NAVIGATIONSYSTEM_API void UpdateActorAndComponentsInNavOctree(AActor& Actor, bool bUpdateAttachedActors = true);
 	/** update all navoctree entries for actor and its non scene components after root movement */
 	static NAVIGATIONSYSTEM_API void UpdateNavOctreeAfterMove(USceneComponent* Comp);
@@ -954,8 +1054,11 @@ public:
 	/** updates bounds of all components implementing INavRelevantInterface */
 	static NAVIGATIONSYSTEM_API void UpdateNavOctreeBounds(AActor* Actor);
 
+	// 把新的 AABB 标脏，Tick 时推给 NavData 做增量重建。Flags 控制重建类型（几何/Modifier）。
 	NAVIGATIONSYSTEM_API void AddDirtyArea(const FBox& NewArea, ENavigationDirtyFlag Flags, const FName& DebugReason = NAME_None);
+	// 同上，但额外记录 Element 来源（便于 Debug 时定位是哪个对象造成的脏）
 	NAVIGATIONSYSTEM_API void AddDirtyArea(const FBox& NewArea, ENavigationDirtyFlag Flags, const TFunction<const TSharedPtr<const FNavigationElement>()>& ElementProviderFunc, const FName& DebugReason = NAME_None);
+	// 批量版本
 	NAVIGATIONSYSTEM_API void AddDirtyAreas(const TArray<FBox>& NewAreas, ENavigationDirtyFlag Flags, const FName& DebugReason = NAME_None);
 	UE_DEPRECATED(5.5, "Use the version taking ENavigationDirtyFlag instead.")
 	NAVIGATIONSYSTEM_API void AddDirtyArea(const FBox& NewArea, int32 Flags, const FName& DebugReason = NAME_None);
@@ -1030,11 +1133,15 @@ public:
 
 	//----------------------------------------------------------------------//
 	// Custom navigation links
+	// 每个 Custom Link（如 SmartLink）都会被登记在 CustomNavLinksMap，ID=FNavLinkId。
+	// Tile 生成时 Recast 会把它们写入 dtOffMeshConnection；寻路时 dtQueryFilter 会回调
+	// IsLinkPathfindingAllowed。
 	//----------------------------------------------------------------------//
 	NAVIGATIONSYSTEM_API virtual void RegisterCustomLink(INavLinkCustomInterface& CustomLink);
 	NAVIGATIONSYSTEM_API void UnregisterCustomLink(INavLinkCustomInterface& CustomLink);
 	int32 GetNumCustomLinks() const { return CustomNavLinksMap.Num(); }
 
+	// Request* 版本：通过 NavigationObjectRepository 延迟登记（World 尚未就绪时使用）
 	static NAVIGATIONSYSTEM_API void RequestCustomLinkRegistering(INavLinkCustomInterface& CustomLink, UObject* OwnerOb);
 	static NAVIGATIONSYSTEM_API void RequestCustomLinkUnregistering(INavLinkCustomInterface& CustomLink, UObject* ObjectOb);
 
@@ -1045,6 +1152,7 @@ public:
 	NAVIGATIONSYSTEM_API INavLinkCustomInterface* GetCustomLink(FNavLinkId UniqueLinkId) const;
 
 	/** updates custom link for all active navigation data instances */
+	// SmartLink 的 SetEnabled / SetEnabledArea 会走到这里 —— 通知所有 NavData 更新对应 poly 的 Area flag
 	NAVIGATIONSYSTEM_API void UpdateCustomLink(const INavLinkCustomInterface* CustomLink);
 
 	/** Return a Bounding Box containing the navlink points */
@@ -1077,9 +1185,11 @@ public:
 
 	//----------------------------------------------------------------------//
 	// building
+	// 导航数据构建控制：Build/CancelBuild + 多种锁机制
 	//----------------------------------------------------------------------//
 	
 	/** Triggers navigation building on all eligible navigation data. */
+	// 手动触发所有 NavData 的全量重建（耗时大，一般仅在编辑器 "Build" 按钮里用）
 	NAVIGATIONSYSTEM_API virtual void Build();
 
 	/** Cancels all currently running navigation builds */
@@ -1250,16 +1360,20 @@ public:
 
 protected:
 
+	// 当前运行模式：Editor / Game / PIE / Invalid
 	UPROPERTY()
 	FNavigationSystemRunMode OperationMode;
 
 	/** Queued async pathfinding queries to process in the next update. */
+	// 待处理的异步寻路请求（主线程塞入，TriggerAsyncQueries 取出交给后台）
 	TArray<FAsyncPathFindingQuery> AsyncPathFindingQueries;
 
 	/** Queued async pathfinding results computed by the dedicated task in the last frame and ready to dispatch in the next update. */
+	// 上一帧后台算出的结果，本帧在 GameThread 上派发（回调 ResultDelegate）
 	TArray<FAsyncPathFindingQuery> AsyncPathFindingCompletedQueries;
 
 	/** Graph event that the main thread will wait for to synchronize with the async pathfinding task, if any. */
+	// 与异步寻路任务同步用的事件；销毁前等待它完成
 	FGraphEventRef AsyncPathFindingTask;
 
 	/** Flag used by main thread to ask the async pathfinding task to stop and postpone remaining queries, if any. */
@@ -1267,14 +1381,19 @@ protected:
 
 	FCriticalSection NavDataRegistration;
 
+	// Agent → NavData 快速反查表（GetNavDataForProps 用）
 	TMap<FNavAgentProperties, TWeakObjectPtr<ANavigationData> > AgentToNavDataMap;
 	
+	// 默认 Octree 控制器（持有 FNavigationOctree + 读写锁 + PendingUpdates）
 	FNavigationOctreeController DefaultOctreeController;
 
+	// Custom Link 注册表：FNavLinkId → Owner 信息
 	TMap<FNavLinkId, FNavigationSystem::FCustomLinkOwnerInfo> CustomNavLinksMap;
 
+	// Dirty Area 累积器：Tick 时推给每份 NavData 做增量重建
 	FNavigationDirtyAreasController DefaultDirtyAreasController;
 
+	// World 级子系统：统一保管已登记的导航元素与自定义链接（中转 + 反查）
 	UPROPERTY(transient)
 	TObjectPtr<UNavigationObjectRepository> Repository = nullptr;
 
@@ -1336,6 +1455,7 @@ protected:
 	 *	@return RegistrationSuccessful if registration was successful, other results mean it failed
 	 *	@see ERegistrationResult
 	 */
+	// NavData 注册核心：检查 Agent 匹配、PendingKill、重复等；成功则填入 NavDataSet 对应槽
 	NAVIGATIONSYSTEM_API virtual ERegistrationResult RegisterNavData(ANavigationData* NavData);
 
 	/** tries to register navigation area */
@@ -1362,6 +1482,7 @@ protected:
 	/** Adds given element to NavOctree. No check for owner's validity are performed, 
 	 *	nor its presence in NavOctree - function assumes callee responsibility 
 	 *	in this regard **/
+	// 把一个 DirtyElement 真正插入 NavOctree（绕过 PendingUpdates 的内部直插路径）
 	NAVIGATIONSYSTEM_API void AddElementToNavOctree(const FNavigationDirtyElement& DirtyElement);
 
 	NAVIGATIONSYSTEM_API void SetCrowdManager(UCrowdManagerBase* NewCrowdManager);
@@ -1397,12 +1518,14 @@ private:
 	void CheckToLimitNavigationBoundsToLoadedRegions(FNavigationBounds& OutBounds) const;
 
 protected:
+	// 每帧把 DefaultDirtyAreasController 里的脏区域推给各 NavData 做增量重建
 	NAVIGATIONSYSTEM_API virtual void RebuildDirtyAreas(float DeltaSeconds);
 	
 	// adds navigation bounds update request to a pending list
 	NAVIGATIONSYSTEM_API void AddNavigationBoundsUpdateRequest(const FNavigationBoundsUpdateRequest& UpdateRequest);
 
 	/** Triggers navigation building on all eligible navigation data. */
+	// 全量重建：常在世界加载完后或 Build() 按钮点击后调一次
 	NAVIGATIONSYSTEM_API virtual void RebuildAll(bool bIsLoadTime = false);
 		 
 	/** Handler for FWorldDelegates::LevelAddedToWorld event */
@@ -1488,6 +1611,12 @@ public:
 
 //----------------------------------------------------------------------//
 // UNavigationSystemModuleConfig 
+// -----------------------------------------------------------------------
+// NavigationSystem 模块级别的配置类。Project Settings → Navigation System
+// 暴露的字段，用于驱动 CreateAndConfigureNavigationSystem 构建 UNavigationSystemV1。
+// bStrictlyStatic：打包后不需要动态重建 NavMesh（走 ConfigureAsStatic）
+// bCreateOnClient：客户端是否创建
+// bAutoSpawnMissingNavData：缺 NavData 时自动 Spawn
 //----------------------------------------------------------------------//
 UCLASS(MinimalAPI)
 class UNavigationSystemModuleConfig : public UNavigationSystemConfig

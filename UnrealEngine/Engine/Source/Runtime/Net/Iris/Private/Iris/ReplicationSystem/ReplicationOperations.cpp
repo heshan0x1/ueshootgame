@@ -1,5 +1,28 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
+// =====================================================================================================================
+// ReplicationOperations.cpp —— Iris 状态级 / 对象级 / 协议级操作的实现
+// ---------------------------------------------------------------------------------------------------------------------
+// 本文件实现 ReplicationOperations.h 中三套门面：
+//   - FReplicationStateOperations    —— 单 Descriptor 粒度（Quantize / Dequantize / Serialize / IsEqual / Validate / Apply）。
+//   - FReplicationInstanceOperations —— Instance 粒度（PollAndCopy / Quantize 整对象 / Reset / DequantizeAndApply）。
+//   - FReplicationProtocolOperations —— Protocol 粒度（带 ChangeMask 序列化 / 与默认或基线的 delta）。
+//
+// 主要技术点：
+//   1) 所有操作以"逐成员循环"为模式，使用 Descriptor 提供的 MemberDescriptors / MemberSerializerDescriptors / 
+//      MemberChangeMaskDescriptors 数组，按 Internal/External 偏移把数据搬来搬去。
+//   2) Quantize/Dequantize 走 NetSerializer 的虚函数，保证类型相关的"打包逻辑"（精度量化、压缩格式）在 Serializer 自治。
+//   3) ChangeMask：每个 ReplicationState 有一段位图（External buffer 中预留），按位指示每个 ChangeMask 段是否脏。
+//      位偏移与位宽由 MemberChangeMaskDescriptor 给出（一个成员可能占多 bit，例如数组元素 modulo 散列）。
+//   4) 文件末尾的 AppendMemberChangeMasks / ResetMemberChangeMasks 是把状态级 ChangeMask 拼接到对象级 BitStream 的核心。
+//   5) Conditional ChangeMask：当 Protocol 含 HasConditionalChangeMask（lifetime conditional）时还要拼一份 conditional mask。
+//   6) Init State 特殊处理：init state 不属于 ChangeMask 跟踪，且仅在 Context.IsInitState() 时序列化。
+//
+// CVar 行为：
+//   - net.Iris.DeltaCompressInitialState（默认 true）：初始状态相对默认状态 delta，节省带宽。
+//   - net.Iris.OnlyQuantizeDirtyMembers（默认 true）：QuantizeIfDirty 仅 quantize 标脏成员。
+// =====================================================================================================================
+
 #include "Iris/ReplicationSystem/ReplicationOperations.h"
 #include "Iris/Core/IrisProfiler.h"
 #include "Iris/Core/IrisLog.h"
@@ -36,6 +59,8 @@
 namespace UE::Net::Private
 {
 
+// 用于 NetTrace 输出 lifetime condition 名（COND_None / COND_InitialOnly / ...）。
+// 编号与 ELifetimeCondition 的整数值一一对应；Reset 函数（文件末尾）可清空 DebugNameId。
 static FNetDebugName s_LifetimeConditionDebugNames[] = 
 {
 	{TEXT("None"), 0},
@@ -59,8 +84,12 @@ static FNetDebugName s_LifetimeConditionDebugNames[] =
 static_assert(COND_Max == 17, "s_LifetimeConditionDebugNames may need updating.");
 
 // Append changemask bits to ChangeMaskWriter and conditionally to the ConditionalChangeMaskWriter. If the state is dirty, the function will return true.
+// 把单个 ReplicationState 的 ChangeMask（位图）拼接到对象级 ChangeMask BitStream，并返回该 state 是否脏。
+// 同时也处理 ConditionalChangeMask：仅当 Descriptor 标记 HasLifetimeConditionals 时才有 conditional 段需要写。
 static bool AppendMemberChangeMasks(FNetBitStreamWriter* ChangeMaskWriter, FNetBitStreamWriter* ConditionalChangeMaskWriter, uint8* ExternalStateBuffer, const FReplicationStateDescriptor* Descriptor);
+// 提交后清空 ChangeMask 并把 state header 的 dirty 位重置（成员被 ack 给 Writer 后调用）。
 static void ResetMemberChangeMasks(uint8* ExternalStateBuffer, const FReplicationStateDescriptor* Descriptor);
+// 调试断言：确保 Context 持有的 ChangeMask 与传入的 ChangeMask 是同一份位图（避免 stack 上的临时位图遗留）。
 static void CheckChangeMask(const FNetSerializationContext& Context, const FNetBitArrayView& ChangeMask) { check(Context.GetChangeMask() && (Context.GetChangeMask()->GetData() == ChangeMask.GetData()));}
 
 }
@@ -84,12 +113,15 @@ static FAutoConsoleVariableRef CVarbOnlyQuantizeDirtyMembers(
 
 void FReplicationStateOperations::Quantize(FNetSerializationContext& Context, uint8* RESTRICT DstInternalBuffer, const uint8* RESTRICT SrcExternalBuffer, const FReplicationStateDescriptor* Descriptor)
 {
+	// 对齐合规检查：Internal/External 都必须按 Descriptor 提供的对齐。
 	check(IsAligned(DstInternalBuffer, Descriptor->InternalAlignment) && IsAligned(SrcExternalBuffer, Descriptor->ExternalAlignment));
 
+	// 取出 Descriptor 中的成员描述数组。
 	const FReplicationStateMemberDescriptor* MemberDescriptors = Descriptor->MemberDescriptors;
 	const FReplicationStateMemberSerializerDescriptor* MemberSerializerDescriptors = Descriptor->MemberSerializerDescriptors;
 	const uint32 MemberCount = Descriptor->MemberCount;
 
+	// 逐成员 Quantize：每个成员根据自己 NetSerializer 的 Quantize 实现把 External 内存解码到 Internal 紧凑表示。
 	for (uint32 MemberIt = 0; MemberIt < MemberCount; ++MemberIt)
 	{
 		const FReplicationStateMemberDescriptor& MemberDescriptor = MemberDescriptors[MemberIt];
@@ -720,6 +752,8 @@ void FReplicationInstanceOperations::Quantize(FNetSerializationContext& Context,
 	const FReplicationStateDescriptor** ReplicationStateDescriptors = Protocol->ReplicationStateDescriptors;
 
 	// Set up conditional change mask writer.
+	// 若 Protocol 含 conditional changemask（lifetime conditionals），则也要把每个 state 的 conditional 段拼接进缓冲。
+	// 这段 conditional mask 会被嵌入到 ObjectStateBuffer 的 GetConditionalChangeMaskOffset() 处。
 	FNetBitStreamWriter ConditionalChangeMaskWriter;
 	FNetBitStreamWriter* OutConditionalChangeMaskWriter = nullptr;
 	if (EnumHasAnyFlags(Protocol->ProtocolTraits, EReplicationProtocolTraits::HasConditionalChangeMask))
@@ -728,6 +762,7 @@ void FReplicationInstanceOperations::Quantize(FNetSerializationContext& Context,
 		OutConditionalChangeMaskWriter = &ConditionalChangeMaskWriter;
 	}
 
+	// 全量 Quantize：依次走每个 ReplicationState（按 Descriptor->InternalAlignment 对齐）。
 	uint8* CurrentInternalStateBuffer = DstObjectStateBuffer;	
 	for (uint32 StateIt = 0; StateIt < Protocol->ReplicationStateCount; ++StateIt)
 	{
@@ -752,6 +787,9 @@ void FReplicationInstanceOperations::Quantize(FNetSerializationContext& Context,
 
 void FReplicationInstanceOperations::QuantizeIfDirty(FNetSerializationContext& Context, uint8* DstObjectStateBuffer, FNetBitStreamWriter* OutChangeMaskWriter, const FReplicationInstanceProtocol* InstanceProtocol, const FReplicationProtocol* Protocol)
 {
+	// QuantizeIfDirty —— 仅 quantize 标脏状态（生产路径）。
+	// 关键差异（vs Quantize）：在 AppendMemberChangeMasks 返回 true 时才执行 Quantize；同时若 cvar 允许，对非 init state
+	// 还会进一步只 quantize ChangeMask 中真正脏的成员（QuantizeWithMask）。
 	IRIS_PROFILER_SCOPE_VERBOSE(QuantizeIfDirty);
 
 	check(InstanceProtocol && InstanceProtocol->FragmentCount == Protocol->ReplicationStateCount);
@@ -821,11 +859,16 @@ void FReplicationInstanceOperations::DequantizeAndApply(FNetSerializationContext
 {
 	using namespace UE::Net::Private;
 
+	// 接收侧入口（客户端用）：把内部量化状态 dequantize 出来 → 调用每个 Fragment 的 Apply / RepNotify / 遗留回调。
+	// 真正实现委托给 FDequantizeAndApplyHelper（Initialize / ApplyAndCallLegacyFunctions / Deinitialize 三步）。
+	// Helper 负责：临时分配 ExternalState、按 ChangeMask partial dequantize、ApplyReplicatedState、CollectOwner 与 Pre/PostNetReceive、
+	// CallRepNotifies、最后 Destruct 临时 ExternalState 防止动态内存泄漏。
 	FDequantizeAndApplyHelper::FContext* Context = FDequantizeAndApplyHelper::Initialize(NetSerializationContext, Parameters);
 
 	FDequantizeAndApplyHelper::ApplyAndCallLegacyFunctions(Context, NetSerializationContext);
 
 	// We need to destruct temporary states (as properties might have allocated memory outside of our temporary allocator)
+	// 临时 state 中的 UProperty 可能持有"非线性 allocator"分配的内存（FString/TArray 等），必须 Destruct 才能正确释放。
 	FDequantizeAndApplyHelper::Deinitialize(Context);
 }
 
@@ -996,6 +1039,10 @@ void FReplicationProtocolOperations::Deserialize(FNetSerializationContext& Conte
 
 void FReplicationProtocolOperations::SerializeWithMask(FNetSerializationContext& Context, const uint32* ChangeMaskData, const uint8* RESTRICT SrcObjectStateBuffer, const FReplicationProtocol* Protocol)
 {
+	// 对象级带 ChangeMask 序列化：Writer 主路径。
+	// 流程：
+	//   1) 把整段 ChangeMask 用 SparseBitArray 写入 BitStream（多数对象大多为 0）；
+	//   2) 逐 Descriptor 调用 SerializeWithMask；init state 仅在 IsInitState() 时序列化。
 	// Nothing to serialize
 	if (Protocol->InternalTotalSize == 0U)
 	{
@@ -1128,6 +1175,8 @@ void FReplicationProtocolOperations::FreeDynamicState(FNetSerializationContext& 
 
 void FReplicationProtocolOperations::SerializeInitialStateWithMask(FNetSerializationContext& Context, const uint32* ChangeMaskData, const uint8* RESTRICT SrcObjectStateBuffer, const FReplicationProtocol* Protocol)
 {
+	// 初始状态特殊路径：相对默认状态 delta 编码，让"接近默认值"的字段几乎不耗带宽。
+	// 受 cvar net.Iris.DeltaCompressInitialState 控制；关闭时退化为普通 SerializeWithMask。
 	if (!bDeltaCompressInitialState)
 	{
 		SerializeWithMask(Context, ChangeMaskData, SrcObjectStateBuffer, Protocol);
@@ -1420,10 +1469,13 @@ namespace UE::Net::Private
 
 static bool AppendMemberChangeMasks(FNetBitStreamWriter* ChangeMaskWriter, FNetBitStreamWriter* ConditionalChangeMaskWriter, uint8* StateBuffer, const FReplicationStateDescriptor* Descriptor)
 {
+	// 把单个 ReplicationState 的 ChangeMask 拼到对象级 ChangeMaskWriter 中。
+	// 同时按需拼接 ConditionalChangeMask（仅 lifetime conditionals 状态）。
 	const uint32 BitCount = Descriptor->ChangeMaskBitCount;
 	if (BitCount)
 	{
 		// Append change mask bits
+		// ChangeMask 在 ExternalStateBuffer 的 GetChangeMaskOffset() 位置存放。<=32 位走 WriteBits 快路径，否则用 WriteBitStream 流式写入。
 		FNetBitArrayView::StorageWordType* ChangeMaskStorage = reinterpret_cast<FNetBitArrayView::StorageWordType*>(StateBuffer + Descriptor->GetChangeMaskOffset());
 		if (BitCount <= 32)
 		{
@@ -1435,6 +1487,7 @@ static bool AppendMemberChangeMasks(FNetBitStreamWriter* ChangeMaskWriter, FNetB
 			ChangeMaskWriter->WriteBitStream(ChangeMaskStorage, SrcStreamBitOffset, BitCount);
 		}
 
+		// 处理 conditional 段
 		if (ConditionalChangeMaskWriter != nullptr)
 		{
 			if (EnumHasAnyFlags(Descriptor->Traits, EReplicationStateTraits::HasLifetimeConditionals))
@@ -1443,6 +1496,7 @@ static bool AppendMemberChangeMasks(FNetBitStreamWriter* ChangeMaskWriter, FNetB
 
 				// Append conditional change mask bits.
 				// The conditionals are on or off rather than tracking dirtiness so we do not reset them.
+				// conditional bits 是"开/关"语义而非脏跟踪，因此 Quantize 时不会被清零。
 				if (BitCount <= 32u)
 				{
 					ConditionalChangeMaskWriter->WriteBits(*ConditionalChangeMaskStorage, BitCount);
@@ -1456,11 +1510,15 @@ static bool AppendMemberChangeMasks(FNetBitStreamWriter* ChangeMaskWriter, FNetB
 			else
 			{
 				// Skip past our non-existing conditional mask.
+				// 该 state 没有 conditional mask（普通成员），但 conditional writer 是按整个对象一次性分配的，
+				// 必须把"虚位"留出来（Seek 跳过），保持后续 state 的 conditional 段对齐。
 				ConditionalChangeMaskWriter->Seek(ConditionalChangeMaskWriter->GetPosBits() + BitCount);
 			}
 		}
 	}
 
+	// 返回该 state 是否脏（由 ReplicationStateHeader 的 dirty bit 决定，不依赖 ChangeMask 本身——
+	// 因为 push-based 状态可能 ChangeMask 全 0 但仍因 dirty bit 被认为脏）。
 	FReplicationStateHeader& ReplicationStateHeader = Private::GetReplicationStateHeader(StateBuffer, Descriptor);
 	return FReplicationStateHeaderAccessor::GetIsStateDirty(ReplicationStateHeader);
 }

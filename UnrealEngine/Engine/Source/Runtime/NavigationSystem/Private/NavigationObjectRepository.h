@@ -1,5 +1,28 @@
 ﻿// Copyright Epic Games, Inc. All Rights Reserved.
 
+// =============================================================================
+// NavigationObjectRepository.h —— WorldSubsystem 级的导航元素"中央登记处"
+// -----------------------------------------------------------------------------
+// 文件职责：
+//   - 作为 UWorldSubsystem，集中存放 World 所有"对导航有意义的对象"的 SharedRef；
+//   - 三类登记：
+//       1) FNavigationElement（新式，直接以 struct 构造/注册）；
+//       2) INavRelevantInterface（传统 AActor/UActorComponent 实现）；
+//       3) INavLinkCustomInterface（自定义链接宿主）；
+//   - 以 TMap<Handle, SharedPtr<FNavigationElement>> 为主存储；
+//     同时维护 ObjectsToHandleMap：UObject ↔ Handle 的反查表；
+//   - 通过 OnNavigationElementAddedDelegate / OnCustomNavLinkObjectRegistered
+//     等委托广播变更，让 UNavigationSystemV1 在另一端做 Octree 注册。
+//
+// 与 NavigationSystem 的关系：
+//   UNavigationObjectRepository 只"保管"对象；UNavigationSystemV1 在自己的
+//   初始化里订阅上面的委托，把变更同步到 FNavigationOctreeController/DirtyAreas。
+//   这样 Repository 就和具体"导航数据结构"解耦：它可以为多个导航系统共享元素。
+//
+// 线程：访问靠 UE_MT_DECLARE_TS_RW_ACCESS_DETECTOR 做一致性检测。写路径都在
+// GameThread 上走，异步 tile 生成线程只读 SharedRef。
+// =============================================================================
+
 #pragma once
 
 #include "AI/Navigation/NavigationElement.h" // required since we can't fwd declare types used as TMap keys
@@ -184,18 +207,23 @@ protected:
 
 private:
 
+	// 内部统一注册入口：若该 UObject 已注册则原地更新 FNavigationElement，否则新建。
 	TSharedPtr<const FNavigationElement> RegisterNavRelevantObjectInternal(const INavRelevantInterface& NavRelevantInterface, const UObject& NavRelevantObject, ENotifyOnSuccess NotifyOnSuccess);
 
 	/** For legacy object registration path (i.e., Actor/ActorComponent) */
+	// UObject → Handle 反查；用于从传统接口路径（Actor/Component）快速拿到已登记元素
 	TMap<FObjectKey, FNavigationElementHandle> ObjectsToHandleMap;
 
 	/** List of registered navigation elements. */
+	// Handle → SharedPtr<FNavigationElement> 主存储；析构时自动释放
 	TMap<FNavigationElementHandle, TSharedPtr<FNavigationElement>> NavRelevantElements;
 
 	/** List of registered custom navigation link objects. */
+	// 自定义链接（门、梯子、弹射…）接口的弱引用列表；由 NavigationSystem 广播到 tile 生成
 	TArray<TWeakInterfacePtr<INavLinkCustomInterface>> CustomLinkObjects;
 
 	/** Multi thread access detector used to validate accesses to the maps of registered UObjects and FNavigationElement */
+	// 线程一致性检测器：读写标记冲突时在非 Shipping 构建里 ensure，排查竞争
 	UE_MT_DECLARE_TS_RW_ACCESS_DETECTOR(NavElementAccessDetector);
 
 	//----------------------------------------------------------------------//
